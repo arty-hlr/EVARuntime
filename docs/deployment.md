@@ -822,12 +822,48 @@ Ce que fait le script :
 11. Repasse `doctor` sur l'hôte basculé, en constat non bloquant
 12. **Rollback automatique** du code déployé, du venv, du mode et de l'unité si la
     readiness ou la recette échoue
+13. **Purge les venvs de release excédentaires** une fois la version validée, en
+    conservant l'actif et le précédent (voir ci-dessous)
 
 > **Conservation :** les secrets, `nodes.yaml`, le contenu du registre, la DB et
 > les GGUF ne sont jamais remplacés. Le script ne modifie dans `env` que les clés
 > nécessaires au mode explicitement confirmé. Il peut copier l'ancien registre
 > `/etc/llm-gateway/models.yaml` vers `/var/lib/llm-gateway/models.yaml` pour
 > corriger les permissions d'écriture atomique; l'original reste en place.
+
+#### Rétention des venvs de release
+
+`update.sh` ne remplace jamais un venv : il en construit un neuf à son
+emplacement définitif (`/opt/llm-gateway/venv-release-<commit>-<horodatage>`)
+puis fait basculer le symlink `/opt/llm-gateway/venv`, le chemin figé dans
+l'unité systemd. C'est ce qui rend le rollback instantané — mais aussi ce qui
+ferait grossir `/opt` indéfiniment, une arborescence complète par mise à jour.
+
+La rétention est donc **bornée et explicite** : une fois la version validée par
+la recette du premier token, le script conserve **la release active et la
+précédente**, et purge les plus anciennes. La cible courante du symlink n'est
+jamais supprimée, quel que soit son âge — y compris après un retour arrière
+manuel vers une vieille release. Le `venv-pre-update-*` laissé par la migration
+depuis l'ancien schéma est traité comme une release ordinaire.
+
+- Le nombre de releases conservées se règle par `EVA_GATEWAY_VENV_KEEP`
+  (défaut : `2`, minimum : `1`).
+- `--dry-run` annonce ce que la purge emporterait, sans rien supprimer.
+- Un échec de purge n'échoue **jamais** la mise à jour : la gateway sert, seul
+  l'espace disque manque. Le script le signale en avertissement.
+- La purge n'a lieu **qu'après** la validation. Avant, la release précédente est
+  encore ce vers quoi le rollback rebascule.
+
+Retour arrière manuel, tant que la release est conservée :
+
+```bash
+ls -dt /opt/llm-gateway/venv-release-*
+sudo ln -sfn /opt/llm-gateway/venv-release-<…> /opt/llm-gateway/venv
+sudo systemctl restart llm-gateway
+```
+
+Le node-agent applique la même politique sur ses propres releases — voir
+« Stratégie de venv du node-agent ».
 
 #### Sauvegarde automatique avant mise à jour
 
@@ -1470,16 +1506,42 @@ Conséquences pratiques :
 - **Retour arrière manuel** possible tant que la release est conservée :
 
 ```bash
-ls -d /opt/llm-gateway/venv-agent-release-*
+ls -dt /opt/llm-gateway/venv-agent-release-*
 sudo ln -sfn /opt/llm-gateway/venv-agent-release-<…> /opt/llm-gateway/venv-agent
 sudo systemctl restart llm-gateway-agent
 ```
 
-- **Rétention** : les releases précédentes (~200 Mo) ne sont pas purgées
-  automatiquement. Les supprimer à la main quand l'espace disque le justifie,
-  en conservant celle vers laquelle pointe `venv-agent`.
 - L'unité conserve `ExecStart=…/venv-agent/bin/python -m uvicorn` : défense en
   profondeur validée en production, insensible par construction au shebang.
+
+**Rétention des releases.** Puisque aucun venv n'est plus écrasé, chaque mise à
+jour laisse une arborescence complète (~200 Mo) sur le disque du nœud, plus un
+éventuel `venv-agent-pre-update-*` issu de la migration. `update-agent.sh` purge
+donc les releases excédentaires **après une mise à jour réussie**, en conservant
+**l'active et la précédente** — soit exactement ce que réclame le retour arrière
+manuel ci-dessus. La politique est la même que celle de la gateway :
+
+- La cible courante du symlink n'est **jamais** supprimée, quel que soit son
+  âge : c'est le venv sur lequel l'agent tourne. Après un retour arrière manuel
+  vers une vieille release, celle-ci est donc protégée bien qu'elle soit la plus
+  ancienne du répertoire.
+- L'ordre de purge est celui des **dates de modification**, pas des noms.
+- Le nombre de releases conservées se règle par `EVA_AGENT_VENV_KEEP`
+  (défaut : `2`, minimum : `1`).
+- `--dry-run` annonce ce que la purge emporterait, sans rien supprimer.
+- La purge n'a lieu **qu'après** la validation (health-check passé, rollback
+  désarmé). Avant, la release précédente est encore ce vers quoi le rollback
+  rebascule — un rollback ne doit jamais trouver une release supprimée.
+- Un échec de purge n'échoue **jamais** la mise à jour : l'agent est en service,
+  seul l'espace disque manque. Le script le signale en avertissement.
+
+Vérifier ce qui reste sur un nœud :
+
+```bash
+du -sh /opt/llm-gateway/venv-agent-release-* /opt/llm-gateway/venv-agent-pre-update-* 2>/dev/null
+readlink -f /opt/llm-gateway/venv-agent
+sudo bash node_agent/deploy/update-agent.sh --dry-run --no-pull   # annonce la purge
+```
 
 #### Start-limit systemd et codes de sortie de `update-agent.sh`
 
