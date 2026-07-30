@@ -40,6 +40,13 @@ IPAddressAllow=192.0.2.10
 LimitNOFILE=8192
 LimitNPROC=512
 TasksMax=256
+# Limites mémoire volontairement basses et ABSOLUES : cette unité est un proxy
+# d'edge, aucun llama-server ni GGUF mmap ne vit dans ce cgroup (PrivateDevices,
+# pas d'accès /models). Elles ne dépendent donc pas de models.yaml — cf.
+# docs/deployment.md §15 pour le couple models.yaml x limites mémoire, qui ne
+# concerne que llm-gateway.service (mode local) et llm-gateway-agent.service
+# (mode cluster). Ne pas relever ces valeurs pour « faire de la place » à un
+# modèle : ce service ne charge rien.
 MemoryHigh=512M
 MemoryMax=1G
 

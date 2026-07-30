@@ -23,7 +23,7 @@ GPU local et pilote des node-agents installés séparément.
 12. [Dépannage](#12-dépannage)
 13. [Déploiement multi-nœuds (optionnel)](#13-déploiement-multi-nœuds-optionnel--avancé)
 14. [Sauvegardes SQLite et restauration](#14-sauvegardes-sqlite-et-restauration)
-15. [Durcissement systemd du service principal](#15-durcissement-systemd-du-service-principal)
+15. [Durcissement systemd et profils mémoire](#15-durcissement-systemd-et-profils-mémoire)
 16. [Durcissement nginx](#16-durcissement-nginx-anti-slowloris-et-concurrence)
 17. [Rotation des logs journald](#17-rotation-des-logs-journald)
 18. [Référence de configuration (variables d'environnement)](#18-référence-de-configuration-variables-denvironnement)
@@ -41,7 +41,8 @@ GPU local et pilote des node-agents installés séparément.
 | CUDA toolkit | 12.x | Mode local et chaque node-agent; inutile sur l'orchestrateur cluster |
 | Pilotes NVIDIA | 535+ | `nvidia-smi` sur les hôtes d'inférence, pas sur l'orchestrateur |
 | nginx | 1.18+ | `apt install nginx` |
-| Espace disque | 100 GB+ sur nœud GPU | L'orchestrateur ne stocke que code, DB et registre |
+| Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
+| RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
 ### Vérifications initiales
 
@@ -186,6 +187,14 @@ Le `mmproj_path` est déclaré dans `models.yaml` — voir section 6 pour la str
 - Budget net disponible = 48 − 2 (overhead) − 2.4 (marge 5%) = **43.6 GB**
 - 70B seul : 42 GB ≤ 43.6 GB ✓
 - 70B + 8B simultanément : 42 + 5.5 = 47.5 GB > 43.6 GB → éviction LRU automatique
+
+> **La VRAM n'est pas la seule contrainte.** Les modèles MoE déclarés avec
+> `cpu_moe: true` (`--cpu-moe`) laissent leurs experts FFN **en RAM hôte** : ils
+> ne consomment presque pas de VRAM, mais exigent des dizaines — voire des
+> centaines — de gigaoctets de RAM, et cette RAM est comptée dans le cgroup
+> systemd du service. Avant d'activer un modèle, consulter la table
+> « modèle → RAM hôte requise → VRAM requise » de
+> [§15](#15-durcissement-systemd-et-profils-mémoire).
 
 ---
 
@@ -390,6 +399,13 @@ models:
       threads: 4
       threads_http: 2
 ```
+
+> **Avant de passer un modèle à `enabled: true` :** vérifier la RAM **hôte**
+> requise, pas seulement la VRAM. Un modèle avec `cpu_moe: true` garde ses experts
+> FFN résidents en RAM et cette RAM est comptée dans le cgroup systemd du service.
+> Table de dimensionnement et procédure d'activation :
+> [§15.1](#151-couple-modelsyaml--limites-mémoire-systemd). `minimax-m2.7` est
+> livré `enabled: false` pour cette raison (~236 Go de RAM hôte requis).
 
 > **Modèles vision — règle absolue :** si `vision` est dans `capabilities`, le champ
 > `mmproj_path` doit pointer vers le fichier projecteur CLIP (`.gguf`). Sans lui,
@@ -911,6 +927,8 @@ Causes fréquentes :
 | `Port already in use` | Deux modèles sur le même port | Vérifier `BASE_LLAMA_PORT` et `MAX_LOADED_MODELS` |
 | HTTP 500 sur requête avec image | `mmproj_path` absent dans `models.yaml` | Ajouter `mmproj_path` pointant vers le fichier projecteur CLIP (`.gguf`) |
 | Warning `mmproj_path absent` dans les logs | Modèle vision sans projecteur | Télécharger le fichier `mmproj` sur HuggingFace et configurer `mmproj_path` |
+| Génération très lente, TTFT de plusieurs dizaines de secondes, **aucune erreur** ; `pgmajfault` grimpe dans `/sys/fs/cgroup/system.slice/llm-gateway.service/memory.stat` ; disque à 100 % | Le working set RAM hôte d'un modèle `cpu_moe: true` dépasse `MemoryHigh`/`MemoryMax` (ou la RAM installée) : le noyau recycle en boucle les pages `mmap` propres des experts FFN → refault NVMe à chaque token | Désactiver le modèle ou l'exécuter sur un hôte plus grand. Vérifier la table de dimensionnement [§15.1](#151-couple-modelsyaml--limites-mémoire-systemd). Ne pas se contenter de relever `MemoryMax` au-delà de la RAM physique |
+| `Failed to set up mount namespacing`, l'unité ne démarre pas | Un chemin de `ReadWritePaths` n'existe pas (ex. `/data/models` non provisionné) | Créer le répertoire, ou le préfixer par `-` dans l'unité (déjà fait pour les répertoires de modèles) |
 
 ### Vérifier le budget VRAM
 
@@ -1260,7 +1278,7 @@ curl http://127.0.0.1:8000/health
 
 ---
 
-## 15. Durcissement systemd du service principal
+## 15. Durcissement systemd et profils mémoire
 
 `gateway/deploy/llm-gateway.service` est aligné sur le niveau de durcissement du
 service étudiant, **à l'exception des directives incompatibles avec l'accès GPU**.
@@ -1269,7 +1287,8 @@ Directives ajoutées : `ProtectKernelTunables`, `ProtectKernelModules`,
 `RestrictRealtime`, `RestrictSUIDSGID`, `LockPersonality`,
 `SystemCallArchitectures=native`, `SystemCallFilter=@system-service` (moins
 `@privileged @resources @mount @reboot @swap @debug`), et des limites
-`MemoryHigh`/`MemoryMax`/`TasksMax`.
+`MemoryHigh`/`MemoryMax`/`MemorySwapMax`/`OOMPolicy`/`TasksMax` — ces dernières
+étant **dérivées du profil de modèles activés** ([§15.1](#151-couple-modelsyaml--limites-mémoire-systemd)).
 
 ### Directives volontairement OMISES (casseraient le GPU)
 
@@ -1286,16 +1305,179 @@ Directives ajoutées : `ProtectKernelTunables`, `ProtectKernelModules`,
   supplémentaires (`nvidia-caps`, MIG…), les ajouter ; en cas de doute,
   **commenter tout le bloc** pour revenir au comportement par défaut (accès régi
   par l'appartenance aux groupes `render,video`, cf. `install.sh`).
-- **`MemoryHigh=48G` / `MemoryMax=64G` / `TasksMax=4096`** : valeurs de départ
-  pour un hôte L40S 48 Go avec ~128 Go de RAM. Les poids modèle sont en VRAM,
-  mais le `mmap` GGUF, le KV host et les buffers HTTP consomment de la RAM.
-  **Dimensionner à la charge réelle** (nombre de modèles chargés simultanément,
-  `MAX_LOADED_MODELS`). Un `MemoryMax` trop bas provoquerait un OOM-kill du
-  service et de ses `llama-server`.
+- Les **limites mémoire** ne sont plus des valeurs de départ arbitraires : elles
+  sont dérivées du profil de modèles activés et documentées en
+  [§15.1](#151-couple-modelsyaml--limites-mémoire-systemd).
 
 > Après modification, valider avec `systemd-analyze verify
 > /etc/systemd/system/llm-gateway.service` puis un cycle
 > `stop`/`start`/inférence de bout en bout **en staging** avant la prod.
+
+### Conflits durcissement ↔ besoins des modèles (conservés, documentés)
+
+Ces points sont laissés **durcis** volontairement. Ils sont listés pour que
+personne ne les découvre en production.
+
+| Directive | Conflit potentiel | Décision |
+|-----------|-------------------|----------|
+| `SystemCallFilter=~@resources` | Bloque `set_mempolicy`, `mbind`, `migrate_pages`, `move_pages`, `sched_setaffinity`. `llama-server` n'est **pas** lancé avec `--numa` (cf. `build_llama_cmd`), donc aucun modèle approuvé n'est bloqué aujourd'hui. Sur un hôte bi-socket, `--numa distribute` améliorerait pourtant nettement les modèles `cpu_moe`. | Filtre **conservé**. Activer `--numa` exige de lever `~@resources` : décision de sécurité explicite, à valider en staging (le refus d'un appel filtré termine le processus par `SIGSYS`, il ne renvoie pas une erreur). |
+| `LimitMEMLOCK` (défaut, 8 Mo) | `--mlock` verrouillerait les poids en RAM. | `--mlock` **n'est pas utilisé** : le GGUF est lu via `mmap`, ses pages restent réclamables, ce qui est exactement ce qui évite l'OOM-kill. Ne pas relever `LimitMEMLOCK` « au cas où » : avec `--mlock`, `MemoryMax` redevient un plafond dur et le modèle entier doit tenir en RAM. Un test (`test_local_unit_does_not_grant_memlock`) garde cette décision. |
+| `ProtectSystem=strict` + `ReadWritePaths` | Un répertoire listé mais **absent** empêche l'unité de démarrer. | Les répertoires de modèles sont préfixés `-` (`-/models -/data/models`) : ignorés s'ils n'existent pas. `install.sh` ne crée que `/models`. Tout nouveau répertoire déclaré dans `models.yaml` doit être ajouté ici. |
+| `PrivateDevices` / `MemoryDenyWriteExecute` | Casseraient CUDA et le JIT. | Omises (cf. table précédente), inchangé. |
+
+### 15.1 Couple `models.yaml` × limites mémoire systemd
+
+C'est le point de dimensionnement le plus souvent manqué, parce qu'il ne produit
+**aucune erreur** quand il est faux : seulement un effondrement du TTFT.
+
+**Pourquoi les limites du service concernent les modèles.** `llama-server` n'est
+pas un service séparé : c'est un **sous-processus enfant** de la gateway (mode
+local) ou du node-agent (mode cluster). Il vit donc dans le **même cgroup**, et
+toute sa mémoire — y compris le page cache de son `mmap` GGUF — est comptée dans
+le `MemoryHigh`/`MemoryMax` de l'unité.
+
+**Où réside quoi.**
+
+| Ce qui est chargé | Emplacement | Piloté par |
+|-------------------|-------------|-----------|
+| Poids des couches offloadées | **VRAM** | `n_gpu_layers` |
+| KV cache | **VRAM** (le KV suit les couches, qui sont sur GPU) | `ctx_size`, `parallel`, `cache_type_k/v` |
+| Poids des experts FFN d'un MoE `cpu_moe: true` | **RAM hôte, résidents** — relus depuis le `mmap` à chaque token | `cpu_moe` |
+| Page cache du GGUF pendant le chargement | **RAM hôte, transitoire** (pages propres, jetables ensuite) | taille du fichier |
+| Processus (gateway + RSS de chaque `llama-server`) | RAM hôte | `batch_size`, `ubatch_size`, `threads_http` |
+
+**La nuance qui compte.** Une limite cgroup inférieure au working set d'un modèle
+`cpu_moe` ne provoque pas forcément d'OOM-kill : les pages `mmap` **propres** sont
+réclamables, le noyau les recycle au lieu de tuer le processus. Ce qui est
+certain, c'est le **thrashing NVMe** — chaque token refaute des pages d'experts —
+donc un TTFT et un débit effondrés, silencieusement, y compris pour les autres
+modèles chargés. Autrement dit : `MemoryMax` ne protège pas contre ce cas, il le
+provoque. La limite doit être **dérivée du profil de modèles activés**.
+
+**Politique retenue** (`llm-gateway.service` et `node_agent/deploy/llm-gateway-agent.service`) :
+
+```ini
+MemoryHigh=80%      # pression douce (reclaim/throttle) — adapté à des pages mmap réclamables
+MemoryMax=90%       # garde-fou dur contre une fuite de mémoire ANONYME uniquement
+MemorySwapMax=0     # ne jamais swapper : refault d'une page propre ≪ swap-in d'une page anonyme
+OOMPolicy=stop      # un llama-server tué ⇒ arrêt de l'unité, Restart=on-failure repart propre
+TasksMax=4096       # ~64 tâches par llama-server × MAX_LOADED_MODELS=5
+```
+
+> **Prérequis :** les valeurs en pourcentage et `MemorySwapMax=` exigent
+> **cgroup v2** (hiérarchie unifiée) et systemd ≥ 231 — c'est le défaut sur Ubuntu
+> 22.04 et 24.04. Vérifier avec `stat -fc %T /sys/fs/cgroup` → `cgroup2fs`. Sur un
+> hôte encore en cgroup v1, remplacer les pourcentages par les valeurs absolues
+> déduites de la table ci-dessous et documenter l'écart.
+
+Les pourcentages sont relatifs à la RAM physique de l'hôte. Ils sont préférés aux
+valeurs absolues parce que l'unité systemd est un **artefact versionné** alors que
+le dimensionnement mémoire est une **propriété de l'hôte** : `MemoryMax=64G`
+codait en dur l'hypothèse d'un hôte donné, et cette hypothèse a dérivé dès qu'un
+modèle de 248 Go est entré dans le registre.
+
+**Règle d'arbitrage :** un profil de modèles qui ne tient pas dans 80 % de la RAM
+installée se refuse **dans `models.yaml`** (`enabled: false`). Il ne s'absorbe pas
+en relevant la limite systemd au-delà de la RAM réellement présente.
+
+#### Table de dimensionnement — modèle → RAM hôte → VRAM
+
+Hôte de référence : **L40S 48 Go / 128 Go de RAM** (mono-socket, GGUF sur NVMe).
+
+| Modèle | `cpu_moe` | GGUF | VRAM requise | RAM hôte **résidente** | RAM hôte **transitoire** (chargement) | RAM physique minimale (`MemoryHigh=80 %`) | Activé par défaut | Verdict |
+|--------|-----------|------|--------------|------------------------|----------------------------------------|-------------------------------------------|-------------------|---------|
+| `llama-3.3-70b-instruct` | non | ~42.5 Go | 42.0 Go | ~1.5 Go | ~42.5 Go (propre, jetable) | 8 Go (64 Go recommandés pour un chargement rapide) | oui | ✅ compatible |
+| `gemma-4-26b-a4b` | non | ~16 Go | 26.9 Go | ~1.5 Go | ~16 Go | 8 Go | oui | ✅ compatible |
+| `qwen3.5-9b-q5_k_m` | **oui** | ~19 Go | 7.0 Go | **~16 Go** | ~19 Go | 24 Go | oui | ✅ compatible |
+| `llama-3.1-8b-instruct` | non | ~4.9 Go | 5.5 Go | ~0.7 Go | ~4.9 Go | 4 Go | non (GGUF absent) | ✅ compatible si activé |
+| `minimax-m2.7` | **oui** | **~248 Go** (4 shards) | 32.0 Go | **~236 Go** | ~248 Go | **~320 Go** | **non** | ❌ **incompatible** avec l'hôte de référence |
+| **Profil activé complet** | — | — | ≤ 43.6 Go (borné par l'éviction LRU) | ~19 Go | — | 32 Go (64 Go recommandés, 128 Go = référence) | — | ✅ |
+
+> **Niveau de preuve.** Ces valeurs sont des **estimations d'architecture**, pas
+> des mesures : tailles de GGUF déclarées (amont / registre), part des experts
+> déduite de la quantisation et du ratio paramètres actifs/totaux, surcoût de
+> processus estimé. Elles sont volontairement conservatrices. À remplacer par des
+> mesures `nvidia-smi` + `memory.peak` du cgroup dès que la calibration
+> (backlog AUT-008 / PERF-006) existe. La colonne « RAM hôte résidente » est
+> celle qui décide de la compatibilité ; la colonne « transitoire » n'influence
+> que le temps de chargement.
+
+#### Cas MiniMax M2.7 — traité explicitement
+
+`minimax-m2.7` est **désactivé par défaut** dans `gateway/models.yaml`. Ce n'est
+pas une contrainte de VRAM (32 Go déclarés, ça tient sur un L40S) mais de RAM
+hôte : avec `cpu_moe: true`, les ~248 Go d'experts FFN doivent rester résidents.
+Sur l'hôte de référence à 128 Go, aucune valeur de `MemoryMax` ne rend ce modèle
+utilisable — l'ancienne valeur `MemoryMax=64G` garantissait le thrashing, et la
+retirer ne ferait que déplacer le problème sur la RAM physique.
+
+Pour l'activer :
+
+1. hôte avec **≥ 320 Go de RAM** (working set ~236 Go sous `MemoryHigh=80 %`) et
+   ~250 Go d'espace NVMe rapide ;
+2. `enabled: true` dans `models.yaml` (ou `POST /admin/models/{id}/enable`) ;
+3. mettre à jour la table ci-dessus **et** le profil correspondant dans
+   `gateway/tests/test_deploy_memory_profiles.py` (le test échoue sinon) ;
+4. vérifier après chargement : `systemctl show llm-gateway -p MemoryCurrent` et
+   `cat /sys/fs/cgroup/system.slice/llm-gateway.service/memory.stat` (regarder
+   `file`, `pgmajfault` : une croissance continue de `pgmajfault` en génération
+   signe le thrashing) ;
+5. mesurer le TTFT réel avant d'ouvrir le modèle aux utilisateurs.
+
+#### Procédure — activer un nouveau modèle
+
+À suivre **avant** de passer `enabled: true`, en local comme en cluster :
+
+1. **Mesurer le fichier** : `ls -lh` sur le GGUF (tous les shards).
+2. **Classer le modèle** : `cpu_moe: true` → la quasi-totalité du fichier sera
+   résidente en RAM hôte ; sinon → seule la VRAM est dimensionnante.
+3. **Comparer à la RAM installée** : `free -g`. Le working set + ~2 Go de
+   baseline doit tenir dans **80 %** de la RAM (valeur de `MemoryHigh`).
+4. **Vérifier le répertoire** : si le GGUF n'est pas sous un chemin déjà listé
+   dans `ReadWritePaths` de l'unité, l'ajouter (préfixé `-`) et vérifier
+   `ALLOWED_MODEL_DIRS`.
+5. **Mettre à jour** la table de cette section et `MEMORY_PROFILES` dans
+   `gateway/tests/test_deploy_memory_profiles.py`, puis
+   `cd gateway && python -m pytest tests/test_deploy_memory_profiles.py -v`.
+6. **Charger et observer** en staging : `MemoryCurrent`, `memory.stat`
+   (`pgmajfault`), TTFT. Si `pgmajfault` grimpe pendant la génération, le modèle
+   ne tient pas — le désactiver.
+
+#### Topologie cluster — où s'applique la contrainte
+
+| Unité | `llama-server` dans son cgroup ? | Limites mémoire | Dépend de `models.yaml` ? |
+|-------|----------------------------------|-----------------|---------------------------|
+| `gateway/deploy/llm-gateway.service` (mode local) | **oui** | `MemoryHigh=80%` / `MemoryMax=90%` / `MemorySwapMax=0` | **oui** — table ci-dessus |
+| `node_agent/deploy/llm-gateway-agent.service` (nœud GPU, mode cluster) | **oui** | idem | **oui** — la même table s'applique à la RAM du **nœud** |
+| `gateway/deploy/llm-gateway-cluster.service` (orchestrateur) | non (pas de GPU, `PrivateDevices=true`, pas de `/models`) | `MemoryHigh=4G` / `MemoryMax=8G`, absolues | non |
+| `gateway-student/deploy/llm-gateway-student.service` | non (proxy d'edge) | `MemoryHigh=512M` / `MemoryMax=1G`, absolues | non |
+| `gateway/deploy/llm-gateway-backup.service` | non (`sqlite3 .backup`) | aucune limite mémoire | non |
+
+En mode cluster, **augmenter la RAM ou la limite de l'orchestrateur ne sert à
+rien** : le modèle est chargé par le node-agent, sur le nœud. Un nœud doit avoir
+la RAM du plus gros modèle qu'il peut se voir attribuer ; sinon retirer ce modèle
+du registre de l'orchestrateur.
+
+#### Test de non-régression
+
+`gateway/tests/test_deploy_memory_profiles.py` lit les unités systemd livrées et
+`gateway/models.yaml`, et échoue si :
+
+- un modèle du registre n'a pas de profil mémoire déclaré (force la revue de
+  déploiement à chaque ajout de modèle) ;
+- un `vram_gb` diverge entre `models.yaml` et la table ;
+- un modèle **activé** exige plus de RAM hôte que la limite de l'unité locale ou
+  de l'unité node-agent ne l'autorise sur l'hôte de référence ;
+- le profil activé complet dépasse cette limite ;
+- une unité qui héberge des `llama-server` ne déclare pas explicitement sa
+  politique mémoire (`MemoryHigh`, `MemoryMax`, `MemorySwapMax=0`, `OOMPolicy`,
+  `TasksMax`) ;
+- l'orchestrateur cluster gagne un accès GPU ou aux répertoires de modèles (son
+  dimensionnement bas ne serait plus valide) ;
+- un modèle activé pointe vers un répertoire absent de `ReadWritePaths`.
+
+C'est une validation **par inspection outillée** : elle ne remplace pas un essai
+en staging, elle empêche la dérive entre le registre et les unités.
 
 ---
 

@@ -45,6 +45,17 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug
 DevicePolicy=closed
+
+# ── Limites mémoire — topologie cluster ───────────────────────────────────────
+# Contrairement à llm-gateway.service, AUCUN llama-server ne tourne dans ce
+# cgroup : cet hôte n'orchestre que des node-agents (pas de GPU, pas de /models,
+# PrivateDevices=true). Les limites peuvent donc rester absolues et basses, et
+# elles sont indépendantes du contenu de models.yaml : la contrainte mémoire des
+# modèles s'applique sur les NŒUDS, dans node_agent/deploy/llm-gateway-agent.service.
+# Ce qui consomme ici : la gateway (~0.3 Go), les connexions httpx vers les
+# nœuds et les buffers de relais SSE (quelques Mo par stream actif) — 8 Go
+# laissent une marge très large.
+# Ne PAS recopier une table de dimensionnement modèle ici (cf. docs/deployment.md §15).
 MemoryHigh=4G
 MemoryMax=8G
 TasksMax=1024

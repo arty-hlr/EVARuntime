@@ -50,5 +50,33 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 LimitNOFILE=1048576
 
+# ── Limites mémoire — c'est ICI que les modèles vivent en mode cluster ─────────
+# Le node-agent lance les llama-server en sous-processus : ils sont dans CE
+# cgroup, pas dans celui de l'orchestrateur. La contrainte mémoire pertinente en
+# mode cluster est donc celle de cette unité.
+# Même raisonnement que gateway/deploy/llm-gateway.service :
+#   • modèle entièrement offloadé (-ngl 999 sans cpu_moe) → page cache mmap
+#     transitoire ≈ taille du GGUF, résident ≈ 0, KV cache en VRAM ;
+#   • modèle `cpu_moe: true` → les experts FFN restent lus depuis le mmap à
+#     chaque token et doivent rester RÉSIDENTS en RAM hôte du nœud.
+# Une limite inférieure à ce working set ne garantit pas un OOM-kill (pages mmap
+# propres = réclamables) mais garantit le thrashing NVMe et l'effondrement du
+# TTFT. Pourcentages plutôt que valeurs absolues : le dimensionnement mémoire est
+# une propriété du nœud, pas de l'artefact versionné. Table
+# « modèle → RAM hôte requise » et procédure : docs/deployment.md §15.
+# Le nœud doit avoir assez de RAM pour le plus gros modèle qu'il est autorisé à
+# charger ; sinon retirer ce modèle de models.yaml côté orchestrateur.
+MemoryHigh=80%
+MemoryMax=90%
+# Ne jamais swapper un llama-server : refault NVMe d'une page propre < swap-in
+# d'une page anonyme, et le swap dégrade durablement le TTFT.
+MemorySwapMax=0
+# Un llama-server tué par le noyau laisserait de la VRAM orpheline et un slot
+# compté « chargé » côté agent : arrêter l'unité et laisser Restart=on-failure
+# repartir propre.
+OOMPolicy=stop
+# ~64 tâches par llama-server x MAX_LOADED_MODELS=5, plus les threads de l'agent.
+TasksMax=4096
+
 [Install]
 WantedBy=multi-user.target
