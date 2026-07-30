@@ -21,8 +21,8 @@
 |---|---|
 | **Où en est-on** | Jalon **M0 atteint**, puis **premier déploiement réel sur deux VMs** joué de bout en bout — il a révélé 6 défauts invisibles en CI (§0.10). **Ces 6 défauts sont fermés** (vague 4, §0.11), avec COR-009 en prime |
 | **Ce qui vient ensuite** | Jalon **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage. **Plus aucun P0 ouvert dans le Lot A** |
-| **Santé des tests** | **741 tests verts** (685 gateway + 56 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
-| **Reste à faire** | 41 items sur 61 (§0.3). Les 5 items ouverts du Lot A sont tous en P1/P2 |
+| **Santé des tests** | **758 tests verts** (695 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
+| **Reste à faire** | 41 items sur 62 (§0.3). Les 5 items ouverts du Lot A sont tous en P1/P2 |
 | **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
@@ -41,20 +41,20 @@ vus —, §0.9 ce que l'exploitation doit savoir.
 | Branche de travail | `feat/lot-a-vague4-retours-deploiement` (créée depuis `dev` @ `3a60f19`) |
 | Base de référence | `dev` @ `3a60f19` — 678 tests verts, `ruff` propre |
 | Périmètre livré à ce jour | COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, AUT-012, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
-| Périmètre de la vague 4 | COR-009, COR-015 → COR-017, TST-006, OPS-008, OPS-009 — **7 items, tous `[x]`** |
+| Périmètre de la vague 4 | COR-009, COR-015 → COR-017, TST-006, OPS-008, OPS-009 — **7 items, tous `[x]`** — plus OPS-010, né de la vague (§0.11) |
 | Prochain jalon | **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage |
 
 ### 0.2 Base de référence des tests et état courant
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **685** 🔬 |
-| `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **56** 🔬 |
-| **Total** | — | **354** | **741** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **695** 🔬 |
+| `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
+| **Total** | — | **354** | **758** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+324 tests** ajoutés par le jalon M0, puis **+63 par la vague 4**, tous des
+**+324 tests** ajoutés par le jalon M0, puis **+80 par la vague 4**, tous des
 régressions rouges avant correctif et vertes après. Les scripts de déploiement
 passent `bash -n`.
 
@@ -76,18 +76,20 @@ vérifiée par `bash -n`, à compléter avec EVA-044.
 | B — bootstrap automatisé | 13 | 1 | 0 | 12 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
 | D — sécurité et supply-chain | 8 | 1 | 0 | 7 | 0 |
-| E — tests et exploitation | 15 | 4 | 0 | 9 | 2 |
-| **Total** | **61** | **17** | **0** | **41** | **3** |
+| E — tests et exploitation | 16 | 4 | 1 | 9 | 2 |
+| **Total** | **62** | **17** | **1** | **41** | **3** |
 
-Huit items ont été **ajoutés au backlog** après coup, d'où 61 au lieu de 53 :
+Neuf items ont été **ajoutés au backlog** après coup, d'où 62 au lieu de 53 :
 COR-014 (Lot A) et SEC-008 (Lot D) pendant l'implémentation (§0.8), puis
 COR-015 à COR-017 (Lot A) et TST-006, OPS-008, OPS-009 (Lot E) lors du premier
-déploiement réel sur deux VMs (§0.10).
+déploiement réel sur deux VMs (§0.10), enfin **OPS-010** (Lot E) né de la
+vague 4 elle-même.
 
 Les **8 items du jalon M0 sont terminés et vérifiés**, ainsi que les **7 items
-de la vague 4**. Plus aucun item n'est `[~]` : la convention §0.6 veut qu'un
-item codé mais non testé y reste, et les deux qui l'étaient (COR-015, COR-016)
-portent désormais leur test.
+de la vague 4**. Les deux items qui étaient `[~]` faute de test (COR-015,
+COR-016) portent désormais le leur. Le seul `[~]` restant est **OPS-010**, dont
+la part venvs est livrée et testée mais dont la borne sur les sauvegardes
+`*.pre-migration.*.bak` reste à poser, sous OPS-002.
 
 **Il ne reste aucun P0 ouvert dans le Lot A.** Les 5 items restants
 (COR-003, COR-008, COR-010, COR-012, COR-013) sont en P1/P2.
@@ -169,7 +171,8 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-30 | OPS-008 | `ad953bc` | `pytest tests -q` (gateway) | Timer armé avec `--now`, après l'initialisation de la base 🔬 |
 | 2026-07-30 | COR-009 | `0c2efcb` | `pytest tests -q` (gateway) | 649 réussis ; timeouts dérivés du registre (900 s), `/ready` et `/completion` exposés 🔬 |
 | 2026-07-30 | OPS-009 | `28acf1c`, `66140b1` | `pytest tests -q` (gateway) + rougeur rejouée | 685 réussis ; HTTP/2 rendu selon `nginx -v`, seuil inversé → 4 échecs 🔬 |
-| 2026-07-30 | **Vague 4** | `66140b1` | Les 2 suites + `bash -n` sur les 10 scripts de déploiement | **741 réussis** (685 / 56), 6 défauts terrain fermés 🔬 |
+| 2026-07-30 | OPS-010 | `d58b365` | `pytest tests -q` (gateway + node_agent) | Rétention bornée des venvs, cible du symlink protégée ; rouge en retirant cette protection 🔬 |
+| 2026-07-30 | **Vague 4** | `532a5da` | Les 2 suites + `bash -n` sur les 12 scripts de déploiement | **758 réussis** (695 / 63), 6 défauts terrain fermés + OPS-010 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -315,10 +318,32 @@ des commits atomiques ensuite fusionnés dans la branche de lot.
 | C3 | COR-017 (part gateway), OPS-008 | P0 / P1 | `gateway/deploy/install.sh`, `update.sh` | `8961607`, `ad953bc` | +19 | `[x]` |
 | C4 | OPS-009, COR-009 | P2 / P1 | `gateway/deploy/nginx.conf`, `docs/api.md` | `28acf1c`, `0c2efcb` | +16 | `[x]` |
 | — | OPS-009 (complément) | P2 | `gateway/deploy/nginx-lib.sh` | `66140b1` | +12 | `[x]` |
+| — | OPS-010 (corollaire) | P1 | `*/deploy/*venv*-lib.sh` | `d58b365` | +17 | `[~]` |
 
-**Total : +63 tests**, chacun vérifié rouge avant correctif et vert après. La
+**Total : +80 tests**, chacun vérifié rouge avant correctif et vert après. La
 rougeur de C1, C2 et C3 a été **re-jouée indépendamment par l'orchestrateur**
 avant fusion, pas seulement rapportée par le chantier.
+
+#### OPS-010, le défaut que la vague a elle-même créé
+
+COR-016 supprime le déplacement de venv au profit d'une bascule par symlink.
+Corollaire immédiat, et signalé par le chantier lui-même : **plus aucun venv
+n'est écrasé**, donc chaque mise à jour laisse une arborescence complète sur le
+disque — environ 200 Mo par mise à jour et par nœud — sans que rien ne borne
+l'accumulation ni ne la signale. `gateway/deploy/update.sh` portait d'ailleurs
+le même comportement depuis toujours ; COR-016 l'a rendu visible en
+l'étendant au node-agent.
+
+La rétention est désormais explicite et bornée des deux côtés (`EVA_*_VENV_KEEP`,
+défaut 2 : l'active et la précédente, celle que réclame le retour arrière manuel).
+Trois garde-fous méritent d'être connus : la cible courante du symlink n'est
+**jamais** supprimée quel que soit son âge, l'ordre est celui des dates de
+modification et non des noms (un nom de release gateway commence par un hash de
+commit et ne se trie pas), et la purge n'a lieu qu'**après** validation — purger
+plus tôt supprimerait ce vers quoi le rollback rebascule.
+
+L'item reste `[~]` : les venvs sont bornés, les sauvegardes
+`*.pre-migration.*.bak` d'OPS-006 ne le sont toujours pas (suivi sous OPS-002).
 
 #### Les deux points de vigilance, et ce qu'ils ont donné
 
@@ -1425,5 +1450,5 @@ Une entrée de backlog n'est terminée que si :
 | Date | Auteur | Modification | Preuve |
 |---|---|---|---|
 | 2026-07-30 | Codex | Création du plan consolidé, analyse du rapport externe et architecture du bootstrap | Audit local, 433 tests, sources officielles listées ci-dessus |
-| 2026-07-30 | Claude | Vague 4 : fermeture des 6 défauts du premier déploiement réel, plus COR-009. En-tête de suivi §0.0 ajouté | 4 chantiers en worktrees isolés, 8 commits, **741 tests** (+63), rougeur de chaque correctif rejouée indépendamment avant fusion |
+| 2026-07-30 | Claude | Vague 4 : fermeture des 6 défauts du premier déploiement réel, plus COR-009 et OPS-010. En-tête de suivi §0.0 ajouté | 4 chantiers en worktrees isolés, **758 tests** (+80), rougeur de chaque correctif rejouée indépendamment avant fusion |
 | 2026-07-30 | Codex | Relecture de `claude-analyse-projet.md`; correction du statut de la supposée course pin, ajout de doctor, inspection GGUF, migrations et ordre de travail performance | Lecture intégrale du document Claude, vérification du segment asyncio et du paquet officiel `gguf` |
