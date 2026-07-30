@@ -43,7 +43,7 @@ LimitNPROC=4096
 # avec mlock, les pages ne sont plus réclamables et MemoryMax devient un vrai
 # plafond dur. Ne pas relever cette limite « au cas où ».
 
-# ── Durcissement sécurité (aligné sur gateway-student, adapté à l'accès GPU) ──
+# ── Durcissement sécurité (adapté aux contraintes de l'accès GPU) ─────────────
 # La gateway lance llama-server en sous-processus (create_subprocess_exec,
 # start_new_session=True) et a besoin du GPU CUDA. Les directives qui casseraient
 # ce lancement ou l'accès aux devices NVIDIA sont volontairement OMISES ou
@@ -75,7 +75,7 @@ LockPersonality=true
 
 # NE PAS activer PrivateDevices=true : masquerait /dev/nvidia*, /dev/nvidiactl,
 # /dev/nvidia-uvm et /dev/dri/* → CUDA indisponible pour les sous-processus
-# llama-server. La gateway étudiante l'active car elle ne touche jamais au GPU.
+# llama-server. Ne l'activer que sur un service qui ne touche jamais au GPU.
 # PrivateDevices=true   # ← INTERDIT ICI (casse CUDA)
 
 # NE PAS activer MemoryDenyWriteExecute=true : casse le JIT (CUDA PTX/JIT,

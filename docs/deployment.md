@@ -1518,8 +1518,8 @@ curl http://127.0.0.1:8000/health
 
 ## 15. Durcissement systemd et profils mémoire
 
-`gateway/deploy/llm-gateway.service` est aligné sur le niveau de durcissement du
-service étudiant, **à l'exception des directives incompatibles avec l'accès GPU**.
+`gateway/deploy/llm-gateway.service` applique le durcissement systemd maximal,
+**à l'exception des directives incompatibles avec l'accès GPU**.
 Directives ajoutées : `ProtectKernelTunables`, `ProtectKernelModules`,
 `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `RestrictNamespaces`,
 `RestrictRealtime`, `RestrictSUIDSGID`, `LockPersonality`,
@@ -1532,7 +1532,7 @@ Directives ajoutées : `ProtectKernelTunables`, `ProtectKernelModules`,
 
 | Directive | Pourquoi omise |
 |-----------|----------------|
-| `PrivateDevices=true` | Masquerait `/dev/nvidia*` et `/dev/dri/*` → CUDA indisponible pour les sous-processus `llama-server`. (Le service étudiant l'active car il ne touche jamais au GPU.) |
+| `PrivateDevices=true` | Masquerait `/dev/nvidia*` et `/dev/dri/*` → CUDA indisponible pour les sous-processus `llama-server`. (À réserver aux unités qui ne touchent jamais au GPU, comme l'orchestrateur cluster.) |
 | `MemoryDenyWriteExecute=true` | Casse le JIT (CUDA PTX/JIT, certains chemins Python/allocateurs). |
 | `CapabilityBoundingSet=` (vide) | Non nécessaire au GPU (l'accès passe par les nœuds devices + groupes `render,video`), laissé au défaut pour rester conservateur. |
 
@@ -1688,7 +1688,6 @@ Pour l'activer :
 | `gateway/deploy/llm-gateway.service` (mode local) | **oui** | `MemoryHigh=80%` / `MemoryMax=90%` / `MemorySwapMax=0` | **oui** — table ci-dessus |
 | `node_agent/deploy/llm-gateway-agent.service` (nœud GPU, mode cluster) | **oui** | idem | **oui** — la même table s'applique à la RAM du **nœud** |
 | `gateway/deploy/llm-gateway-cluster.service` (orchestrateur) | non (pas de GPU, `PrivateDevices=true`, pas de `/models`) | `MemoryHigh=4G` / `MemoryMax=8G`, absolues | non |
-| `gateway-student/deploy/llm-gateway-student.service` | non (proxy d'edge) | `MemoryHigh=512M` / `MemoryMax=1G`, absolues | non |
 | `gateway/deploy/llm-gateway-backup.service` | non (`sqlite3 .backup`) | aucune limite mémoire | non |
 
 En mode cluster, **augmenter la RAM ou la limite de l'orchestrateur ne sert à
