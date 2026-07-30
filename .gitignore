@@ -21,6 +21,9 @@ env/
 *.sqlite3
 *.log
 logs/
+# Sauvegardes produites avant une migration de schéma (OPS-006). Elles portent
+# une extension .bak, donc *.db ci-dessus ne les couvre pas.
+*.pre-migration.*.bak
 
 # Secrets and local configuration
 .env
