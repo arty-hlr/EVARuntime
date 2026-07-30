@@ -47,6 +47,40 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 section() { echo -e "\n${CYAN}▶ $*${NC}"; }
 
+# ── Démarrages systemd (COR-017) ──────────────────────────────────────────────
+# Une unité qui a échoué plusieurs fois de suite atteint son start-limit :
+# systemd refuse alors TOUT démarrage (« Start request repeated too quickly »)
+# tant que le compteur n'est pas remis à zéro. C'est exactement ce qui a laissé
+# la gateway à terre après un rollback de mode. `reset-failed` remet ce compteur
+# à zéro; sur une unité saine c'est un no-op, donc sans risque avant chaque
+# démarrage. Toute (re)mise en marche d'une unité passe par ces fonctions.
+systemctl_start() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl start "$unit"
+}
+
+systemctl_restart() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl restart "$unit"
+}
+
+# Le service n'a pas pu être remis en marche alors que tout ce qui pouvait être
+# restauré l'a déjà été : c'est une COUPURE de service, pas un avertissement.
+# Message sans ambiguïté, commande de rétablissement exacte, sortie non nulle.
+service_down() {
+    echo "" >&2
+    echo -e "${RED}[INDISPONIBILITÉ]${NC} $*" >&2
+    echo -e "${RED}[INDISPONIBILITÉ]${NC} llm-gateway n'a PAS redémarré : la gateway est À TERRE." >&2
+    echo "  Rétablissement manuel immédiat :" >&2
+    echo "    sudo systemctl reset-failed llm-gateway" >&2
+    echo "    sudo systemctl start llm-gateway" >&2
+    echo "    sudo systemctl status llm-gateway --no-pager" >&2
+    echo "    sudo journalctl -u llm-gateway -n 100 --no-pager" >&2
+    exit 1
+}
+
 # SCRIPT_DIR = gateway/ (un niveau au-dessus de deploy/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -293,7 +327,7 @@ rollback_venv() {
 }
 
 rollback_failed_transaction() {
-    local exit_code="$1"
+    local exit_code="$1" restart_failed=false
     [[ "$TRANSACTION_ARMED" == true ]] || return "$exit_code"
 
     trap - ERR
@@ -306,10 +340,16 @@ rollback_failed_transaction() {
     fi
     restore_previous_service_unit "${PREVIOUS_MODE:-local}"
     systemctl daemon-reload
+    # `set +e` est actif : on RESTAURE d'abord tout ce qui peut l'être, on relève
+    # l'échec de démarrage seulement ensuite (COR-017). L'inverse interromprait
+    # le rollback à mi-chemin.
     if [[ "$SERVICE_RESTART_STARTED" == true ]]; then
-        systemctl start llm-gateway
+        systemctl_start llm-gateway || restart_failed=true
     fi
     warn "Code, venv, mode et unité précédents restaurés. Snapshot : $CODE_SNAPSHOT"
+    if [[ "$restart_failed" == true ]]; then
+        service_down "Rollback transactionnel terminé, mais le redémarrage du service a ÉCHOUÉ."
+    fi
     exit "$exit_code"
 }
 
@@ -376,7 +416,10 @@ rollback_deployed_release() {
         restore_previous_service_unit "$PREVIOUS_MODE"
         systemctl daemon-reload
         systemctl stop llm-gateway || true
-        systemctl start llm-gateway || true
+        # Mode, code, venv et unité sont restaurés : plus rien n'est en attente.
+        # Un échec de démarrage ici est une indisponibilité, pas un avertissement.
+        systemctl_start llm-gateway || \
+            service_down "Rollback du mode $EFFECTIVE_MODE → $PREVIOUS_MODE : démarrage refusé par systemd."
         for attempt in $(seq 1 20); do
             sleep 2
             if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
@@ -392,7 +435,10 @@ rollback_deployed_release() {
     restore_previous_service_unit "$EFFECTIVE_MODE"
     systemctl daemon-reload
     systemctl stop llm-gateway || true
-    systemctl start llm-gateway || true
+    # Snapshot, venv et unité sont restaurés : plus rien n'est en attente.
+    # Un échec de démarrage ici est une indisponibilité, pas un avertissement.
+    systemctl_start llm-gateway || \
+        service_down "Rollback vers $CODE_SNAPSHOT : démarrage refusé par systemd."
 
     ROLLBACK_OK=false
     for attempt in $(seq 1 20); do
@@ -635,7 +681,7 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/llm-gateway.conf"
 if [[ ! -f "$JOURNALD_DROPIN" ]]; then
     mkdir -p /etc/systemd/journald.conf.d
     cp "$SCRIPT_DIR/deploy/journald-llm-gateway.conf" "$JOURNALD_DROPIN"
-    systemctl restart systemd-journald
+    systemctl_restart systemd-journald
     info "Rotation journald installée (SystemMaxUse=500M, rétention 30 j)."
 else
     info "Rotation journald déjà présente — conservée ($JOURNALD_DROPIN)."
@@ -669,7 +715,10 @@ systemctl stop llm-gateway || true
 activate_staged_venv
 
 info "Démarrage du service…"
-systemctl start llm-gateway || warn "systemctl start a échoué; la readiness déclenchera le rollback."
+# Chemin nominal : l'échec reste DÉLIBÉRÉMENT non fatal. La sonde de readiness
+# ci-dessous enchaîne sur `rollback_deployed_release`, qui restaure la version
+# précédente — un `error` ici court-circuiterait ce rollback.
+systemctl_start llm-gateway || warn "Le démarrage a échoué; la readiness déclenchera le rollback."
 
 # ── Attente du health check ───────────────────────────────────────────────────
 

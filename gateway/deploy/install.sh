@@ -69,6 +69,18 @@ info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# ── Démarrages systemd (COR-017) ──────────────────────────────────────────────
+# Une unité qui a échoué plusieurs fois de suite atteint son start-limit :
+# systemd refuse alors TOUT démarrage (« Start request repeated too quickly »)
+# tant que le compteur n'est pas remis à zéro. `reset-failed` remet ce compteur
+# à zéro; sur une unité saine c'est un no-op, donc sans risque avant chaque
+# démarrage. Toute (re)mise en marche d'une unité passe par ces fonctions.
+systemctl_restart() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl restart "$unit"
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
@@ -372,6 +384,10 @@ else
 fi
 systemctl daemon-reload
 systemctl enable llm-gateway.service
+# Réinstallation sur un hôte où l'unité était en `failed` : sans cette remise à
+# zéro, le `systemctl start` que l'opérateur lance à l'étape finale peut se voir
+# refuser par le start-limit systemd (COR-017).
+systemctl reset-failed llm-gateway.service 2>/dev/null || true
 info "Service systemd installé et activé."
 
 # ── 7b. Timer de sauvegarde quotidienne de la DB ──────────────────────────────
@@ -422,7 +438,7 @@ if [[ ! -f "$JOURNALD_DROPIN" ]]; then
     info "Installation de la rotation journald…"
     mkdir -p /etc/systemd/journald.conf.d
     cp "$SCRIPT_DIR/deploy/journald-llm-gateway.conf" "$JOURNALD_DROPIN"
-    systemctl restart systemd-journald
+    systemctl_restart systemd-journald
     info "Rotation journald installée (SystemMaxUse=500M, rétention 30 j)."
 else
     info "Configuration journald existante conservée : $JOURNALD_DROPIN"
