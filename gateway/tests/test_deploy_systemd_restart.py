@@ -121,7 +121,9 @@ def test_deploy_scripts_route_starts_through_the_helpers() -> None:
     update = UPDATE_SH.read_text(encoding="utf-8")
     install = INSTALL_SH.read_text(encoding="utf-8")
 
-    assert update.count("systemctl_start llm-gateway") == 4, (
+    # `(?![\\w.-])` : ne pas confondre llm-gateway avec llm-gateway-backup.timer.
+    gateway_starts = re.findall(r"systemctl_start llm-gateway(?![\w.-])", update)
+    assert len(gateway_starts) == 4, (
         "update.sh doit démarrer llm-gateway par systemctl_start sur ses 4 sites : "
         "rollback transactionnel, rollback de mode, rollback de snapshot, bascule nominale."
     )

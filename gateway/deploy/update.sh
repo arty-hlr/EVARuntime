@@ -13,7 +13,9 @@
 # systemd principal, timer de sauvegarde SQLite et son script. La rotation
 # journald est installée si absente (jamais écrasée). Le timer de sauvegarde
 # n'est (ré)activé automatiquement que s'il n'a jamais été installé — un timer
-# volontairement désactivé par l'opérateur est laissé tel quel.
+# volontairement désactivé par l'opérateur est laissé tel quel. Un timer activé
+# mais resté INACTIF (défaut OPS-008 des versions antérieures) est en revanche
+# armé, sans quoi aucune sauvegarde ne tourne jusqu'au prochain reboot.
 #
 # Il ne régénère jamais un secret existant et ne remplace jamais nodes.yaml.
 # Pour mettre à jour aussi nginx : ajouter --nginx en argument.
@@ -64,6 +66,13 @@ systemctl_restart() {
     local unit="$1"
     systemctl reset-failed "$unit" 2>/dev/null || true
     systemctl restart "$unit"
+}
+
+# `enable --now` = enable + start : il arme réellement le timer (OPS-008).
+systemctl_enable_now() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl enable --now "$unit"
 }
 
 # Le service n'a pas pu être remis en marche alors que tout ce qui pouvait être
@@ -656,9 +665,22 @@ cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
 systemctl daemon-reload
 
+# Un timer de sauvegarde récalcitrant ne doit jamais faire échouer — ni pire,
+# faire rollbacker — une mise à jour par ailleurs saine : les deux armements
+# ci-dessous sont volontairement non fatals et se contentent d'un avertissement.
 case "$BACKUP_TIMER_STATE" in
     enabled)
-        info "Timer de sauvegarde déjà actif — unités rafraîchies."
+        # OPS-008 : les versions antérieures faisaient `enable` sans `--now`. Le
+        # timer est alors `enabled` mais `inactive` : absent de `list-timers`, il
+        # ne sauvegarde rien jusqu'au prochain reboot. On répare cet état ici.
+        if systemctl is-active --quiet llm-gateway-backup.timer; then
+            info "Timer de sauvegarde déjà armé — unités rafraîchies."
+        elif systemctl_start llm-gateway-backup.timer; then
+            info "Timer de sauvegarde activé mais inactif — armé (03:15, rétention 14 j)."
+        else
+            warn "Timer de sauvegarde activé mais INACTIF, et son démarrage a échoué."
+            warn "  sudo systemctl start llm-gateway-backup.timer"
+        fi
         ;;
     disabled|masked)
         warn "Timer de sauvegarde présent mais désactivé (choix opérateur) — laissé tel quel."
@@ -666,12 +688,17 @@ case "$BACKUP_TIMER_STATE" in
         ;;
     *)
         # Vide/introuvable = jamais installé (première mise à jour depuis cette version).
-        if command -v sqlite3 &>/dev/null; then
-            systemctl enable llm-gateway-backup.timer
-            info "Timer de sauvegarde quotidienne activé (03:15, rétention 14 j)."
-        else
-            warn "sqlite3 introuvable — timer copié mais NON activé."
+        # `--now` : sans lui le timer resterait inactive jusqu'au prochain reboot.
+        # La base existe déjà à ce stade (elle vient même d'être sauvegardée en
+        # 4c), donc un éventuel rattrapage `Persistent=true` est sans danger.
+        if ! command -v sqlite3 &>/dev/null; then
+            warn "sqlite3 introuvable — timer copié mais NON armé."
             warn "  apt install sqlite3 && sudo systemctl enable --now llm-gateway-backup.timer"
+        elif systemctl_enable_now llm-gateway-backup.timer; then
+            info "Timer de sauvegarde quotidienne armé (03:15, rétention 14 j)."
+        else
+            warn "Timer de sauvegarde NON armé — vérifiez puis relancez :"
+            warn "  sudo systemctl enable --now llm-gateway-backup.timer"
         fi
         ;;
 esac

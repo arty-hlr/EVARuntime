@@ -81,6 +81,13 @@ systemctl_restart() {
     systemctl restart "$unit"
 }
 
+# `enable --now` = enable + start : il arme réellement le timer (OPS-008).
+systemctl_enable_now() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl enable --now "$unit"
+}
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
@@ -390,28 +397,6 @@ systemctl enable llm-gateway.service
 systemctl reset-failed llm-gateway.service 2>/dev/null || true
 info "Service systemd installé et activé."
 
-# ── 7b. Timer de sauvegarde quotidienne de la DB ──────────────────────────────
-# Le service oneshot exécute /opt/llm-gateway/deploy/llm-gateway-backup.sh ; le
-# script doit donc être déployé dans INSTALL_DIR (pas seulement dans le dépôt).
-
-info "Installation du timer de sauvegarde SQLite…"
-mkdir -p "$INSTALL_DIR/deploy"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
-chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
-chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
-systemctl daemon-reload
-# `enable` (sans --now) : planifie le prochain 03:15 sans lancer de backup
-# immédiat — la DB n'est initialisée qu'à l'étape 9.
-if command -v sqlite3 &>/dev/null; then
-    systemctl enable llm-gateway-backup.timer
-    info "Timer de sauvegarde activé (quotidien 03:15, rétention 14 j)."
-else
-    warn "sqlite3 introuvable — timer copié mais NON activé. Après 'apt install sqlite3' :"
-    warn "  sudo systemctl enable --now llm-gateway-backup.timer"
-fi
-
 # ── 8. Nginx ──────────────────────────────────────────────────────────────────
 
 if command -v nginx &>/dev/null; then
@@ -457,6 +442,41 @@ asyncio.run(database.init_db())
 print('DB initialisée.')
 "
 chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/gateway.db" 2>/dev/null || true
+
+# ── 9b. Timer de sauvegarde quotidienne de la DB ──────────────────────────────
+# Le service oneshot exécute /opt/llm-gateway/deploy/llm-gateway-backup.sh ; le
+# script doit donc être déployé dans INSTALL_DIR (pas seulement dans le dépôt).
+#
+# ORDRE (OPS-008) : cette étape suit délibérément l'initialisation de la base.
+# Le timer est armé avec `--now`, et sur une RÉinstallation le stamp
+# `Persistent=true` peut être périmé — systemd rattraperait alors l'occurrence
+# manquée immédiatement. Armer après l'étape 9 garantit qu'une sauvegarde
+# déclenchée aussitôt trouve une base déjà initialisée.
+
+info "Installation du timer de sauvegarde SQLite…"
+mkdir -p "$INSTALL_DIR/deploy"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
+systemctl daemon-reload
+# `--now` est INDISPENSABLE : `enable` seul crée le lien dans timers.target mais
+# laisse le timer `inactive` jusqu'au prochain reboot — absent de `list-timers`,
+# aucune sauvegarde. Sur une installation neuve, ce premier `start` ne déclenche
+# PAS de rattrapage : sans stamp préexistant, systemd pose le stamp sans exécuter
+# le job.
+if command -v sqlite3 &>/dev/null; then
+    if systemctl_enable_now llm-gateway-backup.timer; then
+        info "Timer de sauvegarde armé (quotidien 03:15, rétention 14 j)."
+    else
+        warn "Timer de sauvegarde NON armé — vérifiez puis relancez :"
+        warn "  sudo systemctl enable --now llm-gateway-backup.timer"
+    fi
+else
+    warn "sqlite3 introuvable — timer copié mais NON armé. Après 'apt install sqlite3' :"
+    warn "  sudo systemctl enable --now llm-gateway-backup.timer"
+fi
 
 # ── 10. Résumé ────────────────────────────────────────────────────────────────
 
