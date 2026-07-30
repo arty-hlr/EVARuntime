@@ -95,6 +95,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=deploy-mode-lib.sh
 source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
+# shellcheck source=nginx-lib.sh
+source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 
 usage() {
     cat <<EOF
@@ -594,7 +596,9 @@ info "Mode $EFFECTIVE_MODE activé."
 if [[ "$UPDATE_NGINX" == true ]]; then
     section "4b. Mise à jour nginx"
     if command -v nginx &>/dev/null; then
-        cp "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+        # Même rendu conditionnel qu'à l'installation (OPS-009).
+        nginx_render_conf "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+        info "nginx ${NGINX_DETECTED_VERSION:-?} — HTTP/2 : ${NGINX_HTTP2_FORM}"
         if nginx -t 2>/dev/null; then
             nginx -s reload
             info "nginx rechargé."
@@ -657,10 +661,11 @@ cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
 # répertoire pour lire l'EnvironmentFile sans jamais le sourcer.
 cp "$SCRIPT_DIR/deploy/smoke_test.sh"       "$INSTALL_DIR/deploy/"
 cp "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"  "$INSTALL_DIR/deploy/"
+cp "$SCRIPT_DIR/deploy/nginx-lib.sh"        "$INSTALL_DIR/deploy/"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
 chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh" \
           "$INSTALL_DIR/deploy/smoke_test.sh"
-chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh"
+chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh" "$INSTALL_DIR/deploy/nginx-lib.sh"
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
 systemctl daemon-reload

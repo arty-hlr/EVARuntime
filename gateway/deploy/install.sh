@@ -16,6 +16,8 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=deploy-mode-lib.sh
 source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
+# shellcheck source=nginx-lib.sh
+source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 
 usage() {
     cat <<EOF
@@ -401,7 +403,10 @@ info "Service systemd installé et activé."
 
 if command -v nginx &>/dev/null; then
     info "Configuration nginx…"
-    cp "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+    # HTTP/2 est activé sous la forme que comprend le nginx local (OPS-009) :
+    # la conf livrée reste neutre, le script écrit la bonne directive.
+    nginx_render_conf "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+    info "nginx ${NGINX_DETECTED_VERSION:-?} — HTTP/2 : ${NGINX_HTTP2_FORM}"
     ln -sf /etc/nginx/sites-available/llm-gateway /etc/nginx/sites-enabled/llm-gateway 2>/dev/null || true
 
     if nginx -t 2>/dev/null; then
