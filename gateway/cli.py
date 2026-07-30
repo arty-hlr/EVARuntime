@@ -451,5 +451,69 @@ def status():
     console.print()
 
 
+# ── Diagnostic préflight (AUT-012) ────────────────────────────────────────────
+
+@app.command("doctor")
+def doctor(
+    json_output: bool = typer.Option(
+        False, "--json", help="Rapport JSON (schéma stable) au lieu du texte"
+    ),
+    env_file: Optional[str] = typer.Option(
+        None, "--env-file",
+        help="EnvironmentFile à valider (défaut : EnvironmentFile= de l'unité systemd, sinon /etc/llm-gateway/env)",
+    ),
+    nginx_conf: Optional[str] = typer.Option(
+        None, "--nginx-conf",
+        help="Configuration nginx à contrôler (défaut : /etc/nginx/sites-available/llm-gateway)",
+    ),
+    systemd_unit: Optional[str] = typer.Option(
+        None, "--systemd-unit",
+        help="Unité systemd à contrôler (défaut : /etc/systemd/system/llm-gateway.service)",
+    ),
+    verify_hashes: bool = typer.Option(
+        False, "--verify-hashes",
+        help="Vérifie les empreintes SHA-256 des GGUF — COÛTEUX (lecture intégrale, plusieurs centaines de Go)",
+    ),
+    strict: bool = typer.Option(
+        False, "--strict", help="Traite les avertissements comme des échecs bloquants"
+    ),
+):
+    """
+    Diagnostic préflight de l'hôte et de la configuration (aucun service requis).
+
+    Exit codes : 0 conforme, 1 échec bloquant, 3 avertissements seulement,
+    4 erreur interne de doctor (2 est réservé aux erreurs d'usage de la CLI).
+    Aucun secret n'apparaît dans le rapport. Détails : docs/admin.md.
+    """
+    from pathlib import Path as _Path
+
+    import doctor as doctor_module
+
+    try:
+        options = doctor_module.DoctorOptions(
+            env_file=_Path(env_file) if env_file else None,
+            nginx_conf=_Path(nginx_conf) if nginx_conf else None,
+            systemd_unit=_Path(systemd_unit) if systemd_unit else None,
+            verify_hashes=verify_hashes,
+        )
+        report = _run(doctor_module.run_doctor(options))
+    except Exception as exc:
+        console.print(f"[red]doctor a échoué :[/red] {type(exc).__name__}: {exc}")
+        raise typer.Exit(doctor_module.EXIT_ERROR)
+
+    if json_output:
+        # Écriture brute : le rendu rich reformaterait le document JSON.
+        sys.stdout.write(doctor_module.render_json(report, strict=strict) + "\n")
+    else:
+        console.print(
+            doctor_module.render_human(report, strict=strict),
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+
+    raise typer.Exit(report.exit_code(strict=strict))
+
+
 if __name__ == "__main__":
     app()

@@ -19,6 +19,7 @@ Trois interfaces sont disponibles :
 5. [Rapports d'usage](#5-rapports-dusage)
 6. [Contrôle des modèles](#6-contrôle-des-modèles)
 7. [Référence API REST admin](#7-référence-api-rest-admin)
+8. [Diagnostic préflight — `doctor`](#8-diagnostic-préflight--doctor)
 
 ---
 
@@ -1229,6 +1230,297 @@ curl -s "$GW/admin/metrics/overview" \
 #   }
 # }
 ```
+
+---
+
+## 8. Diagnostic préflight — `doctor`
+
+`doctor` inspecte l'**hôte** et la **configuration** et dit, avant tout
+démarrage, si la gateway pourra servir. Il ne contacte aucun service, ne charge
+aucun modèle et fonctionne donc **avant le premier `systemctl start`** comme
+pendant un incident.
+
+Quatre usages :
+
+- manuellement, après `install.sh` et avant d'activer le service ;
+- depuis `install.sh`, avant activation ;
+- depuis `update.sh`, avant et après bascule de version ;
+- lors d'un incident, pour distinguer un problème d'hôte d'un problème de code.
+
+À ne pas confondre avec les deux autres sondes :
+
+| Outil | Question à laquelle il répond | Service requis |
+|---|---|---|
+| `GET /health` | Le process répond-il ? | oui |
+| `GET /ready` | La gateway peut-elle servir maintenant ? | oui |
+| `doctor` | L'hôte et la configuration sont-ils corrects ? | **non** |
+
+### Usage
+
+```bash
+# Depuis le répertoire d'installation, avec le venv du service
+cd /opt/llm-gateway
+
+# Diagnostic complet, sortie humaine
+sudo venv/bin/python cli.py doctor
+
+# Sortie JSON (schéma stable) pour un script de déploiement
+sudo venv/bin/python cli.py doctor --json
+
+# Cibler explicitement des artefacts (utile en staging ou hors installation standard)
+sudo venv/bin/python cli.py doctor \
+    --env-file /etc/llm-gateway/env \
+    --nginx-conf /etc/nginx/sites-available/llm-gateway \
+    --systemd-unit /etc/systemd/system/llm-gateway.service
+
+# Vérifier en plus l'intégrité SHA-256 des GGUF — COÛTEUX (lecture intégrale)
+sudo venv/bin/python cli.py doctor --verify-hashes
+
+# Traiter les avertissements comme bloquants (recette de mise en production)
+sudo venv/bin/python cli.py doctor --strict
+```
+
+| Option | Effet | Défaut |
+|---|---|---|
+| `--json` | Document JSON au lieu du rapport texte | texte |
+| `--env-file` | EnvironmentFile à valider | `EnvironmentFile=` lu dans l'unité systemd, sinon `/etc/llm-gateway/env`, sinon `./.env` |
+| `--nginx-conf` | Configuration nginx à contrôler | `/etc/nginx/sites-available/llm-gateway` |
+| `--systemd-unit` | Unité systemd à contrôler | `/etc/systemd/system/llm-gateway.service` |
+| `--verify-hashes` | Calcule le SHA-256 des GGUF déclarés | désactivé |
+| `--strict` | Les avertissements deviennent bloquants | désactivé |
+
+`doctor` valide **le fichier d'environnement que systemd donnera au service**, pas
+l'environnement du shell appelant : une variable exportée dans votre session ne
+peut ni masquer ni compléter le fichier ciblé.
+
+**Sans `sudo`**, les contrôles qui exigent des droits (lecture du fichier de
+secrets, de la clé TLS) dégradent en `skip`/`warn` avec la raison, jamais en
+faux négatif silencieux.
+
+### Grille des exit codes
+
+| Code | Signification | Conduite à tenir |
+|---|---|---|
+| `0` | Tous les contrôles passent — aucun échec, aucun avertissement | démarrer / basculer |
+| `1` | Au moins un contrôle **critique** en échec | **ne pas** démarrer ni basculer ; corriger d'abord |
+| `2` | *Réservé* : erreur d'usage de la CLI (option inconnue) | corriger la ligne de commande |
+| `3` | Avertissements seulement, aucun échec bloquant | démarrage possible, dette à traiter |
+| `4` | Erreur interne de `doctor` | signaler ; ne pas conclure sur l'état de l'hôte |
+
+`2` n'est pas utilisé pour les avertissements précisément parce que Typer/Click
+le renvoie déjà pour une erreur d'usage : un script qui accepterait `2` ne
+distinguerait plus « hôte imparfait » de « faute de frappe dans le script ».
+
+Dans un script de déploiement, la lecture correcte est donc :
+
+```bash
+set +e
+sudo venv/bin/python cli.py doctor --json > /tmp/doctor.json
+status=$?
+set -e
+case "$status" in
+    0) echo "Hôte conforme." ;;
+    3) echo "Avertissements — voir /tmp/doctor.json." ;;
+    *) echo "Diagnostic bloquant (code $status) — arrêt." >&2; exit 1 ;;
+esac
+```
+
+### Contrôles effectués
+
+Statut par contrôle : `pass`, `warn`, `fail`, `skip`. Seul un `fail` **critique**
+bloque (exit 1) ; un `skip` n'est jamais un échec.
+
+Contrôles structurels, partagés avec `GET /ready` (module `readiness.py`) :
+
+| Contrôle | Ce qu'il vérifie | Mode cluster |
+|---|---|---|
+| `models_config` | `models.yaml` présent et lisible | contrôlé |
+| `enabled_models` | au moins un modèle activé | contrôlé |
+| `secrets` | secrets non laissés à `CHANGE_ME_*` (avertissement) | contrôlé |
+| `llama_server_binary` | binaire présent et exécutable | `skip` (vit sur les nœuds) |
+| `model_files` | GGUF et projecteurs présents et lisibles | `skip` (vivent sur les nœuds) |
+| `database` | répertoire et fichier SQLite inscriptibles | contrôlé |
+| `log_dir` | répertoire de logs inscriptible (avertissement) | contrôlé |
+| `vram_budget_fit` | au moins un modèle activé tient dans le budget VRAM | `skip` (budget des nœuds) |
+| `cluster_nodes_config` | `nodes.yaml` présent et lisible | contrôlé |
+| `cluster_nodes_online` | heartbeat des nœuds | **toujours `skip`** : exige un service vivant |
+| `serving_capacity` | capacité de service immédiate | **toujours `skip`** : exige un service vivant |
+
+Contrôles propres à `doctor` :
+
+| Contrôle | Ce qu'il vérifie | Bloquant | Mode cluster |
+|---|---|---|---|
+| `config_env_file` | permissions du fichier de secrets (attendu 0600/0640), lisibilité par le `User=` de l'unité, chargement de la configuration | oui | contrôlé |
+| `models_registry` | `models.yaml` se **parse** réellement : chemins absolus, `.gguf`, allowlist `ALLOWED_MODEL_DIRS`, paramètres `llama.cpp` valides | oui | contrôlé |
+| `database_permissions` | base, `-wal`, `-shm` et répertoire non exposés (jugé avec la traversée des parents) | oui si atteignable par tous | contrôlé |
+| `disk_space` | espace libre sur les volumes de la base et des logs | oui sous 0,5 Go | contrôlé |
+| `llama_server_version` | `llama-server --version` confronté à `LLAMA_SERVER_MIN_BUILD` | oui | `skip` |
+| `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability | non (avertissement) | `skip` |
+| `vram_detected` | budget VRAM net vs VRAM des devices **réellement exposés par `CUDA_VISIBLE_DEVICES`** | oui si le budget net dépasse le matériel ; avertissement si `TOTAL_VRAM_GB` est seulement nominalement supérieur | `skip` |
+| `model_artifacts` | taille et plausibilité des GGUF/mmproj ; intégrité SHA-256 **seulement** avec `--verify-hashes` | oui | `skip` |
+| `port_pool` | pool `BASE_LLAMA_PORT … +MAX_LOADED_MODELS-1` libre, pas de collision avec `GATEWAY_PORT` | oui pour la collision, avertissement pour un port occupé | `skip` |
+| `nginx_timeouts` | `proxy_read_timeout` des blocs proxifiants vs `MODEL_LOAD_TIMEOUT_SECONDS + 10` | non (avertissement) | contrôlé |
+| `tls_certificate` | certificat **fourni** : présence, lisibilité, expiration, correspondance au `server_name` ; permissions de la clé | oui | contrôlé |
+| `systemd_limits` | politique mémoire déclarée, `TasksMax` dérivé de `MAX_LOADED_MODELS`, working set des modèles `cpu_moe` sous `MemoryHigh`, répertoires de modèles déclarés | oui pour le profil mémoire | contrôlé |
+| `cluster_agent_secret` | `AGENT_SECRET` présent et ≥ 32 caractères (sans quoi le service refuse de démarrer) | oui | `skip` en local |
+| `cluster_nodes_inventory` | `nodes.yaml` se **parse**, au moins un nœud, `tls_verify` actif | oui | `skip` en local |
+
+Points de conception à connaître :
+
+- **Aucune empreinte SHA-256 n'est calculée par défaut.** Un catalogue de
+  production pèse plusieurs centaines de gigaoctets : hacher à chaque diagnostic
+  saturerait le stockage. `doctor` se limite à des `stat` ; l'intégrité est
+  réservée à `--verify-hashes`.
+- **Politique fail-closed de version.** Si `LLAMA_SERVER_MIN_BUILD > 0` mais que
+  la version du binaire est illisible, le contrôle **échoue** : on ne peut pas
+  prouver que le binaire est patché. Avec `LLAMA_SERVER_MIN_BUILD=0`, `doctor`
+  avertit que le garde-fou supply-chain est inerte.
+- **`nvidia-smi` absent** n'est pas un échec bloquant : en mode cluster c'est
+  normal (`skip`), en mode local c'est un avertissement (un hôte de
+  développement sans GPU doit rester diagnosticable).
+- **VRAM : le critère bloquant est le budget NET**, c'est-à-dire
+  `TOTAL_VRAM_GB - VRAM_OVERHEAD_GB - marge`, puisque c'est lui que le contrôle
+  d'admission distribue. Un `TOTAL_VRAM_GB` nominal légèrement supérieur à la
+  VRAM utilisable (48 « Go » commerciaux contre 46068 MiB exposés sur une L40S)
+  n'est qu'un avertissement : la marge absorbe l'écart, mais il la ronge.
+- **Un port du pool occupé n'est qu'un avertissement**, car `update.sh` appelle
+  `doctor` après bascule, où un port peut être tenu par un modèle légitimement
+  chargé.
+- **Les incohérences nginx sont signalées, pas corrigées** : `doctor` ne modifie
+  aucun fichier.
+
+### Non-divulgation
+
+Aucun secret, token Hugging Face ou valeur sensible n'apparaît dans le rapport,
+en sortie humaine comme en JSON :
+
+- les contrôles ne citent que le **nom** d'un secret, jamais sa valeur ;
+- tout message passe par une passe de rédaction alimentée par les variables du
+  fichier d'environnement dont le nom évoque un secret (`*SECRET*`, `*TOKEN*`,
+  `*KEY*`, `*PASSWORD*`) : même une valeur arrivée par un chemin de fichier ou
+  par un message d'erreur de validation est remplacée par `***` ;
+- aucun secret ne transite par `argv` (donc jamais visible dans `ps`) : les
+  seuls sous-processus lancés sont `llama-server --version` et
+  `nvidia-smi --query-gpu=…`.
+
+En revanche, les **chemins de fichiers sont conservés** : sans eux un diagnostic
+n'est pas actionnable. `doctor` est une commande locale exécutée par un
+opérateur qui a déjà accès à ces fichiers — contrairement au corps public de
+`GET /ready`, qui n'expose que des codes de contrôle.
+
+### Exemple de sortie humaine
+
+Valeurs et chemins fictifs.
+
+```text
+EVARuntime doctor — mode local
+  Configuration : /etc/llm-gateway/env
+  Généré le     : 2026-07-30T09:15:04+00:00
+
+  [ OK ] config_env_file          Fichier de secrets /etc/llm-gateway/env correctement protégé (mode 0640).
+  [ OK ] models_config            Registre des modèles présent et lisible.
+  [ OK ] models_registry          Registre chargé et validé : 5 modèle(s) déclaré(s), 3 activé(s).
+  [ OK ] enabled_models           3 modèle(s) activé(s) dans le registre.
+  [ OK ] secrets                  Aucun secret laissé à sa valeur d'exemple.
+  [ OK ] database                 Base de données inscriptible.
+  [ OK ] database_permissions     Base et fichiers WAL correctement protégés (2 fichier(s) contrôlé(s)).
+  [ OK ] log_dir                  Répertoire de logs inscriptible.
+  [ OK ] disk_space               Espace disque suffisant — base (/var/lib/llm-gateway) : 812.4 Go libres.
+  [ OK ] llama_server_binary      Binaire llama-server présent et exécutable.
+  [WARN] llama_server_version     llama-server build 6120 détecté, mais LLAMA_SERVER_MIN_BUILD=0 : aucun plancher
+                                  de version n'est imposé. Fixez LLAMA_SERVER_MIN_BUILD=6120 (ou le premier build
+                                  patché connu) pour activer le garde-fou supply-chain.
+  [ OK ] gpu_inventory            1 GPU détecté(s) — GPU 0: NVIDIA L40S, 44.4 Go, driver 550.54.15, compute 8.9.
+  [ OK ] vram_detected            1/1 GPU exposé(s) par CUDA_VISIBLE_DEVICES=0 → 44.4 Go détectés, TOTAL_VRAM_GB=44.0,
+                                  budget net 39.8 Go.
+  [ OK ] vram_budget_fit          Au moins un modèle activé tient dans le budget VRAM net (39.8 GB).
+  [ OK ] model_files              Artefacts présents et lisibles pour les 3 modèle(s) activé(s).
+  [ OK ] model_artifacts          4 artefact(s) mesuré(s) pour 3 modèle(s) activé(s), 77.5 Go au total, tailles plausibles.
+  [ OK ] port_pool                Pool de ports 8081–8085 entièrement libre sur 127.0.0.1 (5 modèle(s) simultané(s)).
+  [WARN] nginx_timeouts           Timeout nginx trop court pour chargement admin : proxy_read_timeout 30s sur
+                                  « /admin/ », alors que la gateway peut légitimement attendre 310s
+                                  (MODEL_LOAD_TIMEOUT_SECONDS + 10s, pire modèle activé). Le client recevra 504
+                                  alors que le chargement réussit côté serveur. Portez proxy_read_timeout et
+                                  proxy_send_timeout au-delà de 310s sur ce bloc (item COR-009/EVA-004).
+  [ OK ] tls_certificate          Certificat TLS fourni valide et clé protégée (/etc/ssl/certs/llm-gateway.crt).
+  [ OK ] systemd_limits           Limites de llm-gateway.service cohérentes avec la configuration
+                                  (MemoryHigh=80% → 102 Go, RAM hôte 128 Go).
+  [SKIP] cluster_nodes_config     Mode local : aucun inventaire de nœuds requis.
+  [SKIP] cluster_agent_secret     Mode local : aucun secret partagé orchestrateur ↔ nœuds.
+  [SKIP] cluster_nodes_inventory  Mode local : aucun inventaire de nœuds requis.
+  [SKIP] cluster_nodes_online     Heartbeat des nœuds non évaluable hors process vivant : doctor ne contacte aucun
+                                  node-agent. Utilisez GET /ready ou GET /admin/status.
+  [SKIP] serving_capacity         Capacité de service non évaluable hors process vivant : doctor n'interroge aucun
+                                  service. Utilisez GET /ready (COR-005) ou le smoke test (COR-006).
+
+  Résumé  : 17 conforme(s), 2 avertissement(s), 0 échec(s) dont 0 bloquant(s), 5 ignoré(s)
+  Verdict : AVERTISSEMENTS SEULEMENT
+  Exit code : 3
+```
+
+Les messages longs sont sur une seule ligne dans la sortie réelle (repliés
+ci-dessus pour la lisibilité du document).
+
+### Exemple de sortie JSON
+
+Extrait — valeurs fictives. Le document complet contient une entrée par
+contrôle, dans le même ordre que la sortie humaine.
+
+```json
+{
+  "tool": "evaruntime-doctor",
+  "schema_version": 1,
+  "generated_at": "2026-07-30T09:15:04+00:00",
+  "mode": "local",
+  "config_source": "/etc/llm-gateway/env",
+  "strict": false,
+  "status": "fail",
+  "exit_code": 1,
+  "summary": {
+    "pass": 15,
+    "warn": 2,
+    "fail": 1,
+    "skip": 6,
+    "blocking": 1
+  },
+  "checks": [
+    {
+      "name": "config_env_file",
+      "status": "pass",
+      "code": "ok",
+      "message": "Fichier de secrets /etc/llm-gateway/env correctement protégé (mode 0640).",
+      "critical": true
+    },
+    {
+      "name": "vram_detected",
+      "status": "fail",
+      "code": "vram_budget_exceeds_hardware",
+      "message": "1/2 GPU exposé(s) par CUDA_VISIBLE_DEVICES=0 → 44.4 Go détectés, TOTAL_VRAM_GB=88.0, budget net 81.6 Go. Le contrôle d'admission peut distribuer plus de VRAM qu'il n'en existe : les chargements échoueront en cours de route, sans qu'aucune éviction n'y remédie. Abaissez TOTAL_VRAM_GB à 44.4 au plus (ou relevez VRAM_OVERHEAD_GB / VRAM_SAFETY_MARGIN).",
+      "critical": true
+    },
+    {
+      "name": "serving_capacity",
+      "status": "skip",
+      "code": "service_not_running",
+      "message": "Capacité de service non évaluable hors process vivant : doctor n'interroge aucun service. Utilisez GET /ready (COR-005) ou le smoke test (COR-006).",
+      "critical": false
+    }
+  ],
+  "reason": "total_vram_gb_overcommitted"
+}
+```
+
+Champs stables, garantis par les tests (`gateway/tests/test_doctor.py`) :
+`tool`, `schema_version`, `generated_at`, `mode`, `config_source`, `strict`,
+`status` (`ok` / `warn` / `fail`), `exit_code`, `summary`
+(`pass`/`warn`/`fail`/`skip`/`blocking`), `checks[]`
+(`name`/`status`/`code`/`message`/`critical`) et `reason` (présent uniquement
+s'il existe un contrôle bloquant, contenant le `code` du premier d'entre eux
+dans l'ordre du rapport). Les `code` sont des identifiants machine stables :
+c'est sur eux qu'un script doit s'appuyer, jamais sur le texte du `message`.
+
+Toute évolution non rétro-compatible de ce document incrémente
+`schema_version`.
 
 ---
 
