@@ -13,10 +13,13 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 UMask=0027
 
 ExecStartPre=/opt/llm-gateway/venv-agent/bin/python /opt/llm-gateway/node_agent/preflight.py --env /etc/llm-gateway-agent/env
-# `python -m uvicorn` et pas le script console `bin/uvicorn` : update-agent.sh
-# construit le venv dans un staging puis le déplace, ce qui laisse le shebang du
-# script console pointer sur le chemin de staging (venv non relogeable). `bin/python`
-# est un lien vers l'interpréteur système et survit au déplacement.
+# `python -m uvicorn` et pas le script console `bin/uvicorn` : défense en
+# profondeur, CONSERVÉE après COR-016. update-agent.sh ne déplace plus jamais un
+# venv (construction à l'emplacement définitif + bascule par symlink), donc
+# `bin/uvicorn` fonctionnerait désormais ; mais `bin/python` est un lien vers
+# l'interpréteur système, insensible à tout déplacement, et cette forme a été
+# validée en production. Le shebang absolu d'un script console reste le point
+# de rupture historique (203/EXEC Permission denied) : ne pas y revenir.
 ExecStart=/opt/llm-gateway/venv-agent/bin/python -m uvicorn main:app \
     --host ${AGENT_HOST} \
     --port ${AGENT_PORT} \
