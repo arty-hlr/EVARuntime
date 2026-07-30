@@ -18,51 +18,59 @@
 | Champ | Valeur |
 |---|---|
 | Dernière mise à jour | 2026-07-30 |
-| Phase | **Démarrage de l'implémentation** — sortie de la phase d'audit |
+| Phase | **Implémentation en cours** — vague 1 du jalon M0 livrée |
 | Jalon visé | **M0 — socle fonctionnel fiable** (§13) |
 | Branche de travail | `feat/lot-a-m0-invariants` (créée depuis `dev` @ `49f8d59`) |
 | Base de référence | `dev` @ `49f8d59` |
 | Périmètre de la vague en cours | COR-001, COR-002, COR-004 → COR-007, AUT-012, OPS-006, TST-001 |
 | Hors périmètre pour l'instant | Lots B (bootstrap), C (performance), D (sécurité), reste du Lot E |
 
-### 0.2 Base de référence des tests, revérifiée avant toute modification
+### 0.2 Base de référence des tests et état courant
 
-| Suite | Commande | Résultat |
-|---|---|---|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 réussis 🔬 |
-| `gateway-student` | `cd gateway-student && .venv/bin/python -m pytest tests -q` | 79 réussis 🔬 |
-| `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 réussis 🔬 |
-| **Total** | — | **433 réussis** 🔬 |
+| Suite | Commande | Référence | État courant |
+|---|---|---:|---:|
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **411** 🔬 |
+| `gateway-student` | `cd gateway-student && .venv/bin/python -m pytest tests -q` | 79 | **95** 🔬 |
+| `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **45** 🔬 |
+| **Total** | — | **433** | **551** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
+**+118 tests** ajoutés par la vague 1, tous des régressions rouges avant
+correctif et vertes après.
 
 ### 0.3 Avancement par lot
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Bloqué |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 13 | 0 | 0 | 13 | 0 |
-| B — bootstrap automatisé | 13 | 0 | 0 | 13 | 0 |
+| A — bloqueurs et invariants | 13 | 4 | 1 | 8 | 0 |
+| B — bootstrap automatisé | 13 | 0 | 1 | 12 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
 | D — sécurité et supply-chain | 7 | 0 | 0 | 7 | 0 |
-| E — tests et exploitation | 12 | 0 | 0 | 12 | 0 |
-| **Total** | **53** | **0** | **0** | **53** | **0** |
+| E — tests et exploitation | 12 | 1 | 0 | 11 | 0 |
+| **Total** | **53** | **5** | **2** | **46** | **0** |
+
+Sur les **7 P0 du jalon M0**, 5 sont terminés et vérifiés, 2 sont en cours.
 
 ### 0.4 Vague en cours — jalon M0
 
 Les items sont regroupés par propriété de fichiers, de façon à ce que deux
 chantiers menés en parallèle ne se marchent jamais dessus.
 
-| Vague | ID | État | Fichiers possédés | Dépend de |
-|---|---|---|---|---|
-| 1 | COR-001 | `[ ]` | `gateway/schemas.py`, `gateway/cluster/cluster_manager.py` | — |
-| 1 | OPS-006 | `[ ]` | `gateway/database.py`, `gateway-student/database.py` | — |
-| 1 | COR-004 | `[ ]` | `gateway/model_manager.py`, `gateway/admin.py` | — |
-| 1 | COR-007 | `[ ]` | `gateway/deploy/llm-gateway.service`, `gateway/models.yaml`, `docs/deployment.md` | — |
-| 2 | COR-002 | `[ ]` | `*/database.py`, `*/cli.py`, `gateway/admin.py`, `docs/admin.md` | OPS-006, DEC-001 |
-| 2 | COR-005 | `[ ]` | `gateway/main.py` | — |
-| 3 | AUT-012 | `[ ]` | `gateway/doctor.py` (nouveau), `gateway/cli.py` | COR-005 |
-| 3 | COR-006 | `[ ]` | `gateway/deploy/update.sh`, `gateway/deploy/smoke_test.sh` (nouveau) | COR-005, AUT-012 |
+| Vague | ID | État | Commit | Tests ajoutés |
+|---|---|---|---|---:|
+| 1 | COR-001 | `[x]` | `8417bed` | +13 |
+| 1 | OPS-006 | `[x]` | `63c46b6` | +14 / +16 |
+| 1 | COR-005 | `[x]` | `0f62556` | +39 |
+| 1 | COR-007 | `[x]` | `90fda1c` | +12 |
+| 1 | COR-004 | `[x]` | `fe76ea0` | +24 |
+| 2 | COR-002 | `[~]` | — | — |
+| 2 | AUT-012 | `[~]` | — | — |
+| 3 | COR-006 | `[ ]` | — | — |
+
+Chaque chantier est mené dans un **worktree git isolé** et produit un commit
+atomique sur sa propre branche, ensuite fusionnée dans la branche de lot. Deux
+chantiers ne peuvent donc jamais se marcher dessus, même sur un fichier partagé.
 
 TST-001 n'est pas un chantier séparé : chaque item ci-dessus livre ses propres
 tests de régression, qui doivent échouer avant le correctif et passer après.
@@ -93,7 +101,37 @@ M0 et seront tranchées à l'entrée des lots concernés.
 
 | Date | ID | Commit | Validation | Résultat |
 |---|---|---|---|---|
-| 2026-07-30 | — | — | Base de référence revérifiée | 433 tests réussis 🔬 |
+| 2026-07-30 | — | — | Base de référence revérifiée sur `dev` @ `49f8d59` | 433 tests réussis 🔬 |
+| 2026-07-30 | COR-001 | `8417bed` | `pytest tests -q` (gateway) | 322 réussis, `/admin/status` = 200 en local **et** cluster 🔬 |
+| 2026-07-30 | OPS-006 | `63c46b6` | `pytest tests -q` (gateway + student) | 336 / 95 réussis, migrations versionnées et transactionnelles 🔬 |
+| 2026-07-30 | COR-005 | `0f62556` | `pytest tests -q` (gateway) | 375 réussis, binaire ou GGUF absent → 503 🔬 |
+| 2026-07-30 | COR-007 | `90fda1c` | `pytest tests -q` (gateway) | 387 réussis, invariant profil ↔ limite systemd verrouillé 🔬 |
+| 2026-07-30 | COR-004 | `fe76ea0` | `pytest tests -q` (gateway) | 411 réussis, 5 routes admin protégées, 409 sur modèle occupé 🔬 |
+| 2026-07-30 | — | — | Les 3 suites sur la branche cumulée | **551 réussis** (411 / 95 / 45) 🔬 |
+
+### 0.8 Défauts découverts pendant l'implémentation, absents des deux audits
+
+L'implémentation a mis au jour des défauts que ni l'audit Codex ni l'audit Claude
+n'avaient relevés. Ils sont corrigés dans le commit de l'item qui les a trouvés.
+
+| Découverte | Trouvé par | Traitement |
+|---|---|---|
+| `GatewayStatus` **supprimait silencieusement** des champs émis par les managers : `nodes`/`nodes_online` en cluster, `gpu_used_mb_measured`/`vram_drift_mb` en local. La réconciliation VRAM par `nvidia-smi`, pourtant consommée par le dashboard, était donc **morte** sur `/admin/status` — sans erreur, sans log. | COR-001 | Corrigé 📖 |
+| `ReadWritePaths=/models /data/models` sans préfixe tolérant, combiné à `ProtectSystem=strict`, **empêche le démarrage** de l'unité si le répertoire est absent. Or `install.sh` ne crée que `/models`, alors que deux entrées de `models.yaml` pointent vers `/data/models`. | COR-007 | Corrigé en `-/models -/data/models` 📖 |
+| `node_agent/deploy/llm-gateway-agent.service` n'avait **aucune limite mémoire**, alors que c'est son cgroup qui héberge les `llama-server` en mode cluster. Le durcissement mémoire ne portait que sur la topologie locale. | COR-007 | Politique mémoire ajoutée 📖 |
+| `POST /admin/unload` présentait le même défaut que les routes de COR-004 en mode local : drain de 25 s **puis forçage**, donc requêtes actives tuées. La route n'était pas listée dans l'item. | COR-004 | Inclus dans le correctif 📖 |
+| Les tests `/ready` existants passaient alors que **ni le binaire `llama-server` ni les GGUF n'existaient** dans l'environnement de test : ils n'exerçaient que le contrat de capacité. La permissivité de la sonde était donc verrouillée par les tests. | COR-005 | Tests adossés à un environnement structurellement sain 🔬 |
+
+### 0.9 Points d'exploitation à connaître après la vague 1
+
+| Sujet | Conséquence | Suite |
+|---|---|---|
+| `eva_vram_total_gb` en mode cluster passe du budget net à la VRAM physique des nœuds en ligne, pour aligner la sémantique sur le mode local. L'invariant `total_gb - overhead_gb == budget_net_gb` est désormais vrai dans les deux modes. | Un tableau de bord Grafana s'appuyant sur cette métrique en cluster change d'échelle. | À signaler à l'exploitation ; converge avec PERF-002 |
+| `/ready` exige que **tous** les modèles `enabled: true` aient un GGUF présent et lisible. | Sur un hôte incomplet, `/ready` = 503 et `update.sh` déclenche le rollback. Le message propose explicitement `enabled: false`. | Comportement voulu (COR-005) ; sera adouci par le préchauffage AUT-010 |
+| `minimax-m2.7` passe à `enabled: false` : ~236 Go de RAM hôte résidente en `cpu_moe`, incompatible avec tout `MemoryMax` raisonnable sur l'hôte de référence. | Le modèle n'est plus servi par défaut. Procédure de réactivation documentée (≥ 320 Go de RAM). | Décision assumée `🧭`, à revalider par la calibration AUT-008 |
+| Les sauvegardes `*.pre-migration.*.bak` produites par OPS-006 ne sont **pas purgées** et ne sont connues ni de `.gitignore` ni des scripts de sauvegarde. | Accumulation d'une copie par changement de version de schéma. | À traiter dans OPS-002 |
+| `ruff` n'est installé dans **aucun** des trois venv : aucun chantier ne peut exécuter le lint annoncé par la CI. | Le style est vérifié à la main. | À traiter avec EVA-044 (élargir `ruff`) |
+| `SystemCallFilter=~@resources` bloque `set_mempolicy`/`mbind`/`sched_setaffinity` : `--numa distribute`, utile aux MoE `cpu_moe` bi-socket, est inaccessible. | Aucun modèle bloqué aujourd'hui (`--numa` non utilisé), mais un `llama-server` récent qui appellerait `sched_setaffinity` serait tué par `SIGSYS`. | Filtre conservé, conflit documenté, à valider en staging |
 
 ---
 
@@ -958,13 +996,13 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
-| COR-001 | `[ ]` | P0 | Aligner le statut cluster sur `GatewayStatus` | `/admin/status` retourne 200 en local et cluster, avec validation du response model. |
-| COR-002 | `[ ]` | P0 | Définir et migrer la politique de suppression utilisateur | Un utilisateur avec clés et usage peut être supprimé/anonymisé conformément à la politique, dans les deux gateways. |
+| COR-001 | `[x]` | P0 | Aligner le statut cluster sur `GatewayStatus` | `/admin/status` retourne 200 en local et cluster, avec validation du response model. |
+| COR-002 | `[~]` | P0 | Définir et migrer la politique de suppression utilisateur | Un utilisateur avec clés et usage peut être supprimé/anonymisé conformément à la politique, dans les deux gateways. |
 | COR-003 | `[ ]` | P2 | Formaliser admission + pin sous forme de lease | Hardening préventif : aucun futur `await` ou refactor ne peut ouvrir une fenêtre d'éviction. Ce n'est pas un bug reproduit dans le code actuel. |
-| COR-004 | `[ ]` | P0 | Protéger unload/update/delete contre les requêtes actives | Drain borné, conflit explicite ou job différé ; aucun stream actif tué silencieusement. |
-| COR-005 | `[ ]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
+| COR-004 | `[x]` | P0 | Protéger unload/update/delete contre les requêtes actives | Drain borné, conflit explicite ou job différé ; aucun stream actif tué silencieusement. |
+| COR-005 | `[x]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
 | COR-006 | `[ ]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
-| COR-007 | `[ ]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
+| COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
 | COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
 | COR-009 | `[ ]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. |
 | COR-010 | `[ ]` | P1 | Corriger `revoke_key()` | `%` et `_` sont littéraux ou rejetés ; seconde révocation a un comportement défini. |
@@ -987,7 +1025,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | AUT-009 | `[ ]` | P0 | Recette premier token | Appel public complet avec TTFT mesuré et rapport sans secrets. |
 | AUT-010 | `[ ]` | P1 | Pré-chauffer le modèle par défaut | Le premier utilisateur ne déclenche pas le chargement après un déploiement réussi. |
 | AUT-011 | `[ ]` | P1 | Produire le rapport d'installation | Versions, empreintes, licences, matériel, modèle, performances et contrôles. |
-| AUT-012 | `[ ]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
+| AUT-012 | `[~]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
 | AUT-013 | `[ ]` | P1 | Inspecter les métadonnées GGUF | Architecture, tenseurs, contexte et KV alimentent une estimation conservatrice sans être présentés comme une mesure exacte. |
 
 ### Lot C — performance
@@ -1029,7 +1067,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-003 | `[ ]` | P1 | Releases immuables | Déploiement d'un tag/artefact, pas d'une branche mouvante. |
 | OPS-004 | `[ ]` | P1 | Corrélation des requêtes | Même request ID dans gateway, agent et backend. |
 | OPS-005 | `[ ]` | P1 | Automatiser la gateway étudiante | Install/update/backup/retention avec placeholders interdits. |
-| OPS-006 | `[ ]` | P0 | Versionner les migrations SQLite | `PRAGMA user_version` ou équivalent, migration transactionnelle, sauvegarde préalable et test depuis chaque version supportée. |
+| OPS-006 | `[x]` | P0 | Versionner les migrations SQLite | `PRAGMA user_version` ou équivalent, migration transactionnelle, sauvegarde préalable et test depuis chaque version supportée. |
 | OPS-007 | `[ ]` | P1 | Définir la rétention d'audit student | Rétention temporelle vérifiable, rotation et espace disque cohérents avec la politique. |
 
 ## 13. Jalons
