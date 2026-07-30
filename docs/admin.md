@@ -365,6 +365,34 @@ curl -s "$GW/admin/status" \
 # }
 ```
 
+#### Champs de `vram_budget` selon le mode de déploiement
+
+`GET /admin/status` a le même contrat en `CLUSTER_MODE=local` et en
+`CLUSTER_MODE=cluster`. Trois champs seulement sont garantis dans les deux
+modes — `total_gb`, `used_gb`, `available_gb` — les autres sont spécifiques au
+mode et valent `null` quand ils ne s'appliquent pas.
+
+| Champ | Local | Cluster |
+|---|---|---|
+| `total_gb` | `TOTAL_VRAM_GB` de l'hôte | Somme des VRAM physiques des nœuds **ONLINE** |
+| `overhead_gb` | `VRAM_OVERHEAD_GB` | Réserve agrégée des nœuds (leur overhead **et** leur marge, en GB) |
+| `safety_margin` | `VRAM_SAFETY_MARGIN` (ratio) | `null` — ratio mono-hôte, déjà agrégé en GB dans `overhead_gb` |
+| `used_gb` | VRAM des modèles chargés localement | Somme des `used_vram_gb` des nœuds ONLINE |
+| `available_gb` | Budget net − utilisé | Somme des `available_vram_gb` annoncés par les agents |
+| `budget_net_gb` | `total_gb − overhead_gb − marge` | `used_gb + available_gb` (budget allouable annoncé) |
+| `nodes` / `nodes_online` | `null` | Nœuds configurés / actuellement ONLINE |
+| `gpu_used_mb_measured`, `vram_drift_mb` | Présents si une sonde `nvidia-smi` a réussi | `null` |
+
+En cluster, `total_gb - overhead_gb == budget_net_gb` exactement ; en local il
+faut en plus retirer `safety_margin × total_gb`, la marge n'étant pas incluse
+dans `overhead_gb`. Un nœud offline ne contribue à aucun total : cluster entièrement
+offline ⇒ tous les champs à `0.0` et `nodes_online: 0`, la route restant en 200.
+
+Les entrées de `models` portent en plus, en cluster, le nœud d'hébergement
+(`node`) et la charge live (`active_requests`) ; en local ces deux champs valent
+`null`. L'URL interne du `llama-server` n'est jamais exposée ici — elle n'est
+lisible que via `GET /admin/cluster`.
+
 ### Surveiller la VRAM GPU
 
 ```bash
@@ -461,7 +489,7 @@ Métriques exposées (noms exacts) :
 | `eva_requests_total` | counter | `model`, `status` | Requêtes par modèle et code HTTP (fenêtre 24h) |
 | `eva_tokens_total` | counter | `model`, `type` (`prompt`/`completion`) | Tokens par modèle et type (fenêtre 24h) |
 | `eva_request_latency_seconds` | gauge | `quantile` (0.5/0.95/0.99) | Percentiles de latence (fenêtre 7j) |
-| `eva_vram_used_gb` / `eva_vram_total_gb` / `eva_vram_available_gb` | gauge | — | Budget VRAM comptabilisé |
+| `eva_vram_used_gb` / `eva_vram_total_gb` / `eva_vram_available_gb` | gauge | — | Budget VRAM comptabilisé — mêmes champs que `vram_budget` de `/admin/status` ; en cluster, `eva_vram_total_gb` est la VRAM **physique** des nœuds ONLINE (le budget allouable est `budget_net_gb`) |
 | `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
 | `eva_llama_kv_cache_usage_ratio` | gauge | `model` (+ `node` en cluster) | Occupation du KV cache (0–1) |
 | `eva_llama_tokens_per_second` | gauge | `model` (+ `node`) | Débit de génération |

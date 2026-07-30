@@ -185,16 +185,43 @@ class ModelStatusResponse(BaseModel):
     uptime_seconds: Optional[float]
     idle_seconds: Optional[float]
     llama_params: Optional[dict]
+    # Cluster uniquement : nœud d'hébergement et charge live. `llama_url` reste
+    # volontairement hors de ce schéma (détail d'infra interne) — il n'est
+    # exposé que par GET /admin/cluster.
+    node: Optional[str] = None
+    active_requests: Optional[int] = None
 
 
 class VramBudgetResponse(BaseModel):
-    """Budget VRAM global de la gateway."""
+    """
+    Budget VRAM global de la gateway — commun aux modes local et cluster.
+
+    Seuls `total_gb`, `used_gb` et `available_gb` ont un sens dans les deux
+    modes et restent donc obligatoires.
+
+    - `overhead_gb` / `budget_net_gb` : toujours fournis (config de l'hôte en
+      local, agrégation des nœuds ONLINE en cluster). Optionnels au niveau du
+      schéma pour qu'un manager dégradé produise un statut partiel plutôt
+      qu'une ResponseValidationError (→ 500) sur une route d'observabilité.
+    - `safety_margin` : ratio de configuration mono-hôte. Absent en cluster, où
+      la réserve des nœuds est déjà agrégée en GB dans `overhead_gb`.
+    - `nodes` / `nodes_online` : cluster uniquement.
+    - `gpu_used_mb_measured` / `vram_drift_mb` : local uniquement, et seulement
+      si une sonde nvidia-smi a réussi.
+    """
     total_gb: float
-    overhead_gb: float
-    safety_margin: float
+    overhead_gb: Optional[float] = None
+    safety_margin: Optional[float] = None
     used_gb: float
     available_gb: float
-    budget_net_gb: float
+    budget_net_gb: Optional[float] = None
+    # Cluster uniquement — sans ces champs, /admin/status masquerait la
+    # topologie (ils étaient silencieusement supprimés par le response model).
+    nodes: Optional[int] = None
+    nodes_online: Optional[int] = None
+    # Local uniquement — réconciliation nvidia-smi consommée par le dashboard.
+    gpu_used_mb_measured: Optional[float] = None
+    vram_drift_mb: Optional[float] = None
 
 
 class CapacityQueueStatusResponse(BaseModel):
