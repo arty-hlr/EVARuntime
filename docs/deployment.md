@@ -40,7 +40,7 @@ GPU local et pilote des node-agents installés séparément.
 | Python | 3.11+ | `python3 --version` |
 | CUDA toolkit | 12.x | Mode local et chaque node-agent; inutile sur l'orchestrateur cluster |
 | Pilotes NVIDIA | 535+ | `nvidia-smi` sur les hôtes d'inférence, pas sur l'orchestrateur |
-| nginx | 1.18+ | `apt install nginx` |
+| nginx | 1.18+ | `apt install nginx`. La conf livrée est valide de 1.18 à 1.29 ; **HTTP/2 est désactivé par défaut** et demande nginx ≥ 1.25.1 plus une ligne à décommenter — [§8](#8-configuration-nginx) |
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
@@ -526,6 +526,38 @@ sudo ln -sf /etc/nginx/sites-available/llm-gateway \
             /etc/nginx/sites-enabled/llm-gateway
 sudo nginx -s reload
 ```
+
+### Activer HTTP/2 (optionnel, nginx ≥ 1.25.1)
+
+La configuration livrée n'active **pas** HTTP/2, et ce n'est pas un oubli : aucune
+écriture de la directive n'est acceptée par l'ensemble du socle supporté.
+
+| Version nginx | `listen … ssl http2` | `http2 on;` |
+|---------------|----------------------|-------------|
+| 1.18 (Ubuntu 22.04 LTS) | fonctionne | **`unknown directive` — nginx refuse de démarrer** |
+| 1.24 (Ubuntu 24.04 LTS) | fonctionne | **`unknown directive` — nginx refuse de démarrer** |
+| ≥ 1.25.1 (Debian 13, nginx.org) | **déprécié — warning à chaque `nginx -t` et à chaque reload** | forme recommandée |
+
+Le compromis retenu est donc un `listen` nu : valide et silencieux partout, au
+prix d'HTTP/1.1 par défaut. Le streaming SSE, `proxy_buffering off` et les
+timeouts longs fonctionnent à l'identique en HTTP/1.1 — HTTP/2 n'apporte ici que
+le multiplexage de plusieurs requêtes sur une connexion cliente.
+
+Sur un hôte en nginx ≥ 1.25.1, activer HTTP/2 en deux commandes :
+
+```bash
+# 1. Vérifier la version (HTTP/2 par directive à partir de 1.25.1)
+nginx -v
+
+# 2. Décommenter « http2 on; » dans le bloc server 443
+sudo sed -i 's/^\(\s*\)# http2 on;/\1http2 on;/' \
+          /etc/nginx/sites-available/llm-gateway
+
+sudo nginx -t && sudo nginx -s reload
+```
+
+`nginx -t` ne doit produire **aucun** avertissement, quelle que soit la version :
+un warning de dépréciation à chaque reload finit par masquer les vrais.
 
 ---
 
