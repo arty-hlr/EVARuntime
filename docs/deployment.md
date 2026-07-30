@@ -548,6 +548,20 @@ Résultat attendu :
    Main PID: 12345 (uvicorn)
 ```
 
+### Valider que le service SERT, pas seulement qu'il répond
+
+`systemctl status` et `/health` ne prouvent que la liveness, `/ready` que la
+readiness structurelle. Pour prouver qu'un token sort réellement du chemin
+public, lancer la recette du premier token :
+
+```bash
+sudo bash /opt/llm-gateway/deploy/smoke_test.sh --base-url https://llm.eva.univ-pau.fr
+```
+
+Elle crée une identité éphémère, charge le modèle, génère, vérifie le log
+d'usage puis retire l'identité. Détails, options et exit codes :
+[Recette du premier token](#recette-du-premier-token-smoke_testsh).
+
 ### Vérifier le registre des modèles (CLI)
 
 ```bash
@@ -759,9 +773,18 @@ Ce que fait le script :
 4. Construit un **nouveau venv**, installe les dépendances et exige `pip check`;
    l'ancien venv reste intact jusqu'au redémarrage
 5. **Sauvegarde la base SQLite** avant redémarrage (voir ci-dessous)
-6. Choisit l'unité systemd GPU (`local`) ou sans GPU (`cluster`)
-7. Redémarre le service et exige la readiness `/ready`, pas seulement `/health`
-8. **Rollback automatique** du code déployé, du venv, du mode et de l'unité
+6. Installe la recette du premier token dans `/opt/llm-gateway/deploy/`
+7. Exécute **`evaruntime doctor` avant la bascule**, avec le venv neuf et le code
+   déjà synchronisé — le service tourne encore l'ancienne version, donc un hôte
+   inapte est détecté sans aucune coupure
+8. Choisit l'unité systemd GPU (`local`) ou sans GPU (`cluster`)
+9. Redémarre le service et exige la readiness `/ready`, pas seulement `/health`
+10. Exige la **recette du premier token** : une génération réelle de bout en bout
+    (voir ci-dessous). C'est le gate qui distingue « le service répond » de
+    « le service **sert** »
+11. Repasse `doctor` sur l'hôte basculé, en constat non bloquant
+12. **Rollback automatique** du code déployé, du venv, du mode et de l'unité si la
+    readiness ou la recette échoue
 
 > **Conservation :** les secrets, `nodes.yaml`, le contenu du registre, la DB et
 > les GGUF ne sont jamais remplacés. Le script ne modifie dans `env` que les clés
@@ -781,15 +804,222 @@ La copie utilise `sqlite3 "$DB" ".backup '$DEST'"` — sûr sur une base **WAL
 active** (un simple `cp` pourrait capturer un WAL incohérent). Si `sqlite3` est
 absent, l'étape est ignorée avec un avertissement (la mise à jour continue).
 
+#### Recette du premier token (`smoke_test.sh`)
+
+`/ready` prouve que l'installation est **structurellement** saine : registre
+lisible, binaire `llama-server` exécutable, GGUF des modèles activés présents,
+base inscriptible, budget VRAM cohérent. Elle ne prouve **pas** qu'un token
+sort. Une version applicative cassée dans le proxy d'inférence répondait donc
+200 sur `/ready` et était acceptée puis déployée.
+
+`gateway/deploy/smoke_test.sh` ferme ce trou en exerçant le **vrai chemin
+public** :
+
+```text
+client → nginx si configuré → authentification → quota/rate limit
+       → résolution du modèle → llama-server → chunk SSE AVEC du contenu
+       → log d'usage
+```
+
+Séquence exécutée :
+
+1. liveness `GET /health` sur le chemin public ;
+2. readiness structurelle `GET /ready` sur le plan de contrôle ;
+3. création d'un **utilisateur et d'une clé éphémères** ;
+4. chargement **explicite** du modèle (`POST /admin/models/{id}/load`) ;
+5. `POST /v1/chat/completions` avec `stream: true` ;
+6. mesure du temps jusqu'aux en-têtes ;
+7. mesure du **TTFT** = temps jusqu'au premier delta portant réellement du
+   contenu — pas le premier octet SSE, qui n'est qu'un chunk de rôle ;
+8. attente de `[DONE]` ;
+9. contrôle de l'enveloppe (`chat.completion.chunk`), du modèle annoncé et de
+   l'`usage` ;
+10. vérification de l'écriture du log d'usage (`GET /admin/usage`) ;
+11. révocation de la clé et **anonymisation** de l'utilisateur éphémère ;
+12. rapport, sans aucune clé ni contenu généré.
+
+##### Usage manuel
+
+```bash
+# Défauts : gateway en direct, modèle dérivé de la configuration
+sudo bash /opt/llm-gateway/deploy/smoke_test.sh
+
+# Exercer le vrai chemin client, TLS et non-buffering nginx compris
+sudo bash /opt/llm-gateway/deploy/smoke_test.sh \
+     --base-url https://llm.eva.univ-pau.fr \
+     --model llama-3.1-8b-instruct \
+     --ttft-threshold-ms 5000
+
+# Rapport machine
+sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
+```
+
+> Le script est copié dans `/opt/llm-gateway/deploy/` par `update.sh`. Sur une
+> machine qui n'a pas encore été mise à jour depuis cette version, le lancer
+> depuis le checkout : `sudo bash gateway/deploy/smoke_test.sh`.
+
+##### Options
+
+| Option | Effet |
+|---|---|
+| `--base-url URL` | Chemin **public** exercé par la génération. Défaut : `http://GATEWAY_HOST:GATEWAY_PORT`. |
+| `--admin-url URL` | Plan de contrôle et `/ready`. Défaut : la gateway **en direct**. |
+| `--env-file PATH` | EnvironmentFile lu pour `ADMIN_SECRET`, le port et le modèle. Défaut : `/etc/llm-gateway/env`. |
+| `--admin-secret-file PATH` | Lit `ADMIN_SECRET` dans un fichier root-only. |
+| `--model ID` | Modèle exercé. Défaut : `DEFAULT_MODEL_ID`, sinon le plus petit modèle activé. |
+| `--prompt TEXT` | Prompt du smoke test. |
+| `--max-tokens N` | Plafond de génération (défaut 16). |
+| `--ttft-threshold-ms N` | Seuil d'alerte sur le TTFT. `0` = désactivé (défaut). |
+| `--fail-on-ttft` | Transforme le dépassement de seuil en **échec** (exit 4). |
+| `--load-timeout SEC` | Attente du chargement explicite (défaut 330). |
+| `--stream-timeout SEC` | Durée totale maximale du stream (défaut 120). |
+| `--ready-timeout`, `--connect-timeout`, `--usage-timeout`, `--admin-timeout` | Autres bornes, toutes explicites. |
+| `--ca-cert PATH`, `--insecure-tls` | Contrôle de la validation TLS. |
+| `--json` | Rapport JSON sur `stdout` (les traces restent sur `stderr`). |
+
+##### Exit codes
+
+| Code | Sens | Effet dans `update.sh` |
+|---:|---|---|
+| 0 | Un delta SSE avec du contenu a traversé tout le chemin public | Version conservée |
+| 1 | **Échec fonctionnel** : aucun contenu, erreur upstream, stream sans `[DONE]`, enveloppe/modèle/usage invalides, chargement impossible, log d'usage absent | **Rollback** |
+| 2 | Erreur d'usage (option inconnue, dépendance manquante, configuration inexploitable) | **Rollback** |
+| 3 | Préflight : liveness ou readiness structurelle en échec | **Rollback** |
+| 4 | TTFT au-dessus du seuil **avec** `--fail-on-ttft` | **Rollback** (demandé explicitement) |
+| 5 | Identité éphémère non créée, ou non nettoyée | Version **conservée**, `update.sh` sort en erreur |
+
+##### Ce que chaque URL de base couvre — et ne couvre pas
+
+- `--base-url` sur **nginx** (`https://…`) couvre en plus TLS, `limit_req`,
+  `limit_conn`, l'anti-slowloris et surtout `proxy_buffering off` /
+  `X-Accel-Buffering` : c'est la seule configuration qui prouve que le SSE n'est
+  pas bufferisé par le reverse-proxy.
+- `--base-url` sur la **gateway en direct** (défaut) ne couvre **rien** de tout
+  cela : un premier token vert en direct peut rester invisible côté client
+  derrière un nginx mal configuré.
+- `--admin-url` vise la gateway **en direct** par défaut, volontairement :
+  `/ready` n'est pas proxifiée par `deploy/nginx.conf` (`location /` renvoie
+  404), et `location /admin/` impose `proxy_read_timeout 30s` alors qu'un
+  `POST /admin/models/{id}/load` peut légitimement attendre jusqu'à ~310 s
+  (`MODEL_LOAD_TIMEOUT_SECONDS + 10`). À travers nginx, le chargement
+  renverrait 504 alors qu'il **réussit** côté serveur, et la recette conclurait
+  à tort à une régression. Ce défaut est suivi par l'item COR-009 et n'est pas
+  corrigé par la recette : elle le contourne.
+
+##### Sécurité de la recette
+
+- Aucun secret n'est passé en argument : `ADMIN_SECRET` et la clé éphémère
+  transitent par des fichiers de configuration `curl` en mode 600, dans un
+  répertoire temporaire 700. Ils n'apparaissent ni dans `ps`, ni dans
+  `/proc/*/cmdline`, ni dans le rapport.
+- L'identité éphémère est nettoyée par un `trap` sur `EXIT`/`INT`/`TERM`/`HUP` :
+  échec, erreur ou `Ctrl-C`, elle est toujours révoquée puis anonymisée. Le
+  nettoyage est idempotent (un 404 est toléré).
+- Le rapport ne contient ni clé, ni préfixe de clé, ni contenu généré :
+  seulement des compteurs et des durées.
+
+#### Succès fonctionnel : hard gate — TTFT : alerte
+
+Ces deux notions sont **délibérément séparées** :
+
+- **Succès fonctionnel** (un token sort, l'usage est comptabilisé) : hard gate.
+  Un échec restaure la version précédente, sans exception.
+- **Régression de TTFT** : par défaut une simple **alerte**. La version reste
+  déployée et `update.sh` sort en succès. Un rollback automatique sur une
+  latence dégradée provoquerait des boucles de restauration sur une machine
+  momentanément chargée, sans qu'aucun défaut applicatif soit en cause.
+
+Pour en faire un gate, il faut le demander explicitement :
+
+```bash
+# Alerte seulement (défaut) : le TTFT est mesuré et signalé, jamais bloquant
+sudo bash gateway/deploy/update.sh --ttft-threshold-ms 5000
+
+# Gate : un TTFT > 5 s restaure la version précédente
+sudo bash gateway/deploy/update.sh --ttft-threshold-ms 5000 --ttft-gate
+
+# Équivalents par variables d'environnement (automatisation)
+EVA_SMOKE_TTFT_THRESHOLD_MS=5000 EVA_SMOKE_TTFT_GATE=1 \
+  sudo -E bash gateway/deploy/update.sh
+```
+
+Sans `--ttft-threshold-ms`, aucun seuil n'est appliqué : le TTFT est mesuré et
+rapporté, rien de plus. Les seuils par modèle ne sont pas encore stabilisés —
+les fixer trop tôt ferait plus de mal que de bien.
+
+#### Options de mise à jour liées à la recette
+
+| Option `update.sh` | Variable | Effet |
+|---|---|---|
+| `--smoke-base-url URL` | `EVA_SMOKE_BASE_URL` | Chemin public exercé (viser nginx pour couvrir TLS et le non-buffering). |
+| `--smoke-model ID` | `EVA_SMOKE_MODEL` | Modèle exercé. |
+| `--ttft-threshold-ms N` | `EVA_SMOKE_TTFT_THRESHOLD_MS` | Seuil d'alerte TTFT (0 = désactivé). |
+| `--ttft-gate` | `EVA_SMOKE_TTFT_GATE=1` | Le dépassement de seuil devient une cause de rollback. |
+| `--skip-smoke-test` | — | **Dangereux** : revient au comportement d'avant COR-006 (validation sur `/ready` seul). Dépannage uniquement. |
+| `--skip-doctor` | — | Désactive les deux préflights `doctor`. |
+
+`bash gateway/deploy/update.sh --dry-run` affiche la politique retenue (chemin
+exercé, seuil, alerte ou gate) avant toute modification.
+
+#### Quand la recette échoue
+
+`update.sh` a déjà restauré la version précédente : le service en cours est
+**l'ancien**, sain. Le checkout Git n'a pas été touché.
+
+1. Lire le rapport de la recette dans la trace de `update.sh` : la ligne
+   `Cause` donne le code exact (`generation:no_content`,
+   `generation:upstream_error`, `usage_log_missing`, `model_load_failed:503`…).
+2. Rejouer la recette à la main contre la version restaurée pour distinguer une
+   régression applicative d'un incident d'hôte :
+
+   ```bash
+   sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
+   ```
+
+3. Exécuter le préflight complet, qui ne demande aucun service en marche :
+
+   ```bash
+   /opt/llm-gateway/venv/bin/python /opt/llm-gateway/cli.py doctor \
+       --env-file /etc/llm-gateway/env \
+       --nginx-conf /etc/nginx/sites-available/llm-gateway \
+       --systemd-unit /etc/systemd/system/llm-gateway.service
+   ```
+
+   Exit codes : `0` conforme, `1` échec bloquant, `2` erreur d'usage CLI,
+   `3` avertissements seulement, `4` erreur interne. `update.sh` traite `0` et
+   `3` comme un succès. Ne jamais ajouter `--verify-hashes` dans un contexte de
+   déploiement : il relit intégralement les GGUF, soit plusieurs centaines de Go.
+
+4. Consulter les journaux de la tentative :
+   `sudo journalctl -u llm-gateway --since "30 min ago"`.
+5. Corriger, puis relancer `sudo bash gateway/deploy/update.sh`.
+
+Cas particuliers :
+
+| Cause rapportée | Interprétation |
+|---|---|
+| `readiness_failed:model_file_missing` | Un GGUF d'un modèle `enabled: true` manque. Le télécharger, corriger son `path`, ou passer le modèle à `enabled: false`. |
+| `model_load_failed:504` | L'appel a traversé nginx : `proxy_read_timeout 30s` sur `/admin/` (COR-009). Viser `--admin-url` en direct. |
+| `generation:no_content` | Le stream s'ouvre en 200 mais n'émet aucun token : régression du proxy d'inférence ou backend muet. |
+| `generation:no_done` | Le stream est tronqué : coupure réseau, timeout nginx trop court, ou `llama-server` tué (`MemoryMax`). |
+| `usage_log_missing` | La génération réussit mais n'est pas comptabilisée : la facturation serait fausse. |
+| exit 5 | La version est déployée et fonctionnelle, mais un compte de smoke test subsiste. Le retirer immédiatement avec la commande affichée dans le rapport. |
+
 #### Rollback automatique
 
 Avant toute synchronisation, le script copie le code réellement déployé dans
 `/var/lib/llm-gateway/backups/code-pre-update-*`. Si `/ready` ne devient pas
-200, il restaure ce snapshot et l'ancien venv. Une migration restaure aussi
+200, **ou si la recette du premier token échoue**, il restaure ce snapshot et
+l'ancien venv. L'ancienne version est donc conservée jusqu'à la fin de la
+recette, pas seulement jusqu'au redémarrage. Une migration restaure aussi
 `CLUSTER_MODE` et l'unité systemd précédents. Le checkout Git n'est jamais
 modifié par le rollback et ne finit donc pas en `detached HEAD`. Un rollback
 réussi fait quand même sortir `update.sh` en erreur afin que l'automatisation
 ne confonde pas restauration et déploiement réussi.
+
+Un échec bloquant de `doctor` **avant** la bascule restaure lui aussi le code
+synchronisé, mais **sans jamais arrêter le service** : la version en production
+continue de servir pendant toute la détection.
 
 Le rollback **ne restaure pas** la base de données automatiquement : le schéma
 peut avoir évolué et écraser la base sans arbitrage humain serait plus risqué
@@ -1138,7 +1368,13 @@ sudo bash node_agent/deploy/update-agent.sh
 
 # 3. Gate production après retour des nœuds
 curl -fsS http://127.0.0.1:8000/ready
+sudo bash /opt/llm-gateway/deploy/smoke_test.sh
 ```
+
+La recette du premier token fonctionne à l'identique en mode cluster : le
+chargement explicite du modèle est délégué au node-agent qui l'héberge, et le
+verdict porte sur le même chemin public. `/ready` y délègue binaire et GGUF aux
+nœuds — raison de plus pour ne pas s'en contenter.
 
 Mettre les agents à jour un par un et attendre leur retour `online` avant de
 continuer maintient la capacité si le cluster possède au moins un autre nœud
