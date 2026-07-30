@@ -5,8 +5,15 @@
 # Stratégie de venv (COR-016) : identique à gateway/deploy/update.sh. Le venv
 # neuf est construit à son EMPLACEMENT DÉFINITIF et `venv-agent` est un symlink
 # que l'on bascule. Voir deploy/agent-venv-lib.sh pour le détail.
+#
+# Codes de sortie :
+#   0  mise à jour déployée
+#   1  échec : la version précédente a été restaurée et l'agent tourne à nouveau
+#   9  INDISPONIBILITÉ : rollback effectué mais l'agent ne redémarre pas
 set -Eeuo pipefail
 IFS=$'\n\t'
+
+EXIT_SERVICE_DOWN=9
 
 DRY_RUN=false
 PULL_REPOSITORY=true
@@ -128,7 +135,7 @@ discard_staged_venv() {
 }
 
 rollback() {
-    local original_status="$1"
+    local original_status="$1" restart_status=0
     warn "Échec de mise à jour; restauration de la version précédente."
     set +e
     systemctl stop "$SERVICE"
@@ -145,18 +152,35 @@ rollback() {
     fi
     systemctl daemon-reload
     if [[ "$WAS_ACTIVE" == true ]]; then
+        # COR-017 : les tentatives de démarrage qui viennent d'échouer ont pu
+        # atteindre le start-limit systemd. Sans reset-failed, le start du
+        # rollback échoue sur « Start request repeated too quickly » et laisse
+        # le nœud à terre. Sur une unité saine, c'est un no-op.
+        systemctl reset-failed "$SERVICE" 2>/dev/null
         systemctl start "$SERVICE"
+        restart_status=$?
     fi
     set -e
+    if (( restart_status != 0 )); then
+        # Jamais un simple avertissement : le nœud ne sert plus (COR-017).
+        warn "INDISPONIBILITÉ : la version précédente a été restaurée mais $SERVICE"
+        warn "  ne redémarre pas. Le nœud ne sert plus aucune requête."
+        warn "  systemctl reset-failed $SERVICE && systemctl start $SERVICE"
+        warn "  journalctl -u $SERVICE -n 100 --no-pager"
+        return "$EXIT_SERVICE_DOWN"
+    fi
     warn "Rollback terminé. Inspectez : journalctl -u $SERVICE -n 100"
     return "$original_status"
 }
 
 on_error() {
-    local status=$?
+    local status=$? rollback_status=0
     trap - ERR
     if [[ "$ROLLBACK_READY" == true ]]; then
-        rollback "$status" || true
+        rollback "$status" || rollback_status=$?
+        if (( rollback_status == EXIT_SERVICE_DOWN )); then
+            status="$EXIT_SERVICE_DOWN"
+        fi
     fi
     discard_staged_venv
     cleanup
@@ -219,6 +243,10 @@ install -m 0644 -o root -g root \
 systemctl daemon-reload
 
 if [[ "$WAS_ACTIVE" == true ]]; then
+    # COR-017 : purger un éventuel état `failed` hérité d'un incident précédent.
+    # Sans cela le start-limit systemd peut refuser ce démarrage alors que la
+    # version déployée est saine. No-op sur une unité en bon état.
+    systemctl reset-failed "$SERVICE" 2>/dev/null || true
     systemctl start "$SERVICE"
     HEALTHY=false
     for attempt in 1 2 3 4 5; do

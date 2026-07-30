@@ -1419,6 +1419,32 @@ sudo systemctl restart llm-gateway-agent
 - L'unité conserve `ExecStart=…/venv-agent/bin/python -m uvicorn` : défense en
   profondeur validée en production, insensible par construction au shebang.
 
+#### Start-limit systemd et codes de sortie de `update-agent.sh`
+
+Après plusieurs redémarrages rapprochés, systemd refuse de démarrer une unité
+(« Start request repeated too quickly ») et la laisse en `failed`. Un rollback
+qui se contente de `systemctl start` laisse alors le **nœud à terre**. Chaque
+`systemctl start` des scripts de déploiement node-agent est donc précédé d'un
+`systemctl reset-failed` — no-op sur une unité saine, donc sans risque —, y
+compris dans le chemin de rollback et après une réinstallation.
+
+Codes de sortie de `update-agent.sh` :
+
+| Code | Signification | Action |
+|------|---------------|--------|
+| `0` | Mise à jour déployée et health-check passé | aucune |
+| `1` | Échec : version précédente restaurée, agent **en service** | investiguer avant de réessayer |
+| `9` | **INDISPONIBILITÉ** : rollback effectué mais l'agent ne redémarre pas | intervention immédiate |
+
+Un `9` n'est jamais un simple avertissement : le nœud ne sert plus aucune
+requête et l'orchestrateur le passera `offline` après ~30 s.
+
+```bash
+sudo systemctl reset-failed llm-gateway-agent
+sudo systemctl start llm-gateway-agent
+sudo journalctl -u llm-gateway-agent -n 100 --no-pager
+```
+
 ### Migration explicite local ↔ cluster
 
 Une migration n'est jamais déduite d'un simple rerun. Elle exige `--mode` et

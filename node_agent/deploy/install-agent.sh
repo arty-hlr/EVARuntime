@@ -271,6 +271,11 @@ install -m 0644 -o root -g root \
 
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
+# COR-017 : une réinstallation par-dessus une unité en échec doit repartir d'un
+# compteur de démarrages vierge, sinon le `systemctl start` final (étape 3
+# ci-dessous) se heurte au start-limit : « Start request repeated too quickly ».
+# No-op sur une unité saine ou jamais démarrée.
+systemctl reset-failed "$SERVICE" 2>/dev/null || true
 
 if [[ -n "$ORCHESTRATOR_CIDR" ]]; then
     if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
