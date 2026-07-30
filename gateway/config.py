@@ -5,6 +5,7 @@ jamais dans le code source.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -15,6 +16,39 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def secret_is_placeholder(secret: str) -> bool:
     """True si un secret est vide ou laissé à sa valeur d'exemple CHANGE_ME_*."""
     return not secret or secret.strip().upper().startswith("CHANGE_ME")
+
+
+def split_list_setting(value: object, name: str) -> object:
+    """
+    Normalise un réglage de liste reçu depuis l'environnement.
+
+    Accepte une valeur vide (→ liste vide), une liste CSV — la syntaxe que
+    documentent `.env.example` et `docs/deployment.md` — ou un tableau JSON.
+    Une valeur déjà structurée (liste Python, cas des tests et des appels
+    directs) traverse sans modification.
+
+    Même sémantique que `AgentSettings.allowed_model_dirs_list()` du node-agent,
+    qui a rencontré le même piège avant nous.
+    """
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    if not raw:
+        return []
+    # Un objet JSON serait sinon traité comme un unique élément CSV : l'allowlist
+    # contiendrait une entrée qui ne correspond à rien, donc un contrôle de
+    # sécurité inerte sans le moindre message. On refuse explicitement.
+    if raw.startswith("{"):
+        raise ValueError(f"{name} : attendu une liste CSV ou un tableau JSON, pas un objet")
+    if raw.startswith("["):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} : tableau JSON invalide") from exc
+        if not isinstance(decoded, list) or not all(isinstance(v, str) for v in decoded):
+            raise ValueError(f"{name} : le JSON doit être une liste de chaînes")
+        return [item.strip() for item in decoded if item.strip()]
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 class Settings(BaseSettings):
@@ -65,7 +99,17 @@ class Settings(BaseSettings):
     # ── Répertoires autorisés pour les fichiers .gguf ─────────────────────────
     # Liste séparée par des virgules. Vide = pas de restriction (tous répertoires autorisés).
     # Exemple : ALLOWED_MODEL_DIRS=/models,/data/models
-    allowed_model_dirs: list[str] = Field(default_factory=list)
+    #
+    # L'annotation `str | list[str]` est volontaire, ce n'est pas un raccourci.
+    # pydantic-settings décode un champ *complexe* — donc `list[str]` — comme du
+    # JSON directement dans la source d'environnement, AVANT tout validateur.
+    # Une valeur CSV, et même une valeur vide, faisaient donc échouer le
+    # démarrage sur `SettingsError` : le fichier livré par `.env.example` rendait
+    # le service mort. Élargir l'annotation rend le champ non-complexe pour la
+    # source ; le validateur `mode="before"` ci-dessous produit toujours une
+    # `list[str]`. Le node-agent contourne le même piège autrement
+    # (`allowed_model_dirs: str` + accesseur), cf. `node_agent/config.py`.
+    allowed_model_dirs: str | list[str] = Field(default_factory=list)
 
     # ── Lifecycle modèle ───────────────────────────────────────────────────────
     idle_timeout_seconds: int = 300
@@ -144,7 +188,10 @@ class Settings(BaseSettings):
     # Origines autorisées, séparées par des virgules.
     # "*" (défaut) convient en dev ; en production, restreindre aux domaines
     # clients connus : CORS_ALLOW_ORIGINS=https://app.univ-pau.fr
-    cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Même contrainte d'annotation que `allowed_model_dirs` ci-dessus : sans
+    # elle, le validateur `split_cors_origins` ne s'exécutait jamais, l'échec
+    # ayant lieu dans la source d'environnement.
+    cors_allow_origins: str | list[str] = Field(default_factory=lambda: ["*"])
 
     # ── Rate limiting par défaut ───────────────────────────────────────────────
     default_rpm_limit: int = 20
@@ -217,9 +264,12 @@ class Settings(BaseSettings):
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def split_cors_origins(cls, v: object) -> object:
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+        return split_list_setting(v, "CORS_ALLOW_ORIGINS")
+
+    @field_validator("allowed_model_dirs", mode="before")
+    @classmethod
+    def split_allowed_model_dirs(cls, v: object) -> object:
+        return split_list_setting(v, "ALLOWED_MODEL_DIRS")
 
     @field_validator("cluster_health_interval", "cluster_health_failures_to_offline")
     @classmethod

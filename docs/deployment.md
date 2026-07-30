@@ -288,7 +288,8 @@ MAX_LOADED_MODELS=5         # taille max du pool (ports 8081–8085)
 DEFAULT_MODEL_ID=llama-3.3-70b-instruct
 
 # ── Répertoires autorisés pour les fichiers .gguf ─────────────────────────────
-# Liste séparée par des virgules. Vide = pas de restriction.
+# Liste séparée par des virgules, ou tableau JSON ["/models","/data/models"].
+# Vide = pas de restriction — à ne pas laisser tel quel en production.
 ALLOWED_MODEL_DIRS=/models
 
 # ── GPU ────────────────────────────────────────────────────────────────────────
@@ -315,8 +316,9 @@ INTERNAL_API_KEY=<généré>
 ADMIN_SECRET=<généré>
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Origines navigateur autorisées (séparées par des virgules). "*" par défaut ;
-# en production, restreindre aux domaines clients connus.
+# Origines navigateur autorisées (séparées par des virgules, ou tableau JSON).
+# "*" par défaut ; en production, restreindre aux domaines clients connus.
+# Une valeur vide n'autorise aucune origine — ce n'est pas un joker implicite.
 # CORS_ALLOW_ORIGINS=https://app.univ-pau.fr
 ```
 

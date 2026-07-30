@@ -579,24 +579,57 @@ def test_ambient_environment_never_overrides_the_targeted_file(tmp_path, monkeyp
     assert check(run(host.options()), "secrets").status == "pass"
 
 
-def test_invalid_list_variable_blocks_with_actionable_message(tmp_path, monkeypatch):
+def test_documented_csv_list_variable_loads(tmp_path, monkeypatch):
     """
-    Régression : `ALLOWED_MODEL_DIRS=/models,/data` fait échouer le DÉMARRAGE du
-    service (pydantic-settings parse les champs conteneurs en JSON). doctor doit
-    le dire avant, avec la syntaxe correcte.
+    `ALLOWED_MODEL_DIRS=/models,/data/models` — la syntaxe documentée — doit
+    charger.
+
+    Ce test constatait auparavant l'inverse : le format CSV faisait échouer le
+    DÉMARRAGE du service sur une `SettingsError` de pydantic-settings, et doctor
+    servait à le signaler avant. COR-014 a corrigé la cause à la racine, donc
+    doctor n'a plus rien à signaler ici — mais l'ancien comportement ne doit pas
+    revenir, d'où ce test en miroir.
     """
     host = healthy_host(tmp_path, monkeypatch)
     with host.env_file.open("a", encoding="utf-8") as f:
         f.write("ALLOWED_MODEL_DIRS=/models,/data/models\n")
+
+    # `config_load` n'est rendu qu'en cas d'échec (arrêt précoce du diagnostic) :
+    # son absence est donc la preuve que la configuration a chargé.
+    report = run(host.options())
+    assert "config_load" not in by_name(report)
+
+    config = doctor.load_settings_from_env_file(host.env_file)
+    assert config.allowed_model_dirs == ["/models", "/data/models"]
+
+    # Effet de bord attendu, et souhaité : l'allowlist étant enfin réglable, elle
+    # s'applique. Les GGUF de la fixture vivent sous tmp_path, donc hors des
+    # répertoires autorisés — le registre doit désormais les refuser. Avant
+    # COR-014, ce garde-fou était inatteignable puisque la variable ne pouvait
+    # pas être renseignée sans tuer le service.
+    assert check(report, "models_registry").status == "fail"
+
+
+def test_invalid_list_variable_blocks_with_actionable_message(tmp_path, monkeypatch):
+    """
+    Une valeur de liste réellement invalide doit rester bloquante et actionnable.
+
+    Un objet JSON est refusé explicitement plutôt que traité comme un unique
+    élément CSV : sinon l'allowlist de répertoires contiendrait une entrée qui ne
+    correspond à rien, donc un contrôle de sécurité inerte et silencieux.
+    """
+    host = healthy_host(tmp_path, monkeypatch)
+    with host.env_file.open("a", encoding="utf-8") as f:
+        f.write('ALLOWED_MODEL_DIRS={"repertoire": "/models"}\n')
 
     report = run(host.options())
     result = check(report, "config_load")
     assert result.status == "fail"
     assert result.code == "config_load_failed"
     assert result.is_blocking is True
-    assert "ALLOWED_MODEL_DIRS" in result.message
-    assert "JSON" in result.message
     assert report.exit_code() == doctor.EXIT_BLOCKING
+    # Le message doit orienter vers une syntaxe utilisable.
+    assert "a,b" in result.message or "JSON" in result.message
     # Le contrôle de permissions du fichier reste rendu malgré l'arrêt précoce.
     assert "config_env_file" in by_name(report)
 

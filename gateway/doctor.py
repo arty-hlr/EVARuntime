@@ -389,11 +389,14 @@ def load_settings_from_env_file(path: Path) -> Settings:
 
 def _complex_settings_fields() -> tuple[str, ...]:
     """
-    Champs de `Settings` que pydantic-settings parse en JSON (types conteneurs).
+    Champs de `Settings` que pydantic-settings parserait exclusivement en JSON.
 
-    Dérivé du modèle et non codé en dur : sert à produire un message actionnable
-    quand le fichier d'environnement contient une liste au format « virgules »,
-    qui fait échouer le démarrage du service.
+    Dérivé du modèle et non codé en dur. Depuis COR-014, les champs de liste
+    réellement exposés à l'opérateur (`ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS`)
+    sont annotés `str | list[str]` et acceptent le format CSV documenté : cette
+    fonction ne renvoie donc plus rien aujourd'hui. Elle reste comme garde-fou —
+    si un futur champ est déclaré comme conteneur nu, le format « a,b » ferait de
+    nouveau échouer le DÉMARRAGE du service, et doctor doit savoir le nommer.
     """
     names: list[str] = []
     for name, field_info in Settings.model_fields.items():
@@ -418,7 +421,9 @@ def _config_load_hint(exc: Exception) -> str:
             )
     return (
         "Corrigez la variable citée dans le fichier d'environnement puis relancez "
-        "doctor : le service refuserait de démarrer avec cette valeur."
+        "doctor : le service refuserait de démarrer avec cette valeur. Les "
+        "variables de type liste acceptent le format « a,b » ou un tableau JSON "
+        "[\"a\",\"b\"] ; une valeur vide conserve le défaut."
     )
 
 
