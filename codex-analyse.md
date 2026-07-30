@@ -18,42 +18,44 @@
 | Champ | Valeur |
 |---|---|
 | Dernière mise à jour | 2026-07-30 |
-| Phase | **Implémentation en cours** — 7 des 8 items de M0 livrés |
+| Phase | **Jalon M0 atteint** — les 8 items livrés et vérifiés |
 | Jalon visé | **M0 — socle fonctionnel fiable** (§13) |
 | Branche de travail | `feat/lot-a-m0-invariants` (créée depuis `dev` @ `49f8d59`) |
 | Base de référence | `dev` @ `49f8d59` |
-| Périmètre de la vague en cours | COR-001, COR-002, COR-004 → COR-007, AUT-012, OPS-006, TST-001 |
-| Hors périmètre pour l'instant | Lots B (bootstrap), C (performance), D (sécurité), reste du Lot E |
+| Périmètre livré | COR-001, COR-002, COR-004 → COR-007, COR-014, AUT-012, OPS-006, SEC-008, TST-001 |
+| Prochain jalon | **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage |
 
 ### 0.2 Base de référence des tests et état courant
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **587** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **632** 🔬 |
 | `gateway-student` | `cd gateway-student && .venv/bin/python -m pytest tests -q` | 79 | **138** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **45** 🔬 |
-| **Total** | — | **433** | **770** 🔬 |
+| **Total** | — | **433** | **815** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+337 tests** ajoutés à ce stade, tous des régressions rouges avant correctif
-et vertes après.
+**+382 tests** ajoutés par le jalon M0, tous des régressions rouges avant
+correctif et vertes après. Les scripts de déploiement passent `bash -n`.
+`shellcheck` et `ruff` ne sont installés dans aucun environnement du dépôt : ce
+sont des lacunes d'outillage, à traiter avec EVA-044.
 
 ### 0.3 Avancement par lot
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Bloqué |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 14 | 6 | 1 | 7 | 0 |
+| A — bloqueurs et invariants | 14 | 7 | 0 | 7 | 0 |
 | B — bootstrap automatisé | 13 | 1 | 0 | 12 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
 | D — sécurité et supply-chain | 8 | 1 | 0 | 7 | 0 |
 | E — tests et exploitation | 12 | 1 | 0 | 11 | 0 |
-| **Total** | **55** | **9** | **1** | **45** | **0** |
+| **Total** | **55** | **10** | **0** | **45** | **0** |
 
 Deux items ont été **ajoutés au backlog** pendant l'implémentation, d'où 55 au
 lieu de 53 : COR-014 (Lot A) et SEC-008 (Lot D). Voir §0.8.
 
-Sur les **8 items du jalon M0**, 7 sont terminés et vérifiés, 1 est en cours.
+Les **8 items du jalon M0 sont terminés et vérifiés.**
 
 ### 0.4 Vague en cours — jalon M0
 
@@ -72,7 +74,7 @@ chantiers menés en parallèle ne se marchent jamais dessus.
 | 2 | AUT-012 | `[x]` | `0efa5a7` | +103 |
 | — | SEC-008 | `[x]` | `04f4433` | +13 |
 | — | COR-014 | `[x]` | `06b50af` | +25 / +13 |
-| 3 | COR-006 | `[~]` | — | — |
+| 3 | COR-006 | `[x]` | `0102760` | +45 |
 
 Les deux lignes sans numéro de vague sont les items **ajoutés en cours de
 route** : ils n'étaient pas planifiés, ils sont nés d'une découverte.
@@ -122,7 +124,30 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-30 | SEC-008 | `04f4433` | `pytest tests -q` (gateway) | 459 réussis, aucun nom d'utilisateur dans les journaux 🔬 |
 | 2026-07-30 | AUT-012 | `0efa5a7` | `pytest tests -q` (gateway) | 562 réussis, diagnostic humain et JSON, exit codes stables 🔬 |
 | 2026-07-30 | COR-014 | `06b50af` | `pytest tests -q` (gateway + student) | 587 / 138 réussis, les fichiers d'exemple livrés sont chargeables 🔬 |
-| 2026-07-30 | — | — | Les 3 suites sur la branche cumulée | **770 réussis** (587 / 138 / 45) 🔬 |
+| 2026-07-30 | COR-006 | `0102760` | `pytest tests -q` (gateway) + `bash -n` | 632 réussis, un flux sans contenu est un échec, rollback fonctionnel 🔬 |
+| 2026-07-30 | **M0** | `0102760` | Les 3 suites + syntaxe des 9 scripts de déploiement | **815 réussis** (632 / 138 / 45), jalon atteint 🔬 |
+
+### 0.7.1 Sortie du jalon M0
+
+Conditions de §13 et leur état :
+
+| Condition M0 | État |
+|---|---|
+| COR-001, COR-002 et COR-004 à COR-007 terminés | `[x]` — plus COR-014, découvert en route |
+| AUT-012 et OPS-006 terminés | `[x]` |
+| Toutes les régressions P0 présentes | `[x]` — 382 tests ajoutés, chacun rouge avant correctif |
+| Readiness et rollback fiables | `[x]` — readiness structurelle stricte (COR-005) et rollback adossé à une génération réelle (COR-006) |
+| Aucune opération admin ne tue silencieusement une requête | `[x]` — 5 routes protégées, drain borné puis 409 (COR-004) |
+
+**Décision de sortie prononcée** : le travail de bootstrap (Lot B) peut démarrer
+sur une base correcte.
+
+Ce que M0 ne prétend **pas** avoir démontré, et qui reste vrai depuis l'audit
+initial : aucun test n'a été exécuté contre un GPU réel, un vrai `llama-server`
+ou un GGUF réel. La logique de décision du smoke test est testée contre un faux
+serveur HTTP ; le parcours physique jusqu'au premier token reste à faire
+(TST-004, AUT-009). Le niveau de preuve de COR-007 reste un jugement
+d'architecture `🧭`, à remplacer par la calibration AUT-008.
 
 ### 0.8 Défauts découverts pendant l'implémentation, absents des deux audits
 
@@ -1027,7 +1052,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-003 | `[ ]` | P2 | Formaliser admission + pin sous forme de lease | Hardening préventif : aucun futur `await` ou refactor ne peut ouvrir une fenêtre d'éviction. Ce n'est pas un bug reproduit dans le code actuel. |
 | COR-004 | `[x]` | P0 | Protéger unload/update/delete contre les requêtes actives | Drain borné, conflit explicite ou job différé ; aucun stream actif tué silencieusement. |
 | COR-005 | `[x]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
-| COR-006 | `[~]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
+| COR-006 | `[x]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
 | COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
 | COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
 | COR-009 | `[ ]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. |
