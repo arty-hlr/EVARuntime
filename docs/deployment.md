@@ -1021,6 +1021,31 @@ Un échec bloquant de `doctor` **avant** la bascule restaure lui aussi le code
 synchronisé, mais **sans jamais arrêter le service** : la version en production
 continue de servir pendant toute la détection.
 
+#### Redémarrages et start-limit systemd (COR-017)
+
+Une unité qui a échoué plusieurs fois de suite atteint son **start-limit** :
+systemd refuse alors tout démarrage (`Start request repeated too quickly`), y
+compris celui du rollback. Tous les démarrages d'`install.sh` et `update.sh`
+sont donc précédés d'un `systemctl reset-failed` — un no-op sur une unité saine.
+
+Sur un chemin de rollback, un démarrage refusé n'est plus un avertissement mais
+une **indisponibilité** : `update.sh` sort en erreur avec un bloc
+`[INDISPONIBILITÉ]` qui rappelle que la gateway est à terre et donne la
+commande de rétablissement. La restauration (mode, code, venv, unité) est
+toujours menée à son terme **avant** que l'échec soit signalé.
+
+```
+[INDISPONIBILITÉ] Rollback vers /var/lib/llm-gateway/backups/code-pre-update-… : démarrage refusé par systemd.
+[INDISPONIBILITÉ] llm-gateway n'a PAS redémarré : la gateway est À TERRE.
+  Rétablissement manuel immédiat :
+    sudo systemctl reset-failed llm-gateway
+    sudo systemctl start llm-gateway
+```
+
+Sur le chemin **nominal**, un démarrage en échec reste délibérément non fatal :
+la sonde `/ready` qui suit enchaîne sur le rollback, qu'un arrêt immédiat
+court-circuiterait.
+
 Le rollback **ne restaure pas** la base de données automatiquement : le schéma
 peut avoir évolué et écraser la base sans arbitrage humain serait plus risqué
 qu'utile. La sauvegarde `gateway-pre-update-*.db` reste disponible pour une
@@ -1509,16 +1534,32 @@ propriétaire `llmservice`).
 
 ### Installation du timer de sauvegarde quotidienne
 
-**Automatique.** `install.sh` déploie le script + les unités et active le timer
-(si `sqlite3` est présent). `update.sh` rafraîchit ensuite ces fichiers à chaque
-mise à jour, et active le timer la première fois. Un timer que vous auriez
-volontairement désactivé (`systemctl disable`) n'est jamais réactivé
-automatiquement. Il n'y a donc normalement **rien à faire manuellement**.
+**Automatique.** `install.sh` déploie le script + les unités et **arme** le timer
+avec `enable --now` (si `sqlite3` est présent). `update.sh` rafraîchit ensuite
+ces fichiers à chaque mise à jour, et arme le timer la première fois. Un timer
+que vous auriez volontairement désactivé (`systemctl disable`) n'est jamais
+réactivé automatiquement. Il n'y a donc normalement **rien à faire
+manuellement**.
+
+> **OPS-008 — `--now` est indispensable.** Un `systemctl enable` seul crée le
+> lien dans `timers.target` mais laisse l'unité `inactive` : elle n'apparaît pas
+> dans `list-timers` et ne déclenche **aucune** sauvegarde jusqu'au prochain
+> reboot. Sur un serveur qui ne redémarre pas, cela signifiait zéro sauvegarde
+> périodique, sans le moindre message. `update.sh` répare aussi cet état sur les
+> hôtes déjà installés : un timer `enabled` mais `inactive` est armé.
+>
+> Dans `install.sh`, l'armement suit délibérément l'**initialisation de la
+> base** (étape 9). Sur une installation neuve, ce premier `start` ne déclenche
+> aucune sauvegarde (sans stamp préexistant, systemd pose le stamp sans exécuter
+> le job) ; sur une réinstallation avec un stamp périmé, `Persistent=true` peut
+> en revanche rattraper l'occurrence manquée immédiatement — elle trouve alors
+> une base déjà initialisée.
 
 Vérifier / tester :
 
 ```bash
-systemctl list-timers llm-gateway-backup.timer
+systemctl is-active llm-gateway-backup.timer      # doit répondre « active »
+systemctl list-timers llm-gateway-backup.timer    # doit lister la prochaine échéance
 sudo systemctl start llm-gateway-backup.service   # test manuel immédiat
 journalctl -u llm-gateway-backup.service --no-pager -n 20
 ```
