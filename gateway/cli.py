@@ -186,7 +186,7 @@ def anonymize_user(
                 "horodatage initial conservé, clés revérifiées."
             )
         else:
-            console.print(f"[green]Utilisateur anonymisé.[/green]")
+            console.print("[green]Utilisateur anonymisé.[/green]")
         console.print(f"  Pseudonyme      : {result['username']}")
         console.print(f"  Anonymisé le    : {result['anonymized_at']}")
         console.print(f"  Clés révoquées  : {result['keys_revoked']} / {result['keys_total']}")

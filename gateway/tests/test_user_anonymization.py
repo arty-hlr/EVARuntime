@@ -593,7 +593,8 @@ async def test_anonymized_user_stays_listed_but_not_counted_as_active(temp_db) -
     n'est JAMAIS compté comme utilisateur actif.
     """
     await db.init_db()
-    active = await db.create_user(username="nina")
+    # Compte actif témoin : référencé par son nom dans les assertions.
+    await db.create_user(username="nina")
     anonymized, _ = await _seed_user_with_keys_and_usage(username="oscar")
     await db.anonymize_user(anonymized["id"])
 
