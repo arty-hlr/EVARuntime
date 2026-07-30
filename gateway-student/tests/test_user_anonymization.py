@@ -547,6 +547,31 @@ async def test_anonymization_logs_no_personal_data(temp_db, caplog) -> None:
 
 # ── 10. Frontière de sécurité : aucune route admin côté student ───────────────
 
+def _iter_route_paths(router):
+    """
+    Énumère les chemins de toutes les routes, en descendant récursivement.
+
+    Ce parcours ne peut pas se contenter de lire `app.routes` : depuis
+    FastAPI 0.141, `include_router()` n'aplatit plus les routes, il dépose un
+    `_IncludedRouter` qui garde une référence via `original_router`. Une lecture
+    directe deviendrait donc AVEUGLE aux routes des routeurs inclus.
+
+    C'est critique ici : ce test asserte une *absence*. S'il devenait aveugle,
+    il continuerait de passer pendant que des routes `/admin/*` seraient
+    réellement exposées — un contrôle de sécurité inerte et silencieux. La
+    gateway étudiante n'utilise aucun routeur inclus aujourd'hui, mais le test
+    doit rester valide si cela change.
+    """
+    for route in getattr(router, "routes", []) or []:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            yield from _iter_route_paths(original)
+            continue
+        path = getattr(route, "path", None)
+        if path is not None:
+            yield path
+
+
 def test_student_gateway_exposes_no_admin_route() -> None:
     """
     L'anonymisation est une opération serveur (CLI). La gateway étudiante ne doit
@@ -554,7 +579,13 @@ def test_student_gateway_exposes_no_admin_route() -> None:
     """
     import main
 
-    paths = {route.path for route in main.app.routes}
+    paths = set(_iter_route_paths(main.app))
+
+    # Témoin positif : prouve que le parcours voit réellement quelque chose.
+    # Sans lui, une énumération cassée rendrait les assertions d'absence
+    # ci-dessous trivialement vraies.
+    assert "/v1/chat/completions" in paths
+
     assert not any(path.startswith("/admin") for path in paths)
     assert not any("users" in path for path in paths)
     assert not any("anonymize" in path for path in paths)

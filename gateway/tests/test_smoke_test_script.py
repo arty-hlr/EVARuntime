@@ -793,6 +793,31 @@ def test_update_ne_verifie_jamais_les_empreintes_gguf():
 # route est renommée ou un champ retiré, la recette casserait en production sans
 # qu'aucun test unitaire ne le voie.
 
+def _iter_app_routes(router):
+    """
+    Énumère `(méthode, chemin)` pour toutes les routes d'une application.
+
+    Le parcours doit descendre récursivement : depuis FastAPI 0.141,
+    `include_router()` n'aplatit plus les routes dans `app.routes`, il y dépose
+    un `_IncludedRouter` qui garde une référence via `original_router`. Une
+    lecture directe de `app.routes` ne voit donc plus AUCUNE route de routeur
+    inclus — soit, ici, tout `/admin/*`.
+
+    `requirements.txt` déclare `fastapi>=0.115.0,<1.0.0` : les deux formes
+    coexistent dans la plage supportée, et ce parcours les couvre toutes deux.
+    """
+    for route in getattr(router, "routes", []) or []:
+        original = getattr(route, "original_router", None)
+        if original is not None:
+            yield from _iter_app_routes(original)
+            continue
+        path = getattr(route, "path", None)
+        if path is None:  # Mount sans chemin propre
+            continue
+        for method in getattr(route, "methods", None) or ():
+            yield (method, path)
+
+
 def test_les_routes_exercees_existent_reellement():
     import main  # noqa: PLC0415 - import tardif : conftest prépare l'environnement
 
@@ -808,12 +833,25 @@ def test_les_routes_exercees_existent_reellement():
         ("DELETE", "/admin/users/{username}"),
         ("POST", "/v1/chat/completions"),
     }
-    available = {
-        (method, route.path)
-        for route in main.app.routes
-        for method in getattr(route, "methods", set()) or set()
-    }
+    available = set(_iter_app_routes(main.app))
     assert exercised <= available, f"routes disparues : {sorted(exercised - available)}"
+
+
+def test_le_parcours_des_routes_voit_les_routeurs_inclus():
+    """
+    Garde-fou du garde-fou.
+
+    Si le parcours ci-dessus cessait de descendre dans les routeurs inclus, le
+    test précédent deviendrait vide de sens sur une version récente de FastAPI :
+    il ne verrait plus que les routes déclarées directement sur l'application.
+    On vérifie donc explicitement qu'au moins une route de routeur inclus est
+    atteinte, pour `/admin/*` comme pour les métriques.
+    """
+    import main  # noqa: PLC0415
+
+    paths = {path for _, path in _iter_app_routes(main.app)}
+    assert "/admin/status" in paths
+    assert "/admin/metrics/prometheus" in paths
 
 
 def test_les_champs_consommes_par_la_recette_existent():
