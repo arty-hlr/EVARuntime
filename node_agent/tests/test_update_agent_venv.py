@@ -16,6 +16,12 @@ telle quelle par `update-agent.sh`) est appliquée, puis un exécutable de `bin/
 est réellement lancé. Réintroduire un déplacement de venv les fait échouer sur
 `bad interpreter`.
 
+La seconde moitié du module couvre le COROLLAIRE de cette stratégie (OPS-010) :
+puisque plus aucun venv n'est écrasé, chaque mise à jour laisse une release
+complète (~200 Mo) sur le disque du nœud. La rétention doit être bornée, et
+surtout ne jamais emporter la release ACTIVE ni celle vers laquelle un retour
+arrière manuel rebasculerait.
+
 Ni GPU, ni systemd, ni root : tout se passe dans un répertoire temporaire.
 """
 from __future__ import annotations
@@ -231,3 +237,246 @@ def test_update_agent_script_delegates_to_the_shared_venv_strategy() -> None:
         if line.strip().startswith("mv ") and "VENV" in line
     ]
     assert not moves, f"Un venv est déplacé par update-agent.sh : {moves}"
+
+
+# ── Rétention des releases (OPS-010) ─────────────────────────────────────────
+# Sans purge, chaque mise à jour laisse ~200 Mo de plus sur le nœud, sans le
+# moindre message, jusqu'à saturation de /opt. Les tests ci-dessous verrouillent
+# les deux bornes de la politique : ce qu'elle réclame VRAIMENT (les releases
+# excédentaires disparaissent du disque) et ce qu'elle ne doit JAMAIS toucher
+# (la release en service, et celle qui sert de filet au retour arrière manuel).
+
+def _release(install_dir: Path, name: str, age_seconds: int) -> Path:
+    """Une release factice datée, pour rendre l'ordre de purge déterministe.
+
+    L'âge est imposé explicitement : deux répertoires créés dans la même seconde
+    porteraient la même mtime, et `stat` ne descend pas sous la seconde.
+    """
+    path = install_dir / name
+    path.mkdir()
+    (path / "pyvenv.cfg").write_text("home = /usr\n", encoding="utf-8")
+    stamp = 1_700_000_000 - age_seconds
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def _prunable(install_dir: Path, link: Path, keep: str | None = None) -> list[Path]:
+    """Ce que la rétention DÉSIGNE, sans rien supprimer (ce qu'annonce --dry-run)."""
+    keep_arg = "" if keep is None else f' "{keep}"'
+    result = _bash(
+        f'agent_venv_prunable_releases "{install_dir!s}" "{link!s}"{keep_arg}',
+        cwd=install_dir,
+    )
+    assert result.returncode == 0, result.stderr
+    return [Path(line) for line in result.stdout.splitlines() if line]
+
+
+def _prune(install_dir: Path, link: Path, keep: str | None = None) -> list[Path]:
+    """Ce que la rétention SUPPRIME réellement."""
+    keep_arg = "" if keep is None else f' "{keep}"'
+    result = _bash(
+        f'agent_venv_prune_releases "{install_dir!s}" "{link!s}"{keep_arg}',
+        cwd=install_dir,
+    )
+    assert result.returncode == 0, result.stderr
+    return [Path(line) for line in result.stdout.splitlines() if line]
+
+
+def test_retention_keeps_the_active_and_previous_releases(install_dir: Path) -> None:
+    """Quatre releases, la plus récente en service : deux survivent, deux partent."""
+    oldest = _release(install_dir, "venv-agent-release-20260701-090000-11", age_seconds=300)
+    older = _release(install_dir, "venv-agent-release-20260710-090000-22", age_seconds=200)
+    previous = _release(install_dir, "venv-agent-release-20260720-090000-33", age_seconds=100)
+    active = _release(install_dir, "venv-agent-release-20260730-090000-44", age_seconds=0)
+
+    venv_link = install_dir / "venv-agent"
+    venv_link.symlink_to(active)
+
+    assert _prunable(install_dir, venv_link) == [older, oldest]
+    assert _prune(install_dir, venv_link) == [older, oldest]
+
+    assert active.is_dir(), "La release en service a été purgée."
+    assert previous.is_dir(), "La release précédente doit rester : elle sert au retour arrière."
+    assert not older.exists()
+    assert not oldest.exists()
+
+
+def test_retention_never_removes_the_active_release_even_when_it_is_the_oldest(
+    install_dir: Path,
+) -> None:
+    """
+    Le symlink fait autorité, pas la date.
+
+    Après un retour arrière manuel vers une vieille release, la release EN
+    SERVICE est la plus ancienne du répertoire. Une purge qui ne regarderait que
+    les dates emporterait le venv sous les pieds de l'agent.
+    """
+    active = _release(install_dir, "venv-agent-release-20260601-090000-11", age_seconds=400)
+    _release(install_dir, "venv-agent-release-20260710-090000-22", age_seconds=200)
+    doomed = _release(install_dir, "venv-agent-release-20260715-090000-33", age_seconds=150)
+    newest = _release(install_dir, "venv-agent-release-20260730-090000-44", age_seconds=0)
+
+    venv_link = install_dir / "venv-agent"
+    venv_link.symlink_to(active)
+
+    pruned = _prune(install_dir, venv_link)
+
+    assert active.is_dir(), "La cible du symlink a été purgée : l'agent n'a plus de venv."
+    assert active not in pruned
+    assert newest.is_dir(), "La release conservée en plus de l'active doit être la plus récente."
+    assert doomed in pruned and not doomed.exists()
+
+
+def test_retention_reclaims_the_legacy_pre_update_venv(install_dir: Path) -> None:
+    """
+    `venv-agent-pre-update-*` est une release comme une autre.
+
+    C'est le venv écarté lors de la migration depuis l'ancien schéma : une fois
+    sorti du quota il n'a plus aucune raison d'occuper 200 Mo indéfiniment.
+    """
+    legacy = _release(install_dir, "venv-agent-pre-update-20260601-090000", age_seconds=400)
+    previous = _release(install_dir, "venv-agent-release-20260720-090000-33", age_seconds=100)
+    active = _release(install_dir, "venv-agent-release-20260730-090000-44", age_seconds=0)
+
+    venv_link = install_dir / "venv-agent"
+    venv_link.symlink_to(active)
+
+    assert _prune(install_dir, venv_link) == [legacy]
+    assert not legacy.exists()
+    assert previous.is_dir() and active.is_dir()
+
+    # Mais tant qu'il tient dans le quota, il est conservé : juste après la
+    # migration, c'est LUI la release de retour arrière.
+    fresh = install_dir / "opt2"
+    fresh.mkdir()
+    legacy_kept = _release(fresh, "venv-agent-pre-update-20260601-090000", age_seconds=400)
+    active2 = _release(fresh, "venv-agent-release-20260730-090000-44", age_seconds=0)
+    link2 = fresh / "venv-agent"
+    link2.symlink_to(active2)
+
+    assert _prune(fresh, link2) == []
+    assert legacy_kept.is_dir()
+
+
+def test_retention_only_ever_touches_release_directories(install_dir: Path) -> None:
+    """
+    Rien d'autre que les releases ne doit entrer dans le champ de la purge.
+
+    `install_dir` est `/opt/llm-gateway` : le code déployé, la sauvegarde de
+    rollback et le symlink lui-même y cohabitent avec les venvs.
+    """
+    _release(install_dir, "venv-agent-release-20260601-090000-11", age_seconds=400)
+    _release(install_dir, "venv-agent-release-20260710-090000-22", age_seconds=200)
+    active = _release(install_dir, "venv-agent-release-20260730-090000-44", age_seconds=0)
+
+    bystanders = [
+        install_dir / "node_agent",
+        install_dir / "gateway",
+        install_dir / ".agent-rollback",
+        install_dir / "venv-agent-releases-notes",  # préfixe voisin, pas une release
+    ]
+    for path in bystanders:
+        path.mkdir()
+        (path / "keep-me").write_text("", encoding="utf-8")
+
+    venv_link = install_dir / "venv-agent"
+    venv_link.symlink_to(active)
+
+    _prune(install_dir, venv_link)
+
+    for path in bystanders:
+        assert (path / "keep-me").exists(), f"La purge a touché {path.name}, qui n'est pas une release."
+    assert venv_link.is_symlink(), "Le symlink venv-agent a été emporté par la purge."
+
+
+def test_retention_keep_is_configurable_and_never_falls_below_the_active_release(
+    install_dir: Path,
+) -> None:
+    """Le quota est réglable (EVA_AGENT_VENV_KEEP), mais 0 ne peut pas exister."""
+    releases = [
+        _release(install_dir, f"venv-agent-release-2026070{index}-090000-{index}", age_seconds=age)
+        for index, age in enumerate((400, 300, 200, 100, 0))
+    ]
+    venv_link = install_dir / "venv-agent"
+    venv_link.symlink_to(releases[-1])
+
+    assert _prunable(install_dir, venv_link, keep="4") == [releases[0]]
+
+    # Une valeur inutilisable retombe sur la valeur par défaut plutôt que de
+    # purger au hasard; et dans tous les cas la release active survit.
+    for absurd in ("0", "-1", "", "beaucoup"):
+        assert venv_link.resolve() not in _prunable(install_dir, venv_link, keep=absurd), (
+            f"keep={absurd!r} désigne la release en service."
+        )
+
+
+def test_retention_leaves_the_activated_venv_runnable(install_dir: Path) -> None:
+    """
+    Bout à bout, avec de VRAIS venvs : bascule, puis purge.
+
+    Le venv en service doit rester lançable après la purge — c'est ce que fait
+    systemd au premier `ExecStart` qui suit la mise à jour. Une purge qui
+    emporterait la cible du symlink se verrait ici, et nulle part ailleurs.
+    """
+    venv_link = install_dir / "venv-agent"
+    previous = install_dir / "venv-agent-release-20260720-090000-33"
+    _make_venv(previous)
+    os.utime(previous, (1_699_999_900, 1_699_999_900))
+    stale = _release(install_dir, "venv-agent-release-20260601-090000-11", age_seconds=400)
+    venv_link.symlink_to(previous)
+
+    staged = _bash(
+        f'staged="$(agent_venv_new_release_path "{install_dir!s}")"\nprintf %s "$staged"\n',
+        cwd=install_dir,
+    )
+    assert staged.returncode == 0, staged.stderr
+    staged_venv = Path(staged.stdout)
+    _make_venv(staged_venv)
+
+    switched = _bash(
+        f'agent_venv_activate "{venv_link!s}" "{staged_venv!s}"\n'
+        f'agent_venv_prune_releases "{install_dir!s}" "{venv_link!s}" 2\n',
+        cwd=install_dir,
+    )
+    assert switched.returncode == 0, switched.stderr
+
+    result = _console_script_runs(venv_link)
+    assert result.returncode == 0, (
+        f"bin/{CONSOLE_SCRIPT} n'est plus lançable après la purge (rc={result.returncode}).\n"
+        f"  shebang : {_shebang(venv_link / 'bin' / CONSOLE_SCRIPT)}\n"
+        f"  erreur  : {result.stderr.strip()}"
+    )
+    assert (previous / "bin" / CONSOLE_SCRIPT).exists(), (
+        "La release précédente a été purgée : plus aucun retour arrière possible."
+    )
+    assert not stale.exists(), "La release excédentaire n'a pas été purgée."
+
+
+def test_update_agent_script_applies_a_bounded_retention() -> None:
+    """La stratégie de rétention ne doit pas rester une bibliothèque inutilisée."""
+    body = UPDATE_SCRIPT.read_text()
+
+    assert "agent_venv_prune_releases" in body, (
+        "update-agent.sh ne purge aucun venv de release : chaque mise à jour "
+        "laisse ~200 Mo sur le nœud."
+    )
+    assert "agent_venv_prunable_releases" in body, (
+        "update-agent.sh n'annonce pas la purge en --dry-run."
+    )
+    # La purge n'a de sens qu'une fois la mise à jour validée : avant, la release
+    # précédente est encore ce vers quoi le rollback rebascule.
+    lines = body.splitlines()
+    prune_line = next(
+        index for index, line in enumerate(lines)
+        if "agent_venv_prune_releases" in line and not line.strip().startswith("#")
+    )
+    # `ROLLBACK_READY=false` apparaît deux fois : l'initialisation en tête de
+    # script, puis le désarmement qui acte le succès. C'est le second qui borne.
+    success_line = max(
+        index for index, line in enumerate(lines)
+        if line.strip() == "ROLLBACK_READY=false"
+    )
+    assert prune_line > success_line, (
+        "La purge précède la validation de la mise à jour : elle peut supprimer "
+        "la release vers laquelle le rollback rebascule."
+    )

@@ -25,6 +25,10 @@ ENV_FILE="/etc/llm-gateway-agent/env"
 SERVICE="llm-gateway-agent"
 SERVICE_FILE="/etc/systemd/system/$SERVICE.service"
 ROLLBACK_DIR="$INSTALL_DIR/.agent-rollback"
+# Rétention des venvs de release (OPS-010) : la release active + la précédente,
+# pour qu'un retour arrière manuel reste possible. Les plus anciennes sont
+# purgées après une mise à jour réussie. Voir deploy/agent-venv-lib.sh.
+VENV_KEEP_RELEASES="${EVA_AGENT_VENV_KEEP:-2}"
 WORK_DIR=""
 STAGED_VENV=""
 ROLLBACK_READY=false
@@ -43,6 +47,10 @@ Usage: sudo bash update-agent.sh [--dry-run] [--no-pull]
 
 La mise à jour construit un venv neuf, sauvegarde la version installée, redémarre
 et sonde l'agent. En cas d'échec, code + venv + unité systemd sont restaurés.
+
+Après une mise à jour réussie, les venvs de release sont purgés en ne conservant
+que les 2 plus récents (l'actif et le précédent, pour un retour arrière manuel).
+EVA_AGENT_VENV_KEEP=N règle ce nombre; l'actif n'est jamais supprimé.
 EOF
 }
 
@@ -59,6 +67,11 @@ done
 for command in python3 rsync systemctl; do
     command -v "$command" >/dev/null || die "Commande requise absente : $command"
 done
+
+# Une valeur inexploitable doit se voir maintenant, pas au moment de la purge :
+# à ce stade l'opérateur peut encore corriger sans rien avoir touché.
+[[ "$VENV_KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]] || \
+    die "EVA_AGENT_VENV_KEEP doit être un entier >= 1 (reçu : '$VENV_KEEP_RELEASES')."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -102,6 +115,14 @@ if [[ "$DRY_RUN" == true ]]; then
     if [[ -d "$VENV_DIR" && ! -L "$VENV_DIR" ]]; then
         info "Agent installé avant COR-016 : le venv réel sera migré en place lors de cette mise à jour."
     fi
+    # La purge n'a lieu qu'après une mise à jour RÉUSSIE. On annonce ici ce
+    # qu'elle emporterait dans l'état actuel du disque, sans rien supprimer :
+    # la release neuve n'existant pas encore, la liste est majorante d'une place.
+    info "Rétention des venvs de release : $VENV_KEEP_RELEASES conservés (actif + précédents)."
+    while IFS= read -r prunable_venv; do
+        [[ -n "$prunable_venv" ]] || continue
+        info "  Serait purgé : $prunable_venv"
+    done < <(agent_venv_prunable_releases "$INSTALL_DIR" "$VENV_DIR" "$VENV_KEEP_RELEASES")
     exit 0
 fi
 
@@ -269,4 +290,22 @@ info "Venv en service : $VENV_DIR -> $STAGED_VENV"
 if [[ -n "$AGENT_VENV_PREVIOUS_TARGET" ]]; then
     info "Venv précédent conservé (rollback manuel possible) : $AGENT_VENV_PREVIOUS_TARGET"
 fi
+
+# Purge des releases excédentaires (OPS-010). Ici seulement : la mise à jour est
+# validée, donc la release précédente n'est plus qu'un filet de sécurité — c'est
+# à ce titre qu'on la garde, et qu'on ne garde qu'elle. Un échec de purge n'est
+# JAMAIS un échec de mise à jour : l'agent tourne, il ne manque que de l'espace.
+PRUNED=""
+PRUNE_STATUS=0
+PRUNED="$(agent_venv_prune_releases "$INSTALL_DIR" "$VENV_DIR" "$VENV_KEEP_RELEASES")" \
+    || PRUNE_STATUS=$?
+while IFS= read -r pruned_venv; do
+    [[ -n "$pruned_venv" ]] || continue
+    info "Venv de release purgé : $pruned_venv"
+done <<< "$PRUNED"
+if (( PRUNE_STATUS != 0 )); then
+    warn "Purge des anciens venvs incomplète; l'agent est en service."
+    warn "  Vérifiez l'espace disque puis : ls -d $INSTALL_DIR/venv-agent-release-*"
+fi
+
 info "Secrets, TLS, modèles et configuration n'ont pas été modifiés."

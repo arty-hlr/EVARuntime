@@ -95,6 +95,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=deploy-mode-lib.sh
 source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
+# shellcheck source=venv-retention-lib.sh
+source "$SCRIPT_DIR/deploy/venv-retention-lib.sh"
 
 usage() {
     cat <<EOF
@@ -122,6 +124,10 @@ Validation de la version déployée (COR-006) :
                          version est alors validée sur /ready seul, comme avant
                          COR-006. À réserver à un dépannage.
   --skip-doctor          Désactive les préflights doctor avant et après bascule.
+
+Après une mise à jour validée, les venvs de release sont purgés en ne conservant
+que les 2 plus récents (l'actif et le précédent, pour un retour arrière manuel).
+EVA_GATEWAY_VENV_KEEP=N règle ce nombre; l'actif n'est jamais supprimé.
 EOF
 }
 
@@ -186,6 +192,12 @@ DB_PATH="$DATA_DIR/gateway.db"
 BACKUP_DIR="$DATA_DIR/backups"
 SERVICE_USER="llmservice"
 CONFIG_FILE="$CONFIG_DIR/env"
+# Rétention des venvs de release (OPS-010) : la release active + la précédente,
+# pour qu'un retour arrière manuel reste possible. Les plus anciennes sont
+# purgées une fois la version validée. Voir deploy/venv-retention-lib.sh.
+VENV_KEEP_RELEASES="${EVA_GATEWAY_VENV_KEEP:-2}"
+[[ "$VENV_KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]] || \
+    error "EVA_GATEWAY_VENV_KEEP doit être un entier >= 1 (reçu : '$VENV_KEEP_RELEASES')."
 CURRENT_MODE="$(deploy_env_value "$CONFIG_FILE" CLUSTER_MODE)"
 EFFECTIVE_MODE="$(deploy_select_mode "$CONFIG_FILE" "$REQUESTED_MODE")" || exit 1
 PREVIOUS_MODE="${CURRENT_MODE:-local}"
@@ -218,6 +230,14 @@ fi
 
 if [[ "$DRY_RUN" == true ]]; then
     echo "  Action         : aucune (--dry-run; pas de git pull, pip, systemd ou écriture)"
+    echo "  Rétention venv : $VENV_KEEP_RELEASES releases conservées (actif + précédents)"
+    # La purge n'a lieu qu'après une version VALIDÉE. On annonce ce qu'elle
+    # emporterait dans l'état actuel du disque, sans rien supprimer : la release
+    # neuve n'existant pas encore, la liste est majorante d'une place.
+    while IFS= read -r prunable_venv; do
+        [[ -n "$prunable_venv" ]] || continue
+        echo "                   serait purgé : $prunable_venv"
+    done < <(gateway_venv_prunable_releases "$INSTALL_DIR" "$INSTALL_DIR/venv" "$VENV_KEEP_RELEASES")
     if [[ -n "$CURRENT_MODE" && "$CURRENT_MODE" != "$EFFECTIVE_MODE" ]]; then
         echo "  Migration      : $CURRENT_MODE → $EFFECTIVE_MODE; l'exécution exigera --allow-mode-change"
     fi
@@ -823,6 +843,33 @@ section "Contrôle doctor (après bascule)"
 if ! run_doctor "$INSTALL_DIR/venv/bin/python" "après bascule"; then
     warn "doctor signale un écart sur l'hôte basculé — à traiter, sans rollback :"
     warn "  la version déployée a passé la recette du premier token."
+fi
+
+# ── Rétention des venvs de release (OPS-010) ─────────────────────────────────
+# Ici seulement : la version a PROUVÉ qu'elle sert, donc la release précédente
+# n'est plus qu'un filet de sécurité — c'est à ce titre qu'on la garde, et qu'on
+# ne garde qu'elle. Purger plus tôt supprimerait ce vers quoi un rollback
+# rebascule. Un échec de purge n'est JAMAIS un échec de mise à jour : la gateway
+# sert, il ne manque que de l'espace disque.
+
+section "Rétention des venvs de release"
+PRUNED=""
+PRUNE_STATUS=0
+PRUNED="$(gateway_venv_prune_releases "$INSTALL_DIR" "$INSTALL_DIR/venv" "$VENV_KEEP_RELEASES")" \
+    || PRUNE_STATUS=$?
+while IFS= read -r pruned_venv; do
+    [[ -n "$pruned_venv" ]] || continue
+    info "Venv de release purgé : $pruned_venv"
+done <<< "$PRUNED"
+if (( PRUNE_STATUS != 0 )); then
+    warn "Purge des anciens venvs incomplète; la gateway est en service."
+    warn "  Vérifiez l'espace disque puis : ls -d $INSTALL_DIR/venv-release-*"
+elif [[ -z "$PRUNED" ]]; then
+    info "$VENV_KEEP_RELEASES releases conservées — rien à purger."
+else
+    info "Venv actif conservé : $(readlink -f "$INSTALL_DIR/venv")"
+    [[ -z "$PREVIOUS_VENV_TARGET" ]] || \
+        info "Venv précédent conservé (retour arrière manuel) : $PREVIOUS_VENV_TARGET"
 fi
 
 # ── Vérification des secrets ──────────────────────────────────────────────────
