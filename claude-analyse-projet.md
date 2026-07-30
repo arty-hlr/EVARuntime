@@ -5,7 +5,11 @@
 >
 > **Dernière mise à jour :** 2026-07-30
 > **Branche auditée :** `dev` @ `49f8d59`
-> **État des suites :** 433 tests au vert (309 gateway / 79 student / 45 node_agent) — couverture 83 % (≈72 % hors code de test)
+> **État des suites :** 354 tests au vert (309 gateway / 45 node_agent) — couverture 83 % (≈72 % hors code de test)
+>
+> Le composant `gateway-student` a été supprimé le 2026-07-30 (DEC-009 dans
+> [codex-analyse.md](codex-analyse.md)). Les items qui ne le concernaient que lui
+> — `EVA-006`, `EVA-023` — sont barrés ; le total ci-dessus ne compte plus ses 79 tests.
 
 ---
 
@@ -77,7 +81,7 @@ Préférer l'option 1 : moins de surface, contrat rétro-compatible en local.
 ### ☐ EVA-002 · La suppression d'un utilisateur échoue dès qu'il a servi 🔬
 
 `usage_log.user_id` référence `users(id)` **sans `ON DELETE CASCADE`**
-([gateway/database.py:48](gateway/database.py:48), [gateway-student/database.py:45](gateway-student/database.py:45)),
+([gateway/database.py:48](gateway/database.py:48)),
 alors que `PRAGMA foreign_keys = ON` est appliqué à chaque connexion.
 
 Reproduit sur la gateway principale :
@@ -104,7 +108,7 @@ Sous-jacent : c'est aussi le chemin d'un droit à l'effacement RGPD.
 Quelle que soit l'option : **migration versionnée obligatoire** (cf. `EVA-047`), une base
 existante ne changeant pas de contrainte FK par simple `CREATE TABLE IF NOT EXISTS`.
 
-- **Fichiers :** `gateway/database.py`, `gateway-student/database.py`, `gateway/cli.py`, `gateway/admin.py`
+- **Fichiers :** `gateway/database.py`, `gateway/cli.py`, `gateway/admin.py`
 - **Validation :** test « créer user → logger de l'usage → supprimer → 200 et rapports cohérents »
 - **Statut :** ☐ · **Commit :** — · **Date :** —
 
@@ -191,32 +195,19 @@ l'outil connaît les chemins et le build.
 
 ---
 
-### ☐ EVA-006 · Fuite de slot de concurrence dans la gateway étudiante 🔬
+### ~~EVA-006 · Fuite de slot de concurrence dans la gateway étudiante~~
 
-[gateway-student/main.py:150](gateway-student/main.py:150) appelle `concurrency.acquire(user)`
-**avant** de retourner la `StreamingResponse`. La libération est dans le `finally` du générateur
-`stream_response`. Si le client se déconnecte entre le `return` et le premier `__anext__`,
-le générateur n'est jamais démarré — et **le `finally` d'un générateur async non démarré
-ne s'exécute pas**. Vérifié :
+**Abandonné le 2026-07-30 — sans objet.** Le défaut était localisé dans le composant
+`gateway-student`, supprimé du dépôt (DEC-009 dans [codex-analyse.md](codex-analyse.md)).
 
-```
-apres aclose sans demarrage  -> []
-apres demarrage puis aclose  -> ['released']
-```
+Le mécanisme reste documenté ici parce qu'il éclaire `EVA-041` : **le `finally` d'un
+générateur async jamais démarré ne s'exécute pas**, donc toute ressource acquise *avant*
+de retourner une `StreamingResponse` fuit si le client se déconnecte avant le premier
+`__anext__`. La gateway principale s'en protège déjà par le « pin de garde »
+([proxy.py:238-249](gateway/proxy.py:238)) — c'est ce garde-fou qui reste à couvrir par
+un test (`EVA-041`).
 
-**Impact.** Avec `default_concurrent_stream_limit: 1`, un seul événement de ce type bloque
-l'étudiant en 429 **jusqu'au redémarrage du service**. Aucune purge, aucun TTL.
-
-Ce cas exact est déjà traité côté gateway principale par le « pin de garde »
-([proxy.py:238-249](gateway/proxy.py:238)). **L'asymétrie est le vrai problème** : la garde
-n'a pas été portée sur le composant qui en a le plus besoin.
-
-**Correction.** Porter le pattern `call_later` du proxy principal, ou déplacer `acquire()`
-à l'intérieur du générateur avec un timer de garde.
-
-- **Fichiers :** `gateway-student/main.py`, `gateway-student/rate_limiter.py`
-- **Validation :** test « StreamingResponse créée puis `aclose()` sans itération → slot libéré »
-- **Statut :** ☐ · **Commit :** — · **Date :** —
+- **Statut :** ~~abandonné~~ · **Raison :** composant supprimé · **Date :** 2026-07-30
 
 ---
 
@@ -261,9 +252,8 @@ et les quotas produisent `{"detail": {"error": {...}}}`. `openai-python`, LiteLL
 Vercel AI lisent `error.message` au premier niveau → message d'erreur vide ou générique
 exactement sur les deux cas que l'utilisateur rencontre le plus (clé invalide, quota atteint).
 
-À noter : **la gateway étudiante fait déjà les choses correctement** avec un
-`@app.exception_handler(HTTPException)` ([gateway-student/main.py:91](gateway-student/main.py:91)).
-Il suffit de porter ce handler.
+**Correction.** Un `@app.exception_handler(HTTPException)` sur `app` qui ré-émet le corps
+au format OpenAI de premier niveau, plutôt que de laisser FastAPI l'envelopper dans `detail`.
 
 - **Fichiers :** `gateway/main.py`
 - **Validation :** test paramétré sur 401 / 429 RPM / 429 quota → `"error"` au premier niveau
@@ -294,20 +284,20 @@ et ajouter `ESCAPE '\'` avec échappement de `%`/`_`.
 
 | ID | Item | Preuve | Fichier | Statut |
 |---|---|---|---|---|
-| EVA-010 | **3 à 5 connexions SQLite — donc autant de threads OS — par requête.** `aiosqlite.Connection` démarre un `Thread` par `connect()` (`aiosqlite/core.py:90`) et `get_db()` en ouvre une neuve à chaque appel + 4 PRAGMAs. Chemin gateway : `lookup_key` + `touch_key_last_used` + quota + `log_usage`. Chemin student : +2. À 20 req/s, ~100 threads créés/détruits par seconde. Le pool `httpx` a été finement optimisé ; la couche DB n'a pas reçu le même traitement. → connexion persistante par process (uvicorn tourne en `--workers 1`) sous `asyncio.Lock`. | 📖 | `*/database.py` | ☐ |
+| EVA-010 | **3 à 5 connexions SQLite — donc autant de threads OS — par requête.** `aiosqlite.Connection` démarre un `Thread` par `connect()` (`aiosqlite/core.py:90`) et `get_db()` en ouvre une neuve à chaque appel + 4 PRAGMAs. Chemin gateway : `lookup_key` + `touch_key_last_used` + quota + `log_usage`. À 20 req/s, ~100 threads créés/détruits par seconde. Le pool `httpx` a été finement optimisé ; la couche DB n'a pas reçu le même traitement. → connexion persistante par process (uvicorn tourne en `--workers 1`) sous `asyncio.Lock`. | 📖 | `*/database.py` | ☐ |
 | EVA-011 | **Cold start silencieux.** Sur modèle non chargé, `proxy_request` attend jusqu'à 190 s (600 s pour MiniMax) **sans émettre un octet**. Les SDK et proxies coupent avant. C'est exactement le parcours « première requête après installation ». → émettre les headers immédiatement puis `: keepalive\n\n` toutes les 5–10 s en mode `stream`. | 📖 | `gateway/proxy.py` | ☐ |
 | EVA-012 | **Le streaming disparaît dès qu'il y a des `tools`.** [proxy.py:393](gateway/proxy.py:393) bufferise tout le stream avant le premier octet. Motif légitime (SDK Vercel AI refuse `content`+`tool_calls` mêlés) mais déclencheur trop large : s'applique même quand le modèle ne fait aucun tool call, soit la majorité des tours d'agent. → bufferiser jusqu'à la décision seulement, puis passthrough. | 📖 | `gateway/proxy.py` | ☐ |
-| EVA-013 | **HTTP 200 renvoyé avant de connaître le statut upstream.** La `StreamingResponse` part avec 200 ; `status_code` upstream n'est lu qu'ensuite, dans le générateur. Une 4xx/5xx de `llama-server` devient donc un 200 contenant une erreur SSE. → sonder le statut avant de retourner la réponse, ou aligner sur `upstream.stream_chat` du student qui gère déjà `>= 400`. | 📖 | `gateway/proxy.py` | ☐ |
+| EVA-013 | **HTTP 200 renvoyé avant de connaître le statut upstream.** La `StreamingResponse` part avec 200 ; `status_code` upstream n'est lu qu'ensuite, dans le générateur. Une 4xx/5xx de `llama-server` devient donc un 200 contenant une erreur SSE. → sonder le statut upstream **avant** de construire la `StreamingResponse`, et propager l'erreur au format OpenAI. | 📖 | `gateway/proxy.py` | ☐ |
 | EVA-014 | **`verify_integrity()` bloque la boucle événementielle du node-agent.** [node_agent/main.py:181](node_agent/main.py:181) : hash SHA-256 synchrone d'un GGUF de plusieurs centaines de Go, dans un handler `async`, **hors du `model_lock`** — donc l'agent entier gèle (health inclus → nœud marqué offline) et deux chargements concurrents hashent deux fois. → `asyncio.to_thread()` + déplacer sous le lock. | 📖 | `node_agent/main.py` | ☐ |
 | EVA-015 | **`MemoryMax=64G` incompatible avec le plus gros modèle du registre.** `minimax-m2.7` = GGUF ~248 Go avec `cpu_moe: true` (experts FFN en RAM hôte). Les `llama-server` sont enfants du service, donc dans le même cgroup. Nuance technique : les pages mmap *propres* sont réclamables, donc l'OOM-kill n'est pas certain — mais le thrashing NVMe l'est, et le TTFT s'effondre. → dimensionner par profil de modèle et documenter le couple `MemoryMax` × `models.yaml`. | 🧭 | `gateway/deploy/llm-gateway.service` | ☐ |
 | EVA-016 | **`/ready` peut déclarer prêt un système incapable de générer.** La sonde se contente de « un modèle ready **ou** de la VRAM disponible » ([main.py:286](gateway/main.py:286)) : ni existence du GGUF, ni binaire exécutable, ni capacité réelle. Or [update.sh:480](gateway/deploy/update.sh:480) décide du rollback **uniquement** sur `/ready` : une version incapable de servir est acceptée. → readiness structurelle stricte + smoke test séparé (`EVA-036`). | 📖 | `gateway/main.py`, `gateway/deploy/update.sh` | ☐ |
 | EVA-017 | **Compteurs Prometheus qui décroissent.** `eva_requests_total` et `eva_tokens_total` sont déclarés `counter` ([metrics.py:369](gateway/metrics.py:369)) mais alimentés par une fenêtre glissante de 24 h. Un `counter` ne doit jamais décroître : `rate()` et `increase()` produiront des valeurs fausses. → `gauge` avec suffixe `_24h`, ou vrai compteur monotone en mémoire. | 📖 | `gateway/metrics.py` | ☐ |
 | EVA-018 | **Les métriques du parcours utilisateur sont absentes.** Manquent : TTFT, temps d'attente en queue de capacité, temps de chargement modèle, taux de cold start, tokens/s par modèle, taux d'annulation client. Sans elles, aucune affirmation de performance n'est vérifiable — et `EVA-011`/`EVA-012` ne pourront pas être mesurés avant/après. **À faire en premier du lot P1.** | 🧭 | `gateway/metrics.py`, `gateway/proxy.py` | ☐ |
-| EVA-019 | **Dépendances non figées.** Les trois `requirements.txt` n'utilisent que des `>=`, sans lockfile : deux installations à trois mois d'écart n'installent pas les mêmes versions. De plus `gateway-student/requirements.txt` embarque **`pytest>=8.0` en dépendance runtime** — pytest finit installé en production. → `requirements.lock` (`pip-compile`), `requirements-dev.txt` séparé. | 📖 | `*/requirements.txt` | ☐ |
+| EVA-019 | **Dépendances non figées.** Les `requirements.txt` n'utilisent que des `>=`, sans lockfile : deux installations à trois mois d'écart n'installent pas les mêmes versions. Vérifier au passage qu'aucune dépendance de test ne subsiste en runtime. → `requirements.lock` (`pip-compile`), `requirements-dev.txt` séparé. | 📖 | `*/requirements.txt` | ☐ |
 | EVA-020 | **Race sur les quotas.** Vérification avant inférence, écriture après : N requêtes concurrentes passent toutes le contrôle et dépassent le quota d'autant. Impact borné en usage universitaire, réel en usage automatisé. → réservation atomique, ou acceptation documentée du dépassement borné. | 📖 | `gateway/rate_limiter.py` | ☐ |
 | EVA-021 | **Data-plane cluster en HTTP clair.** Le plan de contrôle orchestrateur→agent est en HTTPS + Bearer, mais le trafic **contenant les prompts** orchestrateur→`llama-server` est en `http://` ([node_client.py:168](gateway/cluster/node_client.py:168)). La confidentialité repose entièrement sur l'isolation du LAN — à documenter explicitement comme prérequis, ou tunneliser (WireGuard / mTLS). | 📖 | `gateway/cluster/`, `docs/architecture.md` | ☐ |
 | EVA-022 | **`/completion` documenté mais inaccessible.** La route existe ([main.py:422](gateway/main.py:422)) et est documentée, mais `nginx.conf` termine par `location / { return 404; }` et ne route que `/v1/`, `/health`, `/admin/`. → ajouter la route à nginx **ou** retirer l'alias non-`/v1` de la doc. | 📖 | `gateway/deploy/nginx.conf`, `docs/api.md` | ☐ |
-| EVA-023 | **Rotation d'audit étudiante par taille, pas par durée.** `RotatingFileHandler(maxBytes=100 Mo, backupCount=90)` ([gateway-student/main.py:45](gateway-student/main.py:45)) = 9 Go de plafond, pas 90 jours. Selon le trafic, la rétention réelle peut être de quelques jours. → `TimedRotatingFileHandler(when="midnight", backupCount=90)`. | 📖 | `gateway-student/main.py` | ☐ |
+| ~~EVA-023~~ | ~~**Rotation d'audit étudiante par taille, pas par durée.**~~ Abandonné le 2026-07-30 : composant `gateway-student` supprimé (DEC-009). Le principe reste valable si un journal d'audit à rétention temporelle est réintroduit ailleurs — `RotatingFileHandler(maxBytes=…)` borne un volume, pas une durée ; il faut `TimedRotatingFileHandler`. | — | — | ~~abandonné~~ |
 | EVA-024 | **Rate-limiting nginx par IP derrière NAT campus.** `limit_req 60r/m` et `limit_conn 4` sur `$binary_remote_addr` : tous les utilisateurs derrière le NAT partagent une IP, donc le 5ᵉ stream simultané **de toute l'université** prend un 429. → clé sur un identifiant applicatif, ou exempter les plages campus (le rate limiting applicatif par utilisateur reste en place). | 🧭 | `gateway/deploy/nginx.conf` | ☐ |
 
 ---
@@ -515,13 +505,13 @@ C'est ce qui transforme « le service répond » en « le service **sert** ».
 | ID | Item | Détail | Statut |
 |---|---|---|---|
 | EVA-040 | **Tests du CLI** | `cli.py` : **0 % de couverture** (218 statements). C'est l'outil d'administration principal en production, jamais exécuté par un test. Typer fournit `CliRunner` — coût faible, gain immédiat. | ☐ |
-| EVA-041 | **Test du pin de garde streaming** | Le mécanisme le plus subtil du proxy (`EVA-006` en est le pendant manquant côté student) n'est couvert par aucun test. `proxy.py` : 56 %, lignes 214-268 non couvertes. | ☐ |
+| EVA-041 | **Test du pin de garde streaming** | Le mécanisme le plus subtil du proxy (cf. `EVA-006` pour le détail du piège qu'il neutralise) n'est couvert par aucun test. `proxy.py` : 56 %, lignes 214-268 non couvertes. | ☐ |
 | EVA-042 | **Seuil de couverture en CI** | La CI ne mesure pas la couverture : elle ne peut donc que dériver. Ajouter `--cov --cov-fail-under=70`, à relever progressivement. | ☐ |
 | EVA-043 | **`pip-audit` bloquant** | Actuellement `continue-on-error: true` ([ci.yml:106](.github/workflows/ci.yml:106)) : les CVE sont affichées mais n'arrêtent rien. Rendre bloquant avec un fichier d'exceptions daté et justifié. | ☐ |
 | EVA-044 | **Élargir `ruff`** | Aujourd'hui `E` + `F` seulement, avec des `per-file-ignores` sur des `F401` préexistants. Ajouter `I` (imports), `B` (bugbear), `UP`, et **nettoyer** les imports morts plutôt que les ignorer. | ☐ |
-| EVA-045 | **`cleanup_stale()` jamais appelé** | [rate_limiter.py:62](gateway/rate_limiter.py:62) : code écrit pour éviter une fuite mémoire, jamais branché. Même schéma côté student (`defaultdict` de locks sans purge). Croissance bornée par le nombre d'utilisateurs, donc bénin — mais c'est une intention non tenue. Brancher ou supprimer. | ☐ |
+| EVA-045 | **`cleanup_stale()` jamais appelé** | [rate_limiter.py:62](gateway/rate_limiter.py:62) : code écrit pour éviter une fuite mémoire, jamais branché. Croissance bornée par le nombre d'utilisateurs, donc bénin — mais c'est une intention non tenue. Brancher ou supprimer. | ☐ |
 | EVA-046 | **Tests E2E avec un vrai `llama-server`** | Les 433 tests tournent en < 3 s : ils sont excellents mais **exclusivement unitaires**. Manquent : un vrai binaire avec un GGUF minuscule, un parcours nginx→gateway→llama, un cluster gateway→agent→llama, les coupures réseau réelles. À faire tourner sur un runner GPU dédié, hors CI principale. | ☐ |
-| EVA-047 | **Migrations SQLite versionnées** | Le schéma est créé par `CREATE TABLE IF NOT EXISTS` : **aucun changement de contrainte n'atteint une base existante**. Bloquant pour `EVA-002`. Le student a un embryon de mécanisme (`_MIGRATIONS`, [gateway-student/database.py:65](gateway-student/database.py:65)) — le généraliser avec `PRAGMA user_version`. | ☐ |
+| EVA-047 | **Migrations SQLite versionnées** | Le schéma est créé par `CREATE TABLE IF NOT EXISTS` : **aucun changement de contrainte n'atteint une base existante**. Bloquant pour `EVA-002`. → moteur de migrations versionné par `PRAGMA user_version`, transactionnel, avec sauvegarde préalable. | ☐ |
 
 ---
 
@@ -645,8 +635,6 @@ des choses qu'il n'a pas vérifiées est plus dangereux qu'un audit incomplet.
 - **Le cold start silencieux** (`EVA-011`) — il note bien l'absence de benchmark, mais pas le
   fait que la première requête reste 190 s sans émettre un octet. C'est pourtant le défaut
   n°1 du parcours « premier token » qu'il évalue.
-- **La fuite de slot de concurrence étudiante** (`EVA-006`) — un blocage définitif jusqu'au
-  redémarrage, non détecté.
 - **`revoke_key` et les jokers `LIKE`** (`EVA-009`).
 
 ### Sur sa notation

@@ -2,7 +2,7 @@
 
 > Document de pilotage vivant
 > Créé le 30 juillet 2026
-> Périmètre : `gateway`, `gateway-student`, `node_agent`, déploiement et exploitation
+> Périmètre : `gateway`, `node_agent`, déploiement et exploitation
 > État initial : audit en lecture seule, 433 tests réussis, aucun test réel GPU/GGUF
 
 ---
@@ -29,15 +29,19 @@
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **632** 🔬 |
-| `gateway-student` | `cd gateway-student && .venv/bin/python -m pytest tests -q` | 79 | **138** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **633** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **45** 🔬 |
-| **Total** | — | **433** | **815** 🔬 |
+| **Total** | — | **354** | **678** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+382 tests** ajoutés par le jalon M0, tous des régressions rouges avant
+**+324 tests** ajoutés par le jalon M0, tous des régressions rouges avant
 correctif et vertes après. Les scripts de déploiement passent `bash -n`.
+
+> **Retrait du composant `gateway-student` (DEC-009, 30 juillet 2026).** Les
+> totaux ci-dessus perdent mécaniquement les 79 tests de référence et 138 tests
+> courants de ce composant. Le journal §0.7 conserve les chiffres tels qu'ils
+> étaient au moment de chaque livraison.
 `shellcheck` et `ruff` ne sont installés dans aucun environnement du dépôt : ce
 sont des lacunes d'outillage, à traiter avec EVA-044.
 
@@ -91,6 +95,7 @@ tests de régression, qui doivent échouer avant le correctif et passer après.
 | ID | Décision | Retenu le |
 |---|---|---|
 | DEC-001 | **Anonymisation** pour la suppression d'utilisateur : la ligne `users` est conservée, les données personnelles sont effacées, `is_active = 0`, les clés sont révoquées. L'historique d'usage agrégé reste exploitable, la personne n'est plus ré-identifiable. Écarté : `ON DELETE CASCADE` (perte de traçabilité de facturation) et `SET NULL` (casse les jointures des rapports). | 2026-07-30 |
+| DEC-009 | **Suppression du composant `gateway-student`** : jamais déployé, aucun consommateur. Code, tests, documentation, unités systemd/nginx/nftables et job CI retirés du dépôt. Vérifié sans effet fonctionnel — ni `gateway` ni `node_agent` n'en dépendaient (aucun import, aucune clé `llmstu-*`, aucune route ni base partagée). Les items de backlog exclusivement student (**COR-011**, **OPS-005**, **OPS-007**) sont annulés, ainsi que **EVA-006** et **EVA-023** côté `claude-analyse-projet.md`. Écarté : garder le composant en l'état (surface de maintenance, CI et audit de dépendances pour du code mort). | 2026-07-30 |
 
 Les décisions DEC-002 à DEC-008 restent `[!]` : elles ne bloquent pas le jalon
 M0 et seront tranchées à l'entrée des lots concernés.
@@ -105,8 +110,8 @@ M0 et seront tranchées à l'entrée des lots concernés.
   `CREATE TABLE IF NOT EXISTS` n'atteint jamais une base existante (OPS-006).
 - **Documentation dans le même commit** que le changement de comportement (§14).
 - Les deux suites de tests ne sont **jamais** lancées dans le même processus
-  pytest : `gateway` et `gateway-student` partagent des noms de modules de
-  premier niveau (`config`, `database`, `auth`, `schemas`).
+  pytest : `gateway` et `node_agent` partagent des noms de modules de
+  premier niveau (`config`, `main`).
 
 ### 0.7 Journal des livraisons
 
@@ -163,7 +168,7 @@ n'avaient relevés. Ils sont corrigés dans le commit de l'item qui les a trouv�
 | Les tests `/ready` existants passaient alors que **ni le binaire `llama-server` ni les GGUF n'existaient** dans l'environnement de test : ils n'exerçaient que le contrat de capacité. La permissivité de la sonde était donc verrouillée par les tests. | COR-005 | Tests adossés à un environnement structurellement sain 🔬 |
 | `_split_statements()` du moteur de migration découpait sur `;` **avant** de retirer les commentaires : un point-virgule de ponctuation dans un commentaire français tronquait silencieusement l'instruction `CREATE TABLE` qui l'entourait. | COR-002, sur le code livré par OPS-006 | Commentaires retirés avant découpage, dans les deux composants 🔬 |
 | Les journaux conservaient une copie du nom d'utilisateur, ce qui **vide de son effet** l'anonymisation RGPD : le middleware d'accès journalisait `request.url.path` (donc `/admin/users/<username>`), et `admin.create_key` journalisait le nom en clair. Deux fuites distinctes — la seconde a été trouvée par le test écrit pour la première. | COR-002, puis le test de SEC-008 | Nouvel item **SEC-008**, corrigé 🔬 |
-| **Trois réglages de liste étaient inutilisables tels que documentés** : pydantic-settings décode un champ `list[str]` comme du JSON dans la source d'environnement, avant tout validateur. `ALLOWED_MODEL_DIRS` échouait au format CSV documenté **et** à la valeur vide livrée dans `.env.example` — copier ce fichier vers `/etc/llm-gateway/env` produisait un service mort. Le validateur `split_cors_origins` de `CORS_ALLOW_ORIGINS` ne s'exécutait jamais. Côté student, `deploy/env.example` livre `ALLOWED_MODELS` en CSV et il n'y a pas d'installateur : le déploiement documenté ne démarrait pas. Reproduit sur les deux sources, dont celle de la production. | AUT-012, reproduit puis élargi au student | Nouvel item **COR-014**, corrigé 🔬 |
+| **Trois réglages de liste étaient inutilisables tels que documentés** : pydantic-settings décode un champ `list[str]` comme du JSON dans la source d'environnement, avant tout validateur. `ALLOWED_MODEL_DIRS` échouait au format CSV documenté **et** à la valeur vide livrée dans `.env.example` — copier ce fichier vers `/etc/llm-gateway/env` produisait un service mort. Le validateur `split_cors_origins` de `CORS_ALLOW_ORIGINS` ne s'exécutait jamais. Reproduit sur les deux sources, dont celle de la production. | AUT-012, reproduit puis élargi | Nouvel item **COR-014**, corrigé 🔬 |
 
 Conséquence de la dernière ligne pour SEC-002 : l'allowlist `ALLOWED_MODEL_DIRS`
 n'était pas seulement absente de l'environnement généré — elle était
@@ -235,9 +240,8 @@ EVARuntime est adapté à un staging contrôlé, mais pas encore à une producti
 sans surveillance.
 
 Les choix fondamentaux sont bons : FastAPI, SQLite WAL, processus
-`llama-server` possédés par la gateway, séparation de la gateway étudiante,
-registre de modèles, queue de capacité, pin/unpin, orchestration cluster légère,
-systemd et nginx.
+`llama-server` possédés par la gateway, registre de modèles, queue de capacité,
+pin/unpin, orchestration cluster légère, systemd et nginx.
 
 La priorité n'est pas une réécriture. Elle est de fermer les écarts entre les
 invariants annoncés, les tests simulés et le comportement réellement déployé.
@@ -247,9 +251,8 @@ invariants annoncés, les tests simulés et le comportement réellement déploy�
 | Contrôle | Résultat initial |
 |---|---|
 | Tests gateway | 309 réussis |
-| Tests gateway-student | 79 réussis |
 | Tests node_agent | 45 réussis |
-| Total | 433 réussis |
+| Total | 354 réussis |
 | Scripts de déploiement | Syntaxe valide |
 | Parcours install/update simulé | Local et cluster validés |
 | Dépendances installées | `pip check` réussi |
@@ -277,11 +280,10 @@ un audit de readiness de production complet**.
 | Assets externes dans le dashboard admin | Confirmé. Chart.js et Google Fonts sont chargés depuis des CDN, tandis que le secret admin est accessible au JavaScript de la page. Le risque supply-chain et le problème air-gap sont réels. |
 | Timeout nginx de 30 s sur le chargement admin | Confirmé. Les gros modèles peuvent charger pendant plusieurs minutes. Dire que cela échoue pour « tout modèle réel » est trop absolu, mais le défaut est certain pour les modèles lents. |
 | Variables de durcissement absentes de l'environnement généré | Confirmé pour `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `LLAMA_SERVER_MIN_BUILD`. Le niveau de risque de CORS doit néanmoins être nuancé : CORS n'est pas une frontière de sécurité serveur. |
-| Fuite possible de concurrence student avant démarrage du générateur | Confirmé comme scénario crédible. `acquire()` précède la création effective du stream et aucun TTL ne récupère un slot abandonné. Ajouter un test de régression. |
 | Multiplication des connexions `aiosqlite` | Confirmé dans le chemin chaud. Le coût exact annoncé en millisecondes n'est toutefois pas mesuré. Une connexion unique sérialisée pourrait devenir un autre goulot ; comparer connexion persistante, writer dédié et petit pool. |
 | Buffering intégral en présence de `tools` | Confirmé. Le TTFT devient proche du temps de génération complet. |
 | Silence pendant un cold start | Confirmé. La gateway ne retourne pas la `StreamingResponse` avant la fin de `ensure_model_loaded()`. |
-| Dépendances non verrouillées | Confirmé. Les installations ne sont pas reproductibles et `pytest` est dans les dépendances runtime de la gateway étudiante. |
+| Dépendances non verrouillées | Confirmé. Les installations ne sont pas reproductibles : aucun `requirements.lock`, uniquement des contraintes `>=`. |
 | Wildcards SQL dans `revoke_key()` | Confirmé techniquement. `%` et `_` ne sont pas échappés. C'est surtout un risque de mauvaise opération par un administrateur déjà privilégié, pas une élévation de privilèges distante. |
 | Faible couverture de certains chemins difficiles | Crédible et cohérent avec les tests présents. Les pourcentages exacts du rapport ne sont pas reproductibles actuellement car la CI ne publie pas de rapport de couverture et `coverage` n'est pas installé dans l'environnement audité. |
 | Qualité des invariants, du scheduler et du client cluster | Confirmé. Ces parties sont parmi les meilleures du projet. |
@@ -1057,7 +1059,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
 | COR-009 | `[ ]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. |
 | COR-010 | `[ ]` | P1 | Corriger `revoke_key()` | `%` et `_` sont littéraux ou rejetés ; seconde révocation a un comportement défini. |
-| COR-011 | `[ ]` | P1 | Corriger le slot student abandonné | Un générateur jamais démarré ne bloque jamais durablement l'utilisateur. |
+| COR-011 | `[–]` | — | ~~Corriger le slot student abandonné~~ | Annulé : composant supprimé (DEC-009). |
 | COR-012 | `[ ]` | P1 | Définir une réservation de quota | Les requêtes concurrentes ne dépassent pas silencieusement le budget, ou le dépassement maximal accepté est borné et documenté. |
 | COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. |
 | COR-014 | `[x]` | P0 | Rendre chargeables les réglages de liste de l'environnement | `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `ALLOWED_MODELS` acceptent la syntaxe documentée sans faire échouer le démarrage ; les fichiers d'exemple livrés sont chargeables. **Item ajouté le 2026-07-30**, découvert par AUT-012 : ces trois réglages étaient inutilisables tels que documentés. |
@@ -1119,9 +1121,9 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-002 | `[ ]` | P1 | Sauvegarde hors hôte et restore drill | Restauration chronométrée et documentée. |
 | OPS-003 | `[ ]` | P1 | Releases immuables | Déploiement d'un tag/artefact, pas d'une branche mouvante. |
 | OPS-004 | `[ ]` | P1 | Corrélation des requêtes | Même request ID dans gateway, agent et backend. |
-| OPS-005 | `[ ]` | P1 | Automatiser la gateway étudiante | Install/update/backup/retention avec placeholders interdits. |
+| OPS-005 | `[–]` | — | ~~Automatiser la gateway étudiante~~ | Annulé : composant supprimé (DEC-009). |
 | OPS-006 | `[x]` | P0 | Versionner les migrations SQLite | `PRAGMA user_version` ou équivalent, migration transactionnelle, sauvegarde préalable et test depuis chaque version supportée. |
-| OPS-007 | `[ ]` | P1 | Définir la rétention d'audit student | Rétention temporelle vérifiable, rotation et espace disque cohérents avec la politique. |
+| OPS-007 | `[–]` | — | ~~Définir la rétention d'audit student~~ | Annulé : composant supprimé (DEC-009). |
 
 ## 13. Jalons
 

@@ -71,7 +71,6 @@ gateway/cluster/         Multi-node scheduling and remote node client
 gateway/deploy/          systemd, nginx and install scripts
 gateway/static/          Admin dashboard
 gateway/tests/           Gateway test suite
-gateway-student/         Restricted student-facing edge gateway
 node_agent/              Lightweight remote GPU node agent
 docs/                    Architecture, API, admin and deployment guides
 ```
