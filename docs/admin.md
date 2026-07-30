@@ -641,6 +641,84 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
 # → ~200  (MiB)
 ```
 
+### Déchargement et requêtes actives (409)
+
+**Invariant : un modèle qui traite une requête active n'est jamais déchargé en
+silence.** Cela vaut pour l'éviction LRU, pour l'arrêt de la gateway, et depuis
+COR-004 pour *toutes* les opérations admin qui déchargent un modèle :
+
+| Route | Décharge le modèle |
+|-------|--------------------|
+| `POST /admin/models/{id}/unload` | toujours |
+| `DELETE /admin/models/{id}` | avant la suppression du registre |
+| `PATCH /admin/models/{id}` avec `enabled: false` | oui |
+| `PATCH /admin/models/{id}` avec `llama_params` | oui (hot-reload) |
+| `POST /admin/unload` | tous les modèles chargés |
+
+Déroulé d'une de ces opérations :
+
+1. **Quarantaine** — le modèle n'admet plus aucune *nouvelle* requête (les
+   clients reçoivent un `503` temporaire, « déchargement administratif en
+   cours »). Sans cela, un flux continu de requêtes empêcherait le drain de
+   converger.
+2. **Drain borné** — la gateway attend la fin des requêtes déjà en cours, au
+   maximum `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS` (défaut **5 s**). Retour immédiat
+   si le modèle est inactif : le cas courant ne coûte rien.
+3. **Décision** :
+   - drain terminé → déchargement normal, `200` ;
+   - requêtes encore actives → **`409 Conflict`**, *rien n'est modifié* : le
+     modèle reste chargé, le registre reste intact (jamais de `enabled: false`
+     persisté sur un modèle qui continue de servir), la quarantaine est levée et
+     le modèle redevient immédiatement utilisable.
+
+```bash
+# Modèle occupé par un stream en cours
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "$GW/admin/models/llama-3.3-70b-instruct/unload" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# → 409
+# corps : {"detail": "Le modèle 'llama-3.3-70b-instruct' traite encore 2 requête(s)
+#           active(s) après 5s de drain — déchargement refusé pour ne pas
+#           interrompre les générations en cours. Réessayez plus tard, ou passez
+#           force=true pour interrompre explicitement les requêtes actives."}
+```
+
+Un `503` sur ces routes garde son sens habituel : échec technique du
+déchargement (en cluster, un agent qui n'a pas confirmé), pas un conflit.
+
+#### Forcer (`?force=true`)
+
+Le forçage est **opt-in, jamais la valeur par défaut**. Il existe pour les cas où
+une requête ne se termine jamais (client disparu, `llama-server` bloqué) et où le
+modèle serait sinon indéchargeable :
+
+```bash
+# Interrompt les générations en cours — à n'utiliser qu'en connaissance de cause
+curl -s -X POST "$GW/admin/models/llama-3.3-70b-instruct/unload?force=true" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+```
+
+`force=true` est accepté par `POST /admin/models/{id}/unload`,
+`DELETE /admin/models/{id}` et `PATCH /admin/models/{id}`. Sur un modèle inactif
+il n'a aucun effet ; chaque forçage **effectif** (requêtes réellement
+interrompues) est tracé par un log `CRITICAL` indiquant leur nombre. Il n'existe
+**pas** de forçage global sur `POST /admin/unload` : décharger modèle par modèle.
+
+En **mode cluster**, le forçage n'existe pas : les node-agents refusent tout
+modèle avec des requêtes actives, et l'orchestrateur ne tue pas un
+`llama-server` qu'il ne possède pas. Sur un modèle occupé, `?force=true` y
+répond donc `409` en précisant que le forçage est indisponible — le paramètre
+n'est jamais ignoré en silence. Sur un modèle inactif, il n'a aucun effet et le
+déchargement réussit normalement.
+
+Réglages associés (`gateway/.env`) :
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS` | `5` | Attente max des requêtes actives sur une opération admin. `0` = refus immédiat si occupé. |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `25` | Attente max au SIGTERM. Le shutdown, lui, **force** après ce délai (la VRAM et les ports doivent être libérés avant que systemd ne tue le processus). |
+| `SHUTDOWN_DRAIN_POLL_SECONDS` | `0.2` | Granularité de poll des deux drains. |
+
 ### Décharger tous les modèles
 
 ```bash
@@ -650,16 +728,24 @@ curl -s -X POST "$GW/admin/unload" \
 # → {"message": "Tous les modèles déchargés. VRAM entièrement libérée."}
 ```
 
+Cette route répond `409` si une génération est encore active après le drain — et
+dans ce cas **aucun** modèle n'est déchargé (pas de purge partielle). Elle répond
+`503` si le déchargement n'a pas pu être confirmé.
+
 En cluster, l'orchestrateur conserve ses clients et son heartbeat après cette
-action : il peut recharger un modèle à la requête suivante. La route répond 409
-si une génération est encore active, ou 503 si un agent n'a pas confirmé le
-déchargement; elle n'annonce jamais une libération partielle comme réussie.
+action : il peut recharger un modèle à la requête suivante. Il n'annonce jamais
+une libération partielle comme réussie.
 
 ### Activer / désactiver un modèle du registre
 
 Désactiver un modèle le rend **invisible aux clients** (`GET /v1/models` ne le liste plus)
 et les requêtes vers cet ID reçoivent un `403`. Si le modèle est actuellement chargé,
 il est automatiquement déchargé.
+
+> Le PATCH répond `409` et **ne modifie pas le registre** si le modèle traite
+> encore des requêtes après le drain — le modèle reste `enabled: true` et
+> continue de servir. Voir
+> [Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
 
 ```bash
 # Désactiver le modèle 8B (ex: fichier .gguf absent)
@@ -680,9 +766,14 @@ curl -s -X PATCH "$GW/admin/models/llama-3.1-8b-instruct" \
 Il est possible de modifier **à chaud** les paramètres de lancement d'un modèle
 (`ctx_size`, `parallel`, `cpu_moe`, etc.) sans redémarrer le gateway.
 
-Le PATCH déclenche un **hot-reload** : le modèle est déchargé immédiatement
-(sa VRAM est libérée), le registre est mis à jour, et le prochain appel relancera
+Le PATCH déclenche un **hot-reload** : le modèle est déchargé (sa VRAM est
+libérée), le registre est mis à jour, et le prochain appel relancera
 llama-server avec les nouveaux paramètres.
+
+> Comme tout déchargement admin, le hot-reload attend la fin des requêtes en
+> cours puis répond `409` sans rien modifier si elles n'ont pas terminé. Les
+> anciens paramètres restent alors en vigueur. Voir
+> [Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
 
 > **`llama_params` utilise une sémantique de remplacement complet.** Tous les champs
 > doivent être fournis — il n'y a pas de merge partiel. Récupérez les valeurs actuelles
@@ -875,6 +966,12 @@ curl -s -X DELETE "$GW/admin/models/qwen2.5-32b-instruct" \
 # → {"message": "Modèle 'qwen2.5-32b-instruct' supprimé du registre."}
 ```
 
+`DELETE` décharge lui-même le modèle si nécessaire : l'étape `unload` ci-dessus
+n'est qu'une commodité. En revanche, si le modèle traite encore des requêtes, le
+`DELETE` répond `409` et **l'entrée reste dans le registre** — jamais de
+suppression partielle. Voir
+[Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
+
 ### Redémarrer le service
 
 ```bash
@@ -923,10 +1020,14 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 |---------|-------|-------------|
 | `GET` | `/admin/models` | Lister tous les modèles (registre + état live) |
 | `POST` | `/admin/models` | Enregistrer un nouveau modèle (persiste dans models.yaml) |
-| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle — `enabled`, `vram_gb`, `description`, `llama_params` (hot-reload) |
-| `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (seulement si non chargé) |
+| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle — `enabled`, `vram_gb`, `description`, `llama_params` (hot-reload) — `?force=true` optionnel |
+| `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (déchargé au préalable) — `?force=true` optionnel |
 | `POST` | `/admin/models/{model_id}/load` | Pré-charger un modèle en VRAM |
-| `POST` | `/admin/models/{model_id}/unload` | Décharger un modèle spécifique |
+| `POST` | `/admin/models/{model_id}/unload` | Décharger un modèle spécifique — `?force=true` optionnel |
+
+Les routes marquées `?force=true` déchargent le modèle : elles répondent `409` si
+une génération est encore en cours. Voir
+[Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
 
 **Exemple — lister les modèles avec état live :**
 
@@ -960,7 +1061,7 @@ curl -s "$GW/admin/models" \
 | Méthode | Route | Description |
 |---------|-------|-------------|
 | `GET` | `/admin/status` | Budget VRAM + état de tous les modèles |
-| `POST` | `/admin/unload` | Décharger tous les modèles chargés |
+| `POST` | `/admin/unload` | Décharger tous les modèles chargés (`409` si une génération est active) |
 
 ### Endpoints d'inférence exposés aux utilisateurs
 

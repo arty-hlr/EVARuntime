@@ -77,7 +77,16 @@ class Settings(BaseSettings):
     # pinnés se libèrent avant de forcer le déchargement. 0 = pas d'attente.
     shutdown_drain_timeout_seconds: float = 25.0
     # Intervalle de poll pendant le drain (court pour réactivité).
+    # Utilisé aussi par le drain des opérations admin de déchargement.
     shutdown_drain_poll_seconds: float = 0.2
+    # Drain des requêtes actives sur une opération ADMIN de déchargement
+    # (POST /admin/models/{id}/unload, DELETE /admin/models/{id},
+    #  PATCH enabled:false ou llama_params, POST /admin/unload).
+    # Volontairement beaucoup plus court que le drain de shutdown : une route
+    # admin ne doit jamais bloquer longtemps. Si des requêtes sont encore actives
+    # à l'expiration, l'opération est refusée en 409 (jamais un stream tué en
+    # silence) — sauf force=true explicite. 0 = refus immédiat si occupé.
+    admin_unload_drain_timeout_seconds: float = 5.0
 
     # Réconciliation VRAM avec nvidia-smi (détection de dérive, NON FATAL).
     # 0 = désactivé. Intervalle entre deux sondes nvidia-smi.
@@ -244,6 +253,7 @@ class Settings(BaseSettings):
     @field_validator(
         "shutdown_drain_timeout_seconds",
         "shutdown_drain_poll_seconds",
+        "admin_unload_drain_timeout_seconds",
         "vram_reconcile_interval_seconds",
         "vram_reconcile_probe_timeout_seconds",
         "vram_reconcile_drift_threshold",
