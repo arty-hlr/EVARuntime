@@ -1381,6 +1381,70 @@ continuer maintient la capacité si le cluster possède au moins un autre nœud
 capable d'héberger les modèles. L'orchestrateur ne fait aucune mise à jour SSH
 ou distante implicite.
 
+#### Stratégie de venv du node-agent
+
+`update-agent.sh` applique la même stratégie que `update.sh` : le venv neuf est
+construit **à son emplacement définitif**
+(`/opt/llm-gateway/venv-agent-release-<horodatage>-<pid>`), puis le symlink
+`/opt/llm-gateway/venv-agent` — le chemin figé dans l'unité systemd — est
+basculé d'une release à l'autre. Aucun venv n'est jamais déplacé.
+
+Un venv **n'est pas relogeable** : les scripts console de `bin/` portent un
+shebang absolu vers `<venv>/bin/python`. La version précédente construisait le
+venv dans un staging `mktemp` puis le déplaçait, ce qui laissait `bin/uvicorn`
+pointer vers un staging root-only puis supprimé : `203/EXEC Permission denied`,
+cinq health-checks en échec et rollback systématique — aucune mise à jour de
+node-agent ne pouvait aboutir. `ExecStartPre` passait, lui, car `bin/python` est
+un lien vers l'interpréteur système : le symptôme désignait le mauvais coupable.
+
+Conséquences pratiques :
+
+- **Agent installé avant ce correctif** : la première mise à jour migre le venv
+  en place. Le venv réel est écarté une seule fois vers
+  `venv-agent-pre-update-<horodatage>` et le symlink est créé. Aucune action
+  opérateur, et les mises à jour suivantes ne repassent plus par ce cas.
+- **Rollback** : le symlink est rebasculé vers la release précédente, restée
+  intacte à son emplacement. Un rollback ne déplace donc aucun venv non plus.
+- **Retour arrière manuel** possible tant que la release est conservée :
+
+```bash
+ls -d /opt/llm-gateway/venv-agent-release-*
+sudo ln -sfn /opt/llm-gateway/venv-agent-release-<…> /opt/llm-gateway/venv-agent
+sudo systemctl restart llm-gateway-agent
+```
+
+- **Rétention** : les releases précédentes (~200 Mo) ne sont pas purgées
+  automatiquement. Les supprimer à la main quand l'espace disque le justifie,
+  en conservant celle vers laquelle pointe `venv-agent`.
+- L'unité conserve `ExecStart=…/venv-agent/bin/python -m uvicorn` : défense en
+  profondeur validée en production, insensible par construction au shebang.
+
+#### Start-limit systemd et codes de sortie de `update-agent.sh`
+
+Après plusieurs redémarrages rapprochés, systemd refuse de démarrer une unité
+(« Start request repeated too quickly ») et la laisse en `failed`. Un rollback
+qui se contente de `systemctl start` laisse alors le **nœud à terre**. Chaque
+`systemctl start` des scripts de déploiement node-agent est donc précédé d'un
+`systemctl reset-failed` — no-op sur une unité saine, donc sans risque —, y
+compris dans le chemin de rollback et après une réinstallation.
+
+Codes de sortie de `update-agent.sh` :
+
+| Code | Signification | Action |
+|------|---------------|--------|
+| `0` | Mise à jour déployée et health-check passé | aucune |
+| `1` | Échec : version précédente restaurée, agent **en service** | investiguer avant de réessayer |
+| `9` | **INDISPONIBILITÉ** : rollback effectué mais l'agent ne redémarre pas | intervention immédiate |
+
+Un `9` n'est jamais un simple avertissement : le nœud ne sert plus aucune
+requête et l'orchestrateur le passera `offline` après ~30 s.
+
+```bash
+sudo systemctl reset-failed llm-gateway-agent
+sudo systemctl start llm-gateway-agent
+sudo journalctl -u llm-gateway-agent -n 100 --no-pager
+```
+
 ### Migration explicite local ↔ cluster
 
 Une migration n'est jamais déduite d'un simple rerun. Elle exige `--mode` et

@@ -138,7 +138,11 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
 "$VENV_DIR/bin/python" -m pip install --quiet -r "$INSTALL_DIR/node_agent/requirements.txt"
-chown -R root:root "$VENV_DIR"
+# Après une mise à jour, $VENV_DIR est un symlink vers une release (COR-016) :
+# `chown -R` sur un symlink ne le traverse pas, on vise donc le venv réel.
+VENV_REAL="$(readlink -f "$VENV_DIR")"
+chown -h root:root "$VENV_DIR"
+chown -R root:root "$VENV_REAL"
 
 if [[ ! -f "$TLS_DIR/agent.crt" || ! -f "$TLS_DIR/agent.key" ]]; then
     PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -267,6 +271,11 @@ install -m 0644 -o root -g root \
 
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
+# COR-017 : une réinstallation par-dessus une unité en échec doit repartir d'un
+# compteur de démarrages vierge, sinon le `systemctl start` final (étape 3
+# ci-dessous) se heurte au start-limit : « Start request repeated too quickly ».
+# No-op sur une unité saine ou jamais démarrée.
+systemctl reset-failed "$SERVICE" 2>/dev/null || true
 
 if [[ -n "$ORCHESTRATOR_CIDR" ]]; then
     if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
