@@ -1,12 +1,28 @@
+"""
+Couche base de données de la gateway étudiante — SQLite WAL, clés stockées en
+hash SHA-256 uniquement.
+
+Le schéma est versionné par `PRAGMA user_version` et amené à niveau par le
+moteur de migration de ce module (section « Migrations versionnées ») : voir
+`docs/architecture.md` pour la procédure d'ajout d'une migration et le
+comportement opérateur en cas d'échec.
+
+Ce moteur est volontairement dupliqué depuis `gateway/database.py` : les deux
+composants sont des frontières de sécurité indépendantes et ne partagent aucun
+code. Toute évolution du mécanisme doit être reportée des deux côtés.
+"""
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import secrets
-import sqlite3
+import stat
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import AsyncGenerator
+from pathlib import Path
+from typing import AsyncGenerator, Awaitable, Callable, Sequence
 
 import aiosqlite
 
@@ -61,12 +77,6 @@ CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_log(user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 """
 
-# Migrations appliquées après la création du schema initial.
-_MIGRATIONS = [
-    "ALTER TABLE users ADD COLUMN hourly_token_limit INTEGER NOT NULL DEFAULT 0",
-]
-
-
 # PRAGMAs de robustesse appliqués à CHAQUE connexion (pas seulement à l'init) :
 # - busy_timeout : attend au lieu d'échouer immédiatement en « database is locked ».
 # - wal_autocheckpoint / journal_size_limit : bornent la croissance du WAL.
@@ -93,23 +103,352 @@ async def get_db() -> AsyncGenerator[aiosqlite.Connection, None]:
         yield db
 
 
-async def init_db() -> None:
-    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(settings.db_path) as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        await db.execute("PRAGMA synchronous = NORMAL")
+# ---------------------------------------------------------------------------
+# Migrations versionnées (OPS-006)
+# ---------------------------------------------------------------------------
+#
+# Un `CREATE TABLE IF NOT EXISTS` n'atteint JAMAIS une base déjà créée : tout
+# changement de contrainte (clé étrangère, NOT NULL, UNIQUE…) exige une
+# migration explicite. Le versionnement repose sur `PRAGMA user_version` :
+#
+#   user_version = 0  → base neuve, ou base déployée avant ce mécanisme ;
+#   user_version = N  → les migrations 1..N ont été appliquées.
+#
+# Invariants du moteur :
+#   - une migration s'applique entièrement ou pas du tout, et `user_version`
+#     n'avance qu'avec elle (même transaction) ;
+#   - une sauvegarde est prise avant la première migration réellement
+#     applicable, jamais si la base est déjà à jour ;
+#   - une base plus récente que le code est refusée (rollback applicatif) au
+#     lieu d'être « migrée » à l'aveugle ;
+#   - toute erreur remonte : fail-closed, le service ne démarre pas sur une
+#     base à moitié migrée.
+
+# PRAGMAs persistants, positionnés à l'initialisation de la base.
+_PRAGMAS = (
+    "PRAGMA journal_mode = WAL",
+    "PRAGMA synchronous = NORMAL",
+)
+
+
+class MigrationError(RuntimeError):
+    """Échec de migration du schéma SQLite. Doit empêcher le démarrage du service."""
+
+
+@dataclass(frozen=True)
+class Migration:
+    """
+    Une étape de migration, déclarative et ordonnée.
+
+    version
+        `user_version` atteint après application. Strictement croissant.
+    description
+        Résumé opérationnel, journalisé. Ne doit contenir aucune donnée
+        personnelle ni secret.
+    statements
+        Instructions SQL exécutées dans l'ordre, une par appel `execute()`.
+        On n'utilise volontairement PAS `executescript()` : sqlite3 valide
+        implicitement la transaction en cours avant de l'exécuter, ce qui
+        casserait l'atomicité de la migration.
+    apply
+        Fonction Python exécutée après `statements`, dans la MÊME transaction.
+        Nécessaire dès qu'une migration doit inspecter la base ou appliquer le
+        motif « create table new → copy → drop old → rename » que SQLite impose
+        pour changer une contrainte (cf. `_rebuild_table`).
+    check_foreign_keys
+        Lance `PRAGMA foreign_key_check` avant le COMMIT et échoue s'il reste
+        des violations. À activer pour toute migration qui recrée une table.
+        Laissé à False par défaut : une base historique peut porter des
+        violations préexistantes, sans lien avec la migration en cours, et le
+        démarrage du service ne doit pas en dépendre.
+    """
+
+    version: int
+    description: str
+    statements: tuple[str, ...] = ()
+    apply: Callable[[aiosqlite.Connection], Awaitable[None]] | None = None
+    check_foreign_keys: bool = False
+
+
+def _split_statements(script: str) -> tuple[str, ...]:
+    """
+    Découpe un script DDL en instructions individuelles, exécutables une à une.
+
+    Le schéma de ce module ne contient ni trigger ni littéral comportant un
+    « ; » : le découpage naïf est donc sûr. Les lignes de commentaire sont
+    retirées pour ne pas produire de fragment vide en fin de script.
+    """
+    statements: list[str] = []
+    for chunk in script.split(";"):
+        body = "\n".join(
+            line for line in chunk.splitlines() if not line.strip().startswith("--")
+        ).strip()
+        if body:
+            statements.append(body)
+    return tuple(statements)
+
+
+async def _rebuild_table(
+    db: aiosqlite.Connection,
+    table: str,
+    create_new_sql: str,
+    copy_columns: Sequence[str],
+    index_statements: Sequence[str] = (),
+) -> None:
+    """
+    Recrée `table` avec une nouvelle définition — seul moyen de changer une
+    contrainte en SQLite (`ALTER TABLE` ne sait pas modifier une clé étrangère).
+
+    Séquence appliquée : création de `<table>__new` → copie des `copy_columns`
+    → `DROP` de l'ancienne table → renommage → recréation des index.
+
+    `create_new_sql` doit créer la table sous le nom `<table>__new`. Les index
+    de l'ancienne table disparaissent avec le `DROP` : `index_statements` doit
+    les redéclarer.
+
+    Les clés étrangères sont déjà désactivées par le moteur de migration
+    (`PRAGMA foreign_keys = OFF`, positionné hors transaction) : sans cela le
+    `DROP TABLE` casserait les références. Déclarer `check_foreign_keys=True`
+    sur la migration pour faire vérifier l'intégrité avant le COMMIT.
+
+    Les identifiants passés ici sont des littéraux du code, jamais des entrées
+    utilisateur : l'interpolation de `table` dans le SQL est volontaire et sûre.
+    """
+    new_table = f"{table}__new"
+    columns = ", ".join(copy_columns)
+    await db.execute(create_new_sql)
+    await db.execute(
+        f"INSERT INTO {new_table} ({columns}) SELECT {columns} FROM {table}"
+    )
+    await db.execute(f"DROP TABLE {table}")
+    await db.execute(f"ALTER TABLE {new_table} RENAME TO {table}")
+    for statement in index_statements:
+        await db.execute(statement)
+
+
+async def _ensure_hourly_token_limit(db: aiosqlite.Connection) -> None:
+    """
+    Garantit la présence de `users.hourly_token_limit`.
+
+    Avant OPS-006 cette évolution était un `ALTER TABLE` rejoué à chaque
+    démarrage en avalant les erreurs « duplicate column ». Les bases déjà
+    déployées peuvent donc porter la colonne tout en restant en
+    `user_version = 0` : on inspecte l'état réel via `PRAGMA table_info` plutôt
+    que de le supposer, et l'`ALTER TABLE` n'est émis que si la colonne manque.
+    """
+    rows = await (await db.execute("PRAGMA table_info(users)")).fetchall()
+    if any(row["name"] == "hourly_token_limit" for row in rows):
+        logger.debug("Colonne users.hourly_token_limit déjà présente.")
+        return
+    await db.execute(
+        "ALTER TABLE users ADD COLUMN hourly_token_limit INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+# Liste ordonnée des migrations. Ajouter une entrée en fin de tuple, jamais
+# réécrire une entrée déjà livrée (une base en production l'a déjà appliquée).
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(
+        version=1,
+        description="Baseline : tables users/api_keys/usage_log et index",
+        # Toutes les instructions sont en `IF NOT EXISTS` : sur une base
+        # préexistante (user_version = 0) cette migration ne fait qu'estampiller
+        # la version, sans toucher aux données.
+        statements=_split_statements(SCHEMA),
+    ),
+    Migration(
+        version=2,
+        description="Colonne users.hourly_token_limit (absorption de l'ALTER historique)",
+        apply=_ensure_hourly_token_limit,
+    ),
+)
+
+# Version de schéma attendue par ce code.
+SCHEMA_VERSION = MIGRATIONS[-1].version
+
+
+def _target_version() -> int:
+    """Version cible = version de la dernière migration déclarée."""
+    return MIGRATIONS[-1].version if MIGRATIONS else 0
+
+
+async def _read_user_version(db: aiosqlite.Connection) -> int:
+    row = await (await db.execute("PRAGMA user_version")).fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _write_user_version(db: aiosqlite.Connection, version: int) -> None:
+    # Un PRAGMA n'accepte pas de paramètre lié ; la valeur est un entier validé
+    # issu des migrations déclarées dans ce module, jamais d'une entrée externe.
+    await db.execute(f"PRAGMA user_version = {int(version)}")
+
+
+def _backup_path(db_path: Path, from_version: int) -> Path:
+    """Chemin de sauvegarde dérivé de la base, incluant la version d'origine."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return db_path.with_name(
+        f"{db_path.name}.pre-migration.v{from_version}.{stamp}.bak"
+    )
+
+
+async def _backup_database(
+    db: aiosqlite.Connection, db_path: Path, from_version: int
+) -> Path:
+    """
+    Sauvegarde cohérente de la base via l'API de sauvegarde SQLite.
+
+    On n'utilise pas une copie de fichier : en mode WAL, le fichier principal
+    seul est incomplet. `Connection.backup()` produit une image cohérente,
+    WAL inclus.
+
+    Le fichier est créé en 0600 AVANT toute écriture (O_EXCL : on n'écrase
+    jamais une sauvegarde existante), puis restreint à ce que la base autorise
+    déjà — une sauvegarde ne doit jamais être plus largement accessible que
+    l'original.
+    """
+    target = _backup_path(db_path, from_version)
+    os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    try:
+        async with aiosqlite.connect(target) as dest:
+            await db.backup(dest)
+        # Restriction appliquée après l'écriture : un mode source en lecture
+        # seule (0400) empêcherait sinon d'écrire la sauvegarde.
+        os.chmod(target, stat.S_IMODE(db_path.stat().st_mode) & 0o600)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+async def _apply_migration(db: aiosqlite.Connection, migration: Migration) -> None:
+    """
+    Applique une migration de façon atomique : SQL, hook Python et
+    `user_version` sont validés ensemble ou annulés ensemble.
+    """
+    logger.info("Migration SQLite %d — %s", migration.version, migration.description)
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        # Relecture sous verrou d'écriture : un autre processus (service et CLI
+        # démarrés en parallèle) a pu appliquer la migration entre la lecture
+        # initiale de `user_version` et l'obtention du verrou. Sans ce contrôle,
+        # une migration de recréation de table serait rejouée.
+        if await _read_user_version(db) >= migration.version:
+            await db.execute("COMMIT")
+            logger.info(
+                "Migration SQLite %d déjà appliquée par un autre processus, ignorée.",
+                migration.version,
+            )
+            return
+        for statement in migration.statements:
+            await db.execute(statement)
+        if migration.apply is not None:
+            await migration.apply(db)
+        if migration.check_foreign_keys:
+            violations = await (
+                await db.execute("PRAGMA foreign_key_check")
+            ).fetchall()
+            if violations:
+                raise MigrationError(
+                    f"Migration {migration.version} : {len(violations)} violation(s) "
+                    "de clé étrangère détectée(s) avant validation."
+                )
+        await _write_user_version(db, migration.version)
+        await db.execute("COMMIT")
+    except BaseException as exc:
+        try:
+            await db.execute("ROLLBACK")
+        except Exception:  # pragma: no cover — transaction déjà refermée
+            logger.warning("ROLLBACK impossible après échec de migration.")
+        logger.error(
+            "Migration SQLite %d échouée, transaction annulée : %s",
+            migration.version,
+            exc,
+        )
+        if isinstance(exc, MigrationError):
+            raise
+        raise MigrationError(
+            f"Migration {migration.version} ({migration.description}) échouée : {exc}"
+        ) from exc
+    logger.info(
+        "Migration SQLite %d appliquée (user_version = %d).",
+        migration.version,
+        migration.version,
+    )
+
+
+async def _migrate(db_path: Path) -> None:
+    """
+    Amène la base au niveau `SCHEMA_VERSION`.
+
+    Idempotent : si la base est déjà à jour, aucune transaction de migration
+    n'est ouverte et aucune sauvegarde n'est produite.
+    """
+    # L'état d'existence est évalué AVANT la connexion : aiosqlite crée le
+    # fichier à l'ouverture, ce qui rendrait le test inopérant ensuite.
+    pre_existing = db_path.is_file() and db_path.stat().st_size > 0
+
+    # isolation_level=None : contrôle manuel des transactions. Par défaut
+    # sqlite3 ouvre et valide des transactions implicites qui interfèrent avec
+    # les BEGIN/COMMIT explicites du moteur de migration.
+    async with aiosqlite.connect(db_path, isolation_level=None) as db:
+        db.row_factory = aiosqlite.Row
+        for pragma in _PRAGMAS:
+            await db.execute(pragma)
         await _apply_session_pragmas(db)
-        await db.executescript(SCHEMA)
-        for migration in _MIGRATIONS:
-            try:
-                await db.execute(migration)
-            except sqlite3.OperationalError as exc:
-                # On n'ignore QUE l'ajout d'une colonne déjà existante ; toute
-                # autre erreur de migration doit remonter.
-                if "duplicate column" not in str(exc).lower():
-                    raise
-                logger.debug("Migration ignorée (colonne déjà existante) : %s", exc)
-        await db.commit()
+
+        current = await _read_user_version(db)
+        target = _target_version()
+
+        if current > target:
+            raise MigrationError(
+                f"Base SQLite en version de schéma {current}, code compatible "
+                f"jusqu'à {target} : rollback applicatif détecté. Redéployer une "
+                "version du code au moins égale au schéma, ou restaurer une "
+                "sauvegarde antérieure. Aucune modification effectuée."
+            )
+
+        pending = [m for m in MIGRATIONS if m.version > current]
+        if not pending:
+            logger.debug(
+                "Schéma SQLite déjà en version %d, aucune migration à appliquer.",
+                current,
+            )
+            return
+
+        if pre_existing:
+            backup = await _backup_database(db, db_path, current)
+            logger.info(
+                "Sauvegarde avant migration (version %d) : %s", current, backup
+            )
+        else:
+            logger.info(
+                "Base SQLite absente ou vide : création du schéma en version %d.",
+                target,
+            )
+
+        # `PRAGMA foreign_keys` est silencieusement IGNORÉ dans une transaction :
+        # il doit donc être basculé ici, hors transaction, pour toute la série de
+        # migrations. C'est une nécessité du motif de recréation de table
+        # (`_rebuild_table`), dont le `DROP TABLE` casserait sinon les
+        # références. L'état est restauré à ON quoi qu'il arrive.
+        await db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            for migration in pending:
+                await _apply_migration(db, migration)
+        finally:
+            await db.execute("PRAGMA foreign_keys = ON")
+
+
+async def init_db() -> None:
+    """
+    Crée ou migre le schéma et applique les pragmas. Idempotent.
+
+    Fail-closed : toute erreur de migration remonte sous forme de
+    `MigrationError` et empêche le démarrage plutôt que de laisser le service
+    tourner sur une base à moitié migrée.
+    """
+    settings.db_path.parent.mkdir(parents=True, exist_ok=True)
+    await _migrate(settings.db_path)
 
 
 # ---------------------------------------------------------------------------
