@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -10,6 +11,37 @@ _DEFAULT_SECRETS: frozenset[str] = frozenset({
     "CHANGE_ME_INTERNAL_STUDENT_EDGE_KEY",
     "CHANGE_ME_AUDIT_HMAC_SECRET",
 })
+
+
+def split_list_setting(value: object, name: str) -> object:
+    """
+    Normalise un réglage de liste reçu depuis l'environnement.
+
+    Accepte une valeur vide (→ liste vide), une liste CSV — la syntaxe livrée par
+    `deploy/env.example` et documentée dans le README — ou un tableau JSON. Une
+    valeur déjà structurée traverse sans modification.
+
+    Dupliqué depuis `gateway/config.py` à dessein : les deux gateways sont des
+    frontières de sécurité indépendantes et ne partagent aucun code.
+    """
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    if not raw:
+        return []
+    # Un objet JSON serait sinon traité comme un unique élément CSV : l'allowlist
+    # de modèles contiendrait une entrée inatteignable, sans message d'erreur.
+    if raw.startswith("{"):
+        raise ValueError(f"{name} : attendu une liste CSV ou un tableau JSON, pas un objet")
+    if raw.startswith("["):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} : tableau JSON invalide") from exc
+        if not isinstance(decoded, list) or not all(isinstance(v, str) for v in decoded):
+            raise ValueError(f"{name} : le JSON doit être une liste de chaînes")
+        return [item.strip() for item in decoded if item.strip()]
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 class Settings(BaseSettings):
@@ -29,7 +61,16 @@ class Settings(BaseSettings):
     upstream_client_cert_path: Path | None = Path("/etc/llm-gateway-student/gw-student.crt")
     upstream_client_key_path: Path | None = Path("/etc/llm-gateway-student/gw-student.key")
 
-    allowed_models: list[str] = Field(default_factory=lambda: ["llama-3.1-8b-instruct", "qwen-9b"])
+    # Annotation `str | list[str]` volontaire : pydantic-settings décode un champ
+    # `list[str]` comme du JSON dans la source d'environnement, AVANT tout
+    # validateur. `split_models` ne s'exécutait donc jamais, et la valeur CSV
+    # livrée par `deploy/env.example` faisait échouer le démarrage sur
+    # `SettingsError`. L'annotation élargie rend le champ non-complexe pour la
+    # source ; le validateur produit toujours une `list[str]`, ce dont dépend
+    # `policy.py` (appartenance à une liste, pas à une sous-chaîne).
+    allowed_models: str | list[str] = Field(
+        default_factory=lambda: ["llama-3.1-8b-instruct", "qwen-9b"]
+    )
     default_model_id: str = "llama-3.1-8b-instruct"
 
     default_rpm_limit: int = 10
@@ -77,10 +118,8 @@ class Settings(BaseSettings):
 
     @field_validator("allowed_models", mode="before")
     @classmethod
-    def split_models(cls, value: object) -> list[str]:
-        if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value  # type: ignore[return-value]
+    def split_models(cls, value: object) -> object:
+        return split_list_setting(value, "ALLOWED_MODELS")
 
     @field_validator("upstream_base_url")
     @classmethod

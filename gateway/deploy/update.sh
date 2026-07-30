@@ -17,6 +17,21 @@
 #
 # Il ne régénère jamais un secret existant et ne remplace jamais nodes.yaml.
 # Pour mettre à jour aussi nginx : ajouter --nginx en argument.
+#
+# ── Gate de validation (COR-006) ─────────────────────────────────────────────
+# Une version n'est conservée que si elle SERT réellement, pas seulement si elle
+# répond. Trois contrôles se succèdent :
+#
+#   1. `evaruntime doctor` AVANT la bascule, sur le venv neuf et le code déjà
+#      synchronisé : un hôte inapte est détecté sans jamais arrêter le service.
+#   2. `/ready` après le redémarrage (readiness structurelle stricte, COR-005).
+#   3. `deploy/smoke_test.sh` : recette du premier token de bout en bout sur le
+#      vrai chemin public, puis `doctor` une seconde fois.
+#
+# L'ancienne version (code, venv, unité, mode) reste conservée jusqu'à la fin de
+# la recette : tout échec fonctionnel la restaure. Une régression de TTFT est en
+# revanche une ALERTE et ne provoque JAMAIS de rollback, sauf si l'opérateur
+# l'exige explicitement avec --ttft-gate.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -41,10 +56,29 @@ source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
 usage() {
     cat <<EOF
 Usage: $0 [--mode local|cluster] [--cluster] [--allow-mode-change] [--nginx] [--dry-run]
+          [--smoke-base-url URL] [--smoke-model ID] [--ttft-threshold-ms N] [--ttft-gate]
+          [--skip-smoke-test] [--skip-doctor]
 
 Sans --mode, le mode présent dans /etc/llm-gateway/env est conservé (local si
 la clé est absente). --cluster reste un alias de --mode cluster.
 Une migration exige --allow-mode-change. --dry-run ne modifie ni le dépôt ni l'hôte.
+
+Validation de la version déployée (COR-006) :
+  --smoke-base-url URL   Chemin public exercé par la recette du premier token.
+                         Le viser sur nginx (https://…) couvre aussi TLS et le
+                         non-buffering SSE du reverse-proxy. Défaut : la gateway
+                         en direct. (env : EVA_SMOKE_BASE_URL)
+  --smoke-model ID       Modèle exercé. Défaut : DEFAULT_MODEL_ID, sinon le plus
+                         petit modèle activé.        (env : EVA_SMOKE_MODEL)
+  --ttft-threshold-ms N  Seuil d'ALERTE sur le TTFT. 0 = désactivé (défaut).
+                         (env : EVA_SMOKE_TTFT_THRESHOLD_MS)
+  --ttft-gate            Transforme le dépassement du seuil en cause de rollback.
+                         Sans cette option, un TTFT lent est signalé et la version
+                         reste déployée.             (env : EVA_SMOKE_TTFT_GATE=1)
+  --skip-smoke-test      DANGEREUX — désactive la recette du premier token : la
+                         version est alors validée sur /ready seul, comme avant
+                         COR-006. À réserver à un dépannage.
+  --skip-doctor          Désactive les préflights doctor avant et après bascule.
 EOF
 }
 
@@ -53,8 +87,27 @@ REQUESTED_MODE=""
 MODE_WAS_EXPLICIT=false
 ALLOW_MODE_CHANGE=false
 DRY_RUN=false
+RUN_SMOKE_TEST=true
+RUN_DOCTOR=true
+SMOKE_BASE_URL="${EVA_SMOKE_BASE_URL:-}"
+SMOKE_MODEL="${EVA_SMOKE_MODEL:-}"
+TTFT_THRESHOLD_MS="${EVA_SMOKE_TTFT_THRESHOLD_MS:-0}"
+TTFT_GATE=false
+[[ "${EVA_SMOKE_TTFT_GATE:-0}" != "1" ]] || TTFT_GATE=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --smoke-base-url)
+            [[ -n "${2:-}" ]] || { echo "--smoke-base-url requiert une URL" >&2; exit 2; }
+            SMOKE_BASE_URL="$2"; shift 2 ;;
+        --smoke-model)
+            [[ -n "${2:-}" ]] || { echo "--smoke-model requiert un identifiant" >&2; exit 2; }
+            SMOKE_MODEL="$2"; shift 2 ;;
+        --ttft-threshold-ms)
+            [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--ttft-threshold-ms requiert un entier" >&2; exit 2; }
+            TTFT_THRESHOLD_MS="$2"; shift 2 ;;
+        --ttft-gate)       TTFT_GATE=true; shift ;;
+        --skip-smoke-test) RUN_SMOKE_TEST=false; shift ;;
+        --skip-doctor)     RUN_DOCTOR=false; shift ;;
         --mode)
             [[ $# -ge 2 ]] || { echo "--mode requiert local ou cluster" >&2; usage; exit 2; }
             deploy_validate_mode "$2" || { echo "Mode invalide : $2" >&2; usage; exit 2; }
@@ -75,6 +128,12 @@ while [[ $# -gt 0 ]]; do
         *) echo "Option inconnue : $1" >&2; usage; exit 2 ;;
     esac
 done
+
+[[ "$TTFT_THRESHOLD_MS" =~ ^[0-9]+$ ]] || \
+    { echo "Seuil TTFT invalide : $TTFT_THRESHOLD_MS (EVA_SMOKE_TTFT_THRESHOLD_MS)" >&2; exit 2; }
+
+SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
+NGINX_SITE="/etc/nginx/sites-available/llm-gateway"
 
 # Répertoires
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
@@ -98,6 +157,21 @@ echo "  Mode demandé : ${REQUESTED_MODE:-<auto>}"
 echo "  Mode existant  : ${CURRENT_MODE:-<absent; local par défaut>}"
 echo "  Mode effectif  : $EFFECTIVE_MODE"
 echo "  Conservation   : env, models.yaml, nodes.yaml, secrets, DB et GGUF"
+if [[ "$RUN_SMOKE_TEST" == true ]]; then
+    echo "  Validation     : doctor (avant/après) + /ready + recette du premier token"
+    echo "  Chemin exercé  : ${SMOKE_BASE_URL:-<gateway en direct>}"
+    if [[ "$TTFT_THRESHOLD_MS" -gt 0 ]]; then
+        if [[ "$TTFT_GATE" == true ]]; then
+            echo "  Seuil TTFT     : ${TTFT_THRESHOLD_MS} ms — GATE (dépassement = rollback)"
+        else
+            echo "  Seuil TTFT     : ${TTFT_THRESHOLD_MS} ms — alerte seulement (aucun rollback)"
+        fi
+    else
+        echo "  Seuil TTFT     : désactivé (mesure rapportée sans gate)"
+    fi
+else
+    echo "  Validation     : /ready SEUL — recette du premier token désactivée (--skip-smoke-test)"
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
     echo "  Action         : aucune (--dry-run; pas de git pull, pip, systemd ou écriture)"
@@ -116,6 +190,12 @@ fi
 for required in awk chmod chown cp curl find git mkdir mktemp mv systemctl; do
     command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
 done
+if [[ "$RUN_SMOKE_TEST" == true ]]; then
+    [[ -f "$SMOKE_TEST_SCRIPT" ]] || \
+        error "Préflight : recette du premier token introuvable ($SMOKE_TEST_SCRIPT). Utilisez --skip-smoke-test en connaissance de cause."
+    command -v python3 &>/dev/null || \
+        error "Préflight : python3 requis par la recette du premier token."
+fi
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité orchestrateur introuvable"
 else
@@ -231,6 +311,106 @@ rollback_failed_transaction() {
     fi
     warn "Code, venv, mode et unité précédents restaurés. Snapshot : $CODE_SNAPSHOT"
     exit "$exit_code"
+}
+
+# ── Gate de validation (COR-006) ──────────────────────────────────────────────
+
+# `evaruntime doctor` (AUT-012). Exit codes : 0 conforme, 1 échec bloquant,
+# 2 erreur d'usage CLI, 3 avertissements seulement, 4 erreur interne de doctor.
+# 0 ET 3 valent succès : le défaut nginx COR-009, par exemple, est signalé en
+# avertissement et ne doit pas empêcher un déploiement par ailleurs sain.
+# --verify-hashes n'est JAMAIS utilisé ici : il relit intégralement les GGUF,
+# soit plusieurs centaines de Go à chaque mise à jour.
+run_doctor() {
+    local python_bin="$1" label="$2" rc=0
+    [[ "$RUN_DOCTOR" == true ]] || { info "doctor ($label) ignoré (--skip-doctor)."; return 0; }
+    [[ -x "$python_bin" ]] || { warn "doctor ($label) : interpréteur introuvable ($python_bin) — contrôle ignoré."; return 0; }
+    [[ -f "$INSTALL_DIR/cli.py" ]] || { warn "doctor ($label) : cli.py introuvable — contrôle ignoré."; return 0; }
+
+    set +e
+    "$python_bin" "$INSTALL_DIR/cli.py" doctor \
+        --env-file "$CONFIG_FILE" \
+        --nginx-conf "$NGINX_SITE" \
+        --systemd-unit /etc/systemd/system/llm-gateway.service
+    rc=$?
+    set -e
+
+    case "$rc" in
+        0) info "doctor ($label) : hôte conforme."; return 0 ;;
+        3) warn "doctor ($label) : avertissements seulement (exit 3) — la mise à jour continue."; return 0 ;;
+        *) warn "doctor ($label) : échec bloquant (exit $rc)."; return 1 ;;
+    esac
+}
+
+# Recette du premier token. Rend l'exit code du script : 0 succès, 1 échec
+# fonctionnel, 3 préflight, 4 seuil TTFT (uniquement si --ttft-gate), 5 identité
+# éphémère résiduelle.
+run_smoke_test() {
+    local rc=0
+    local args=(--env-file "$CONFIG_FILE")
+    [[ -z "$SMOKE_BASE_URL" ]] || args+=(--base-url "$SMOKE_BASE_URL")
+    [[ -z "$SMOKE_MODEL" ]]    || args+=(--model "$SMOKE_MODEL")
+    [[ "$TTFT_THRESHOLD_MS" -le 0 ]] || args+=(--ttft-threshold-ms "$TTFT_THRESHOLD_MS")
+    [[ "$TTFT_GATE" != true ]] || args+=(--fail-on-ttft)
+
+    set +e
+    bash "$SMOKE_TEST_SCRIPT" "${args[@]}"
+    rc=$?
+    set -e
+    return "$rc"
+}
+
+# Restauration de la version précédente après un redémarrage. Extraite pour être
+# partagée par les deux causes de rollback post-bascule : readiness jamais
+# atteinte, et recette du premier token en échec. Ne rend jamais la main.
+rollback_deployed_release() {
+    local cause="$1" attempt
+
+    warn "$cause"
+
+    if [[ "$PREVIOUS_MODE" != "$EFFECTIVE_MODE" ]]; then
+        section "ROLLBACK  Mode $EFFECTIVE_MODE → $PREVIOUS_MODE"
+        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
+        rollback_venv
+        restore_code_snapshot "$CODE_SNAPSHOT"
+        restore_previous_service_unit "$PREVIOUS_MODE"
+        systemctl daemon-reload
+        systemctl stop llm-gateway || true
+        systemctl start llm-gateway || true
+        for attempt in $(seq 1 20); do
+            sleep 2
+            if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+                error "Migration de mode échouée; le mode $PREVIOUS_MODE a été restauré et le service est sain."
+            fi
+        done
+        error "Migration de mode et rollback ont échoué. Intervention requise : journalctl -u llm-gateway -n 100"
+    fi
+
+    section "ROLLBACK  Restauration du snapshot déployé"
+    rollback_venv
+    restore_code_snapshot "$CODE_SNAPSHOT"
+    restore_previous_service_unit "$EFFECTIVE_MODE"
+    systemctl daemon-reload
+    systemctl stop llm-gateway || true
+    systemctl start llm-gateway || true
+
+    ROLLBACK_OK=false
+    for attempt in $(seq 1 20); do
+        sleep 2
+        if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+            ROLLBACK_OK=true
+            break
+        fi
+    done
+
+    if [[ "$ROLLBACK_OK" == true ]]; then
+        warn "Rollback réussi depuis $CODE_SNAPSHOT; le checkout Git est resté intact."
+        warn "La version ${AFTER:0:8} n'est pas déployée; investiguez avant de réessayer."
+        [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update : $BACKUP_FILE"
+        exit 1
+    else
+        error "Rollback ÉCHOUÉ. Intervention requise : sudo journalctl -u llm-gateway -n 100 --no-pager"
+    fi
 }
 
 echo ""
@@ -416,8 +596,16 @@ BACKUP_TIMER_STATE="$(systemctl is-enabled llm-gateway-backup.timer 2>/dev/null 
 
 mkdir -p "$INSTALL_DIR/deploy"
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+# La recette du premier token est installée à côté du service pour qu'un
+# opérateur puisse la relancer en incident sans disposer du checkout Git.
+# `deploy-mode-lib.sh` l'accompagne : smoke_test.sh la source depuis son propre
+# répertoire pour lire l'EnvironmentFile sans jamais le sourcer.
+cp "$SCRIPT_DIR/deploy/smoke_test.sh"       "$INSTALL_DIR/deploy/"
+cp "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"  "$INSTALL_DIR/deploy/"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
-chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh" \
+          "$INSTALL_DIR/deploy/smoke_test.sh"
+chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh"
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
 systemctl daemon-reload
@@ -453,6 +641,19 @@ else
     info "Rotation journald déjà présente — conservée ($JOURNALD_DROPIN)."
 fi
 
+# ── 4e. doctor AVANT la bascule ──────────────────────────────────────────────
+# Le service tourne encore l'ANCIEN code : un hôte inapte est détecté sans
+# aucune coupure. On sonde avec le venv neuf et le code déjà synchronisé, donc
+# exactement l'exécutable qui servira après la bascule. Un échec bloquant
+# déclenche le rollback transactionnel : le service n'est jamais arrêté.
+
+section "4e. Préflight doctor (avant bascule)"
+if ! run_doctor "$STAGED_VENV/bin/python" "avant bascule"; then
+    warn "L'hôte ne satisfait pas les préflights de la version ${AFTER:0:8}."
+    warn "Le service n'a pas été arrêté; le code précédent est restauré."
+    rollback_failed_transaction 1
+fi
+
 # ── 5. Mise à jour du service systemd + redémarrage ──────────────────────────
 
 section "5/5  Redémarrage du service"
@@ -484,64 +685,69 @@ for i in $(seq 1 20); do
 done
 echo ""
 
+TRANSACTION_ARMED=false
+trap - ERR
+
 if [[ "$HEALTHY" == true ]]; then
     HEALTH=$(curl -s http://127.0.0.1:8000/ready)
     info "Service prêt : $HEALTH"
 else
-    TRANSACTION_ARMED=false
-    trap - ERR
     # ── Rollback automatique ──────────────────────────────────────────────────
     # Le service n'est pas devenu ready. Code, venv, unité et mode reviennent au
     # snapshot précédent; la DB n'est jamais restaurée sans arbitrage humain.
-    warn "Le service ne répond pas après $((20 * 2))s."
-
-    if [[ "$PREVIOUS_MODE" != "$EFFECTIVE_MODE" ]]; then
-        section "ROLLBACK  Mode $EFFECTIVE_MODE → $PREVIOUS_MODE"
-        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
-        rollback_venv
-        restore_code_snapshot "$CODE_SNAPSHOT"
-        restore_previous_service_unit "$PREVIOUS_MODE"
-        systemctl daemon-reload
-        systemctl stop llm-gateway || true
-        systemctl start llm-gateway || true
-        for i in $(seq 1 20); do
-            sleep 2
-            if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
-                error "Migration de mode échouée; le mode $PREVIOUS_MODE a été restauré et le service est sain."
-            fi
-        done
-        error "Migration de mode et rollback ont échoué. Intervention requise : journalctl -u llm-gateway -n 100"
-    fi
-
-    section "ROLLBACK  Restauration du snapshot déployé"
-    rollback_venv
-    restore_code_snapshot "$CODE_SNAPSHOT"
-    restore_previous_service_unit "$EFFECTIVE_MODE"
-    systemctl daemon-reload
-    systemctl stop llm-gateway || true
-    systemctl start llm-gateway || true
-
-    ROLLBACK_OK=false
-    for i in $(seq 1 20); do
-        sleep 2
-        if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
-            ROLLBACK_OK=true
-            break
-        fi
-    done
-
-    if [[ "$ROLLBACK_OK" == true ]]; then
-        warn "Rollback réussi depuis $CODE_SNAPSHOT; le checkout Git est resté intact."
-        warn "La version ${AFTER:0:8} n'est pas déployée; investiguez avant de réessayer."
-        [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update : $BACKUP_FILE"
-        exit 1
-    else
-        error "Rollback ÉCHOUÉ. Intervention requise : sudo journalctl -u llm-gateway -n 100 --no-pager"
-    fi
+    rollback_deployed_release "Le service ne répond pas après $((20 * 2))s."
 fi
 
-TRANSACTION_ARMED=false
-trap - ERR
+# ── Validation fonctionnelle de la version (COR-006) ─────────────────────────
+# `/ready` ne prouve QUE la readiness structurelle : registre lisible, binaire
+# exécutable, GGUF présents, base inscriptible. Elle ne prouve pas qu'un token
+# sort. C'est exactement le trou par lequel une version incapable de générer
+# était acceptée avant COR-006. L'ancienne version reste conservée (snapshot de
+# code, venv précédent, unité) jusqu'à la fin de cette recette.
+
+section "Recette du premier token (smoke test)"
+if [[ "$RUN_SMOKE_TEST" != true ]]; then
+    warn "Recette du premier token DÉSACTIVÉE (--skip-smoke-test)."
+    warn "La version est validée sur /ready seul : une version incapable de générer"
+    warn "peut donc être conservée. Relancez la recette dès que possible :"
+    warn "  sudo bash $INSTALL_DIR/deploy/smoke_test.sh"
+else
+    SMOKE_RC=0
+    run_smoke_test || SMOKE_RC=$?
+    case "$SMOKE_RC" in
+        0)
+            info "Premier token prouvé de bout en bout : la version ${AFTER:0:8} SERT."
+            ;;
+        4)
+            # Ce code n'est atteignable que si l'opérateur a demandé --ttft-gate.
+            rollback_deployed_release \
+                "Gate TTFT activé et seuil dépassé (${TTFT_THRESHOLD_MS} ms) : rollback demandé par l'opérateur."
+            ;;
+        5)
+            # La version SERT — le défaut porte sur l'identité de smoke test, pas
+            # sur le code. Un rollback serait une réaction disproportionnée, mais
+            # un compte résiduel doit rester bruyant et non nul.
+            warn "La version ${AFTER:0:8} est fonctionnelle et RESTE déployée."
+            error "Identité de smoke test résiduelle : retirez-la immédiatement (voir le rapport ci-dessus)."
+            ;;
+        *)
+            rollback_deployed_release \
+                "Recette du premier token en ÉCHEC (code $SMOKE_RC) : la version ${AFTER:0:8} répond mais ne sert pas."
+            ;;
+    esac
+fi
+
+# ── doctor APRÈS bascule ─────────────────────────────────────────────────────
+# Deuxième passage, cette fois sur l'hôte réellement basculé : il peut relever
+# une dérive apparue avec la nouvelle version (limites systemd, timeouts nginx,
+# pool de ports). Non bloquant : la version a déjà PROUVÉ qu'elle sert, et un
+# rollback sur un simple constat de configuration serait disproportionné.
+
+section "Contrôle doctor (après bascule)"
+if ! run_doctor "$INSTALL_DIR/venv/bin/python" "après bascule"; then
+    warn "doctor signale un écart sur l'hôte basculé — à traiter, sans rollback :"
+    warn "  la version déployée a passé la recette du premier token."
+fi
 
 # ── Vérification des secrets ──────────────────────────────────────────────────
 # Les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou CHANGE_ME_*.
@@ -565,7 +771,11 @@ echo "  Commandes utiles :"
 echo "    sudo journalctl -u llm-gateway -f          # logs en temps réel"
 echo "    sudo systemctl status llm-gateway          # état du service"
 echo "    curl http://127.0.0.1:8000/health          # santé de l'API"
-echo "    curl http://127.0.0.1:8000/ready           # gate de readiness production"
+echo "    curl http://127.0.0.1:8000/ready           # readiness structurelle (COR-005)"
+echo "    sudo bash $INSTALL_DIR/deploy/smoke_test.sh"
+echo "                                               # recette du premier token à la demande"
+echo "    $INSTALL_DIR/venv/bin/python $INSTALL_DIR/cli.py doctor --env-file $CONFIG_FILE"
+echo "                                               # préflight de l'hôte"
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     echo ""
     echo "  IMPORTANT : update.sh ne met pas les nœuds à jour à distance."

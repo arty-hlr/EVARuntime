@@ -530,6 +530,199 @@ Le champ `model` dans `usage_log` stocke l'ID du modèle tel que résolu
 par le routing (ex : `"llama-3.3-70b-instruct"`), permettant les rapports
 d'usage par modèle.
 
+### Migrations versionnées
+
+Un `CREATE TABLE IF NOT EXISTS` n'atteint **jamais** une base déjà créée : sans
+mécanisme de migration, une base déployée conserve indéfiniment son schéma
+d'origine et aucun changement de contrainte ne l'atteint. `gateway/database.py`
+embarque donc un moteur de migration versionné.
+
+#### Versionnement
+
+La version du schéma est portée par `PRAGMA user_version`, un entier stocké
+dans l'en-tête du fichier SQLite :
+
+| `user_version` | Signification |
+|---|---|
+| `0` | base neuve, ou base déployée avant l'introduction du mécanisme |
+| `N` | les migrations `1..N` ont été appliquées |
+
+Le code déclare sa version cible dans `SCHEMA_VERSION`, dérivée de la dernière
+entrée du tuple `MIGRATIONS`. `init_db()` amène la base à cette version puis
+n'a plus aucun effet : il est idempotent et peut être appelé à chaque démarrage
+comme à chaque commande CLI.
+
+#### Structure d'une migration
+
+```python
+@dataclass(frozen=True)
+class Migration:
+    version: int                  # user_version atteint après application
+    description: str              # journalisée ; jamais de donnée personnelle
+    statements: tuple[str, ...]   # SQL exécuté instruction par instruction
+    apply: Callable | None        # hook Python, même transaction
+    check_foreign_keys: bool      # PRAGMA foreign_key_check avant COMMIT
+```
+
+Règles :
+
+- **Ajouter** une entrée en fin de tuple `MIGRATIONS`, avec `version` égale à la
+  précédente + 1. Ne **jamais** réécrire une entrée déjà livrée : une base en
+  production l'a déjà appliquée et ne la rejouera pas.
+- `statements` est un tuple d'instructions, pas un script. `executescript()` de
+  `sqlite3` valide implicitement la transaction en cours : l'utiliser
+  romprait l'atomicité de la migration.
+- `apply` est nécessaire dès que la migration doit inspecter l'état réel de la
+  base (plutôt que de le supposer) ou recréer une table.
+- `check_foreign_keys=True` sur toute migration qui recrée une table. Il est à
+  `False` par défaut car une base historique peut porter des violations
+  préexistantes, sans lien avec la migration : le démarrage du service ne doit
+  pas en dépendre.
+
+#### Transactionnalité et clés étrangères
+
+Chaque migration s'exécute dans un `BEGIN IMMEDIATE` qui englobe son SQL, son
+hook Python **et** l'écriture de `user_version` : `user_version` n'avance
+qu'avec la migration, et un échec annule tout. Les migrations déjà validées ne
+sont pas perdues — la base s'arrête simplement à la dernière version appliquée.
+
+`PRAGMA foreign_keys` est **silencieusement ignoré à l'intérieur d'une
+transaction**. Le moteur le positionne donc à `OFF` **avant** d'ouvrir la
+première transaction, pour toute la série de migrations, et le restaure à `ON`
+dans un `finally`. C'est une nécessité du motif de recréation de table : le
+`DROP TABLE` de l'ancienne table casserait sinon les références. Les connexions
+applicatives (`get_db()`) rétablissent `foreign_keys = ON` à chaque ouverture.
+
+`user_version` est relue **sous le verrou d'écriture**, après le
+`BEGIN IMMEDIATE` : si un autre processus (service et CLI démarrés en parallèle)
+a appliqué la migration entre-temps, elle est ignorée au lieu d'être rejouée.
+Une migration de recréation de table n'est donc jamais exécutée deux fois.
+
+#### Recréer une table pour changer une contrainte
+
+SQLite ne sait pas modifier une clé étrangère par `ALTER TABLE`. Le seul motif
+possible est *create new → copy → drop old → rename*, encapsulé par le helper
+`_rebuild_table()`. Exemple complet — passer `usage_log.user_id` en
+`ON DELETE CASCADE` :
+
+```python
+async def _migration_usage_log_cascade(db: aiosqlite.Connection) -> None:
+    """Recrée usage_log pour supprimer les lignes d'un utilisateur supprimé."""
+    await _rebuild_table(
+        db,
+        table="usage_log",
+        create_new_sql="""
+            CREATE TABLE usage_log__new (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id             INTEGER NOT NULL
+                                    REFERENCES users(id) ON DELETE CASCADE,
+                api_key_id          INTEGER
+                                    REFERENCES api_keys(id) ON DELETE SET NULL,
+                timestamp           TEXT    NOT NULL DEFAULT (datetime('now')),
+                model               TEXT    NOT NULL,
+                prompt_tokens       INTEGER NOT NULL DEFAULT 0,
+                completion_tokens   INTEGER NOT NULL DEFAULT 0,
+                total_tokens        INTEGER NOT NULL DEFAULT 0,
+                duration_ms         INTEGER,
+                status_code         INTEGER,
+                request_id          TEXT
+            )
+        """,
+        copy_columns=(
+            "id", "user_id", "api_key_id", "timestamp", "model",
+            "prompt_tokens", "completion_tokens", "total_tokens",
+            "duration_ms", "status_code", "request_id",
+        ),
+        index_statements=(
+            "CREATE INDEX idx_usage_user_time ON usage_log(user_id, timestamp)",
+            "CREATE INDEX idx_usage_timestamp ON usage_log(timestamp)",
+        ),
+    )
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    # … migrations existantes, inchangées …
+    Migration(
+        version=2,
+        description="usage_log.user_id en ON DELETE CASCADE",
+        apply=_migration_usage_log_cascade,
+        check_foreign_keys=True,
+    ),
+)
+```
+
+Points d'attention pour ce motif :
+
+- `create_new_sql` doit créer la table sous le nom `<table>__new`.
+- Les index de l'ancienne table disparaissent avec le `DROP` :
+  `index_statements` doit les redéclarer (mêmes noms, la table étant supprimée).
+- `copy_columns` liste explicitement les colonnes copiées ; c'est aussi le point
+  d'entrée pour transformer une valeur (`SELECT` implicite colonne par colonne).
+- Si des lignes orphelines préexistent, `check_foreign_keys=True` fera échouer
+  la migration : nettoyer les orphelins dans la même migration, avant l'appel.
+
+#### Sauvegarde préalable
+
+Avant la **première migration réellement applicable**, le moteur produit une
+sauvegarde. Aucune copie n'est faite si la base est déjà à jour, ni si elle est
+neuve (rien à protéger).
+
+- Chemin : `<db_path>.pre-migration.v<version_origine>.<horodatage UTC>.bak`,
+  par exemple `gateway.db.pre-migration.v0.20260730T101500Z.bak`.
+- Méthode : API de sauvegarde SQLite (`Connection.backup()`), pas une copie de
+  fichier — en mode WAL, le fichier principal seul est incomplet.
+- Permissions : fichier créé en `0600` avant toute écriture, puis restreint à
+  l'intersection avec le mode de la base. Une sauvegarde n'est jamais plus
+  largement accessible que la base elle-même.
+- `O_EXCL` : une sauvegarde existante n'est jamais écrasée.
+
+Ces sauvegardes ne sont pas purgées automatiquement : elles font partie de
+l'état à surveiller côté disque, et ne sont produites qu'à chaque changement de
+version de schéma.
+
+#### Comportement en cas d'échec — fail-closed
+
+Toute erreur remonte sous forme de `MigrationError` depuis `init_db()`, donc
+depuis le lifespan FastAPI : **le service ne démarre pas** sur une base à moitié
+migrée. Deux cas explicites :
+
+| Situation | Comportement |
+|---|---|
+| Migration qui échoue | `ROLLBACK`, `user_version` inchangée, `MigrationError` |
+| `user_version` > `SCHEMA_VERSION` | refus immédiat, aucune écriture, message désignant le rollback applicatif |
+
+Le second cas correspond à un retour arrière de version du code sur une base
+déjà migrée. Il produit une erreur claire plutôt qu'une corruption silencieuse.
+
+Les journaux tracent la version d'origine, la version cible, la description de
+chaque migration et le chemin de la sauvegarde — jamais de donnée personnelle ni
+de secret.
+
+#### Procédure opérateur
+
+Migration normale (déploiement) :
+
+1. Arrêter le service (`systemctl stop llm-gateway`) — la migration s'exécute au
+   démarrage et ne doit pas concurrencer un service actif.
+2. Déployer le nouveau code, puis démarrer le service.
+3. Vérifier le journal : `journalctl -u llm-gateway | grep "Migration SQLite"`.
+4. Contrôler la version atteinte :
+   `sqlite3 /var/lib/llm-gateway/gateway.db "PRAGMA user_version;"`.
+
+En cas d'échec de migration :
+
+1. Le service ne démarre pas ; lire la `MigrationError` dans le journal.
+2. La base est restée dans son état d'avant la migration fautive — elle est
+   exploitable par la version précédente du code si celle-ci acceptait cette
+   `user_version`.
+3. Sinon, restaurer la sauvegarde produite juste avant :
+   ```bash
+   systemctl stop llm-gateway
+   cp gateway.db.pre-migration.v0.20260730T101500Z.bak gateway.db
+   rm -f gateway.db-wal gateway.db-shm
+   ```
+4. Redéployer la version de code correspondant au schéma restauré.
+
 ---
 
 ## Rate limiting in-memory

@@ -19,6 +19,7 @@ Trois interfaces sont disponibles :
 5. [Rapports d'usage](#5-rapports-dusage)
 6. [Contrôle des modèles](#6-contrôle-des-modèles)
 7. [Référence API REST admin](#7-référence-api-rest-admin)
+8. [Diagnostic préflight — `doctor`](#8-diagnostic-préflight--doctor)
 
 ---
 
@@ -176,6 +177,92 @@ curl -s -X PATCH "$GW/admin/users/carol" \
   -H "Content-Type: application/json" \
   -d '{"is_active": false}'
 ```
+
+### Anonymiser un utilisateur (droit à l'effacement RGPD)
+
+C'est le chemin d'exercice du **droit à l'effacement** (RGPD art. 17). L'opération
+est **irréversible** : aucune donnée effacée n'est récupérable.
+
+La politique retenue est l'**anonymisation**, pas la suppression de ligne. La
+ligne utilisateur est conservée pour que l'historique de facturation et d'audit
+reste exploitable, tandis que la personne cesse d'être ré-identifiable.
+
+| | Champ | Devient |
+|---|---|---|
+| **Effacé** | `users.username` | pseudonyme stable `anonymized-user:<id>` |
+| **Effacé** | `users.email` | `NULL` |
+| **Effacé** | `users.notes` | `NULL` |
+| **Effacé** | `api_keys.name` (champ libre) | `NULL` |
+| **Désactivé** | `users.is_active` | `0` — toutes les requêtes sont rejetées |
+| **Révoqué** | `api_keys.is_active` | `0` sur **toutes** les clés du compte |
+| **Conservé** | `users.id`, `users.created_at` | inchangés |
+| **Conservé** | toutes les lignes `usage_log` | inchangées |
+| **Ajouté** | `users.anonymized_at` | horodatage UTC de l'opération |
+
+**Pourquoi pas une suppression.** `usage_log.user_id` référence `users(id)` et
+`PRAGMA foreign_keys = ON` est appliqué à chaque connexion : un `DELETE FROM
+users` échouait en violation de clé étrangère dès que l'utilisateur avait servi
+une requête. Les deux alternatives ont été écartées — `ON DELETE CASCADE` fait
+disparaître l'historique de facturation, `ON DELETE SET NULL` casse les jointures
+des rapports.
+
+```bash
+# CLI — avec confirmation interactive
+llmgw anonymize-user alice
+
+# CLI — non interactif (scripts de fin d'année)
+llmgw anonymize-user alice --yes
+
+# API REST — le verbe DELETE est conservé pour les scripts existants,
+# mais son effet est une anonymisation, décrite dans la réponse.
+curl -s -X DELETE "$GW/admin/users/alice" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+```
+
+Réponse de l'API :
+
+```json
+{
+  "status": "anonymized",
+  "message": "Utilisateur anonymisé : données personnelles effacées définitivement, clés révoquées, historique d'usage conservé.",
+  "user_id": 1,
+  "anonymized_username": "anonymized-user:1",
+  "anonymized_at": "2025-03-20 14:05:11",
+  "keys_revoked": 2,
+  "keys_total": 2,
+  "erased_fields": ["username", "email", "notes", "api_keys.name"],
+  "retained": ["users.id", "users.created_at", "usage_log"]
+}
+```
+
+**Comportement à connaître :**
+
+- **Idempotent.** Une seconde anonymisation répond `200` avec
+  `"status": "already_anonymized"` et **préserve l'horodatage initial**. Notez
+  que l'ancien nom n'existe plus : reciblez le compte par son pseudonyme.
+- **Utilisateur inexistant** → `404`, et code de sortie `1` côté CLI.
+- **Nom réutilisable.** L'ancien nom d'utilisateur est libéré : recréer un compte
+  homonyme fonctionne (cas d'un étudiant qui revient). Le nouveau compte a un
+  `id` distinct et ne récupère pas l'historique de l'ancien.
+- **Visibilité.** Un compte anonymisé reste listé par `GET /admin/users` et
+  `llmgw list-users --all`, comme un compte désactivé, avec un `anonymized_at`
+  non nul qui le distingue d'une simple désactivation. Il n'est **jamais** compté
+  dans les utilisateurs actifs du dashboard.
+- **Rapports.** `GET /admin/usage` et `GET /admin/usage/summary` continuent
+  d'inclure ses requêtes, sous le pseudonyme : les totaux de facturation sont
+  inchangés. C'est l'objectif même de cette politique.
+- **Journaux.** L'opération ne journalise que l'`id` technique — ni le nom, ni
+  l'e-mail, ni les notes effacées ne réapparaissent dans les logs applicatifs.
+
+> **Désactiver ≠ anonymiser.** `disable-user` bloque l'accès en conservant toutes
+> les données et se réactive avec `enable-user`. `anonymize-user` efface les
+> données personnelles définitivement et ne s'annule pas. Pour une suspension
+> temporaire, utilisez `disable-user`.
+
+> **Purge de l'historique.** L'anonymisation conserve `usage_log` par conception.
+> Si une demande d'effacement impose de retirer aussi les lignes d'usage, la
+> purge par rétention (`purge-usage`, section 5) est l'outil approprié — elle
+> opère par ancienneté, pas par utilisateur.
 
 ---
 
@@ -365,6 +452,34 @@ curl -s "$GW/admin/status" \
 # }
 ```
 
+#### Champs de `vram_budget` selon le mode de déploiement
+
+`GET /admin/status` a le même contrat en `CLUSTER_MODE=local` et en
+`CLUSTER_MODE=cluster`. Trois champs seulement sont garantis dans les deux
+modes — `total_gb`, `used_gb`, `available_gb` — les autres sont spécifiques au
+mode et valent `null` quand ils ne s'appliquent pas.
+
+| Champ | Local | Cluster |
+|---|---|---|
+| `total_gb` | `TOTAL_VRAM_GB` de l'hôte | Somme des VRAM physiques des nœuds **ONLINE** |
+| `overhead_gb` | `VRAM_OVERHEAD_GB` | Réserve agrégée des nœuds (leur overhead **et** leur marge, en GB) |
+| `safety_margin` | `VRAM_SAFETY_MARGIN` (ratio) | `null` — ratio mono-hôte, déjà agrégé en GB dans `overhead_gb` |
+| `used_gb` | VRAM des modèles chargés localement | Somme des `used_vram_gb` des nœuds ONLINE |
+| `available_gb` | Budget net − utilisé | Somme des `available_vram_gb` annoncés par les agents |
+| `budget_net_gb` | `total_gb − overhead_gb − marge` | `used_gb + available_gb` (budget allouable annoncé) |
+| `nodes` / `nodes_online` | `null` | Nœuds configurés / actuellement ONLINE |
+| `gpu_used_mb_measured`, `vram_drift_mb` | Présents si une sonde `nvidia-smi` a réussi | `null` |
+
+En cluster, `total_gb - overhead_gb == budget_net_gb` exactement ; en local il
+faut en plus retirer `safety_margin × total_gb`, la marge n'étant pas incluse
+dans `overhead_gb`. Un nœud offline ne contribue à aucun total : cluster entièrement
+offline ⇒ tous les champs à `0.0` et `nodes_online: 0`, la route restant en 200.
+
+Les entrées de `models` portent en plus, en cluster, le nœud d'hébergement
+(`node`) et la charge live (`active_requests`) ; en local ces deux champs valent
+`null`. L'URL interne du `llama-server` n'est jamais exposée ici — elle n'est
+lisible que via `GET /admin/cluster`.
+
 ### Surveiller la VRAM GPU
 
 ```bash
@@ -461,7 +576,7 @@ Métriques exposées (noms exacts) :
 | `eva_requests_total` | counter | `model`, `status` | Requêtes par modèle et code HTTP (fenêtre 24h) |
 | `eva_tokens_total` | counter | `model`, `type` (`prompt`/`completion`) | Tokens par modèle et type (fenêtre 24h) |
 | `eva_request_latency_seconds` | gauge | `quantile` (0.5/0.95/0.99) | Percentiles de latence (fenêtre 7j) |
-| `eva_vram_used_gb` / `eva_vram_total_gb` / `eva_vram_available_gb` | gauge | — | Budget VRAM comptabilisé |
+| `eva_vram_used_gb` / `eva_vram_total_gb` / `eva_vram_available_gb` | gauge | — | Budget VRAM comptabilisé — mêmes champs que `vram_budget` de `/admin/status` ; en cluster, `eva_vram_total_gb` est la VRAM **physique** des nœuds ONLINE (le budget allouable est `budget_net_gb`) |
 | `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
 | `eva_llama_kv_cache_usage_ratio` | gauge | `model` (+ `node` en cluster) | Occupation du KV cache (0–1) |
 | `eva_llama_tokens_per_second` | gauge | `model` (+ `node`) | Débit de génération |
@@ -613,6 +728,84 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
 # → ~200  (MiB)
 ```
 
+### Déchargement et requêtes actives (409)
+
+**Invariant : un modèle qui traite une requête active n'est jamais déchargé en
+silence.** Cela vaut pour l'éviction LRU, pour l'arrêt de la gateway, et depuis
+COR-004 pour *toutes* les opérations admin qui déchargent un modèle :
+
+| Route | Décharge le modèle |
+|-------|--------------------|
+| `POST /admin/models/{id}/unload` | toujours |
+| `DELETE /admin/models/{id}` | avant la suppression du registre |
+| `PATCH /admin/models/{id}` avec `enabled: false` | oui |
+| `PATCH /admin/models/{id}` avec `llama_params` | oui (hot-reload) |
+| `POST /admin/unload` | tous les modèles chargés |
+
+Déroulé d'une de ces opérations :
+
+1. **Quarantaine** — le modèle n'admet plus aucune *nouvelle* requête (les
+   clients reçoivent un `503` temporaire, « déchargement administratif en
+   cours »). Sans cela, un flux continu de requêtes empêcherait le drain de
+   converger.
+2. **Drain borné** — la gateway attend la fin des requêtes déjà en cours, au
+   maximum `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS` (défaut **5 s**). Retour immédiat
+   si le modèle est inactif : le cas courant ne coûte rien.
+3. **Décision** :
+   - drain terminé → déchargement normal, `200` ;
+   - requêtes encore actives → **`409 Conflict`**, *rien n'est modifié* : le
+     modèle reste chargé, le registre reste intact (jamais de `enabled: false`
+     persisté sur un modèle qui continue de servir), la quarantaine est levée et
+     le modèle redevient immédiatement utilisable.
+
+```bash
+# Modèle occupé par un stream en cours
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "$GW/admin/models/llama-3.3-70b-instruct/unload" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# → 409
+# corps : {"detail": "Le modèle 'llama-3.3-70b-instruct' traite encore 2 requête(s)
+#           active(s) après 5s de drain — déchargement refusé pour ne pas
+#           interrompre les générations en cours. Réessayez plus tard, ou passez
+#           force=true pour interrompre explicitement les requêtes actives."}
+```
+
+Un `503` sur ces routes garde son sens habituel : échec technique du
+déchargement (en cluster, un agent qui n'a pas confirmé), pas un conflit.
+
+#### Forcer (`?force=true`)
+
+Le forçage est **opt-in, jamais la valeur par défaut**. Il existe pour les cas où
+une requête ne se termine jamais (client disparu, `llama-server` bloqué) et où le
+modèle serait sinon indéchargeable :
+
+```bash
+# Interrompt les générations en cours — à n'utiliser qu'en connaissance de cause
+curl -s -X POST "$GW/admin/models/llama-3.3-70b-instruct/unload?force=true" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+```
+
+`force=true` est accepté par `POST /admin/models/{id}/unload`,
+`DELETE /admin/models/{id}` et `PATCH /admin/models/{id}`. Sur un modèle inactif
+il n'a aucun effet ; chaque forçage **effectif** (requêtes réellement
+interrompues) est tracé par un log `CRITICAL` indiquant leur nombre. Il n'existe
+**pas** de forçage global sur `POST /admin/unload` : décharger modèle par modèle.
+
+En **mode cluster**, le forçage n'existe pas : les node-agents refusent tout
+modèle avec des requêtes actives, et l'orchestrateur ne tue pas un
+`llama-server` qu'il ne possède pas. Sur un modèle occupé, `?force=true` y
+répond donc `409` en précisant que le forçage est indisponible — le paramètre
+n'est jamais ignoré en silence. Sur un modèle inactif, il n'a aucun effet et le
+déchargement réussit normalement.
+
+Réglages associés (`gateway/.env`) :
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS` | `5` | Attente max des requêtes actives sur une opération admin. `0` = refus immédiat si occupé. |
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `25` | Attente max au SIGTERM. Le shutdown, lui, **force** après ce délai (la VRAM et les ports doivent être libérés avant que systemd ne tue le processus). |
+| `SHUTDOWN_DRAIN_POLL_SECONDS` | `0.2` | Granularité de poll des deux drains. |
+
 ### Décharger tous les modèles
 
 ```bash
@@ -622,16 +815,24 @@ curl -s -X POST "$GW/admin/unload" \
 # → {"message": "Tous les modèles déchargés. VRAM entièrement libérée."}
 ```
 
+Cette route répond `409` si une génération est encore active après le drain — et
+dans ce cas **aucun** modèle n'est déchargé (pas de purge partielle). Elle répond
+`503` si le déchargement n'a pas pu être confirmé.
+
 En cluster, l'orchestrateur conserve ses clients et son heartbeat après cette
-action : il peut recharger un modèle à la requête suivante. La route répond 409
-si une génération est encore active, ou 503 si un agent n'a pas confirmé le
-déchargement; elle n'annonce jamais une libération partielle comme réussie.
+action : il peut recharger un modèle à la requête suivante. Il n'annonce jamais
+une libération partielle comme réussie.
 
 ### Activer / désactiver un modèle du registre
 
 Désactiver un modèle le rend **invisible aux clients** (`GET /v1/models` ne le liste plus)
 et les requêtes vers cet ID reçoivent un `403`. Si le modèle est actuellement chargé,
 il est automatiquement déchargé.
+
+> Le PATCH répond `409` et **ne modifie pas le registre** si le modèle traite
+> encore des requêtes après le drain — le modèle reste `enabled: true` et
+> continue de servir. Voir
+> [Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
 
 ```bash
 # Désactiver le modèle 8B (ex: fichier .gguf absent)
@@ -652,9 +853,14 @@ curl -s -X PATCH "$GW/admin/models/llama-3.1-8b-instruct" \
 Il est possible de modifier **à chaud** les paramètres de lancement d'un modèle
 (`ctx_size`, `parallel`, `cpu_moe`, etc.) sans redémarrer le gateway.
 
-Le PATCH déclenche un **hot-reload** : le modèle est déchargé immédiatement
-(sa VRAM est libérée), le registre est mis à jour, et le prochain appel relancera
+Le PATCH déclenche un **hot-reload** : le modèle est déchargé (sa VRAM est
+libérée), le registre est mis à jour, et le prochain appel relancera
 llama-server avec les nouveaux paramètres.
+
+> Comme tout déchargement admin, le hot-reload attend la fin des requêtes en
+> cours puis répond `409` sans rien modifier si elles n'ont pas terminé. Les
+> anciens paramètres restent alors en vigueur. Voir
+> [Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
 
 > **`llama_params` utilise une sémantique de remplacement complet.** Tous les champs
 > doivent être fournis — il n'y a pas de merge partiel. Récupérez les valeurs actuelles
@@ -847,6 +1053,12 @@ curl -s -X DELETE "$GW/admin/models/qwen2.5-32b-instruct" \
 # → {"message": "Modèle 'qwen2.5-32b-instruct' supprimé du registre."}
 ```
 
+`DELETE` décharge lui-même le modèle si nécessaire : l'étape `unload` ci-dessus
+n'est qu'une commodité. En revanche, si le modèle traite encore des requêtes, le
+`DELETE` répond `409` et **l'entrée reste dans le registre** — jamais de
+suppression partielle. Voir
+[Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
+
 ### Redémarrer le service
 
 ```bash
@@ -879,7 +1091,7 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 | `GET` | `/admin/users` | Lister tous les utilisateurs |
 | `GET` | `/admin/users/{username}` | Détail d'un utilisateur |
 | `PATCH` | `/admin/users/{username}` | Modifier un utilisateur |
-| `DELETE` | `/admin/users/{username}` | Supprimer un utilisateur (**destructif / irréversible**) |
+| `DELETE` | `/admin/users/{username}` | **Anonymiser** un utilisateur — RGPD, **irréversible**. La ligne et l'historique `usage_log` sont conservés, les données personnelles effacées, les clés révoquées ([détail](#anonymiser-un-utilisateur-droit-à-leffacement-rgpd)) |
 
 ### Clés API
 
@@ -895,10 +1107,14 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 |---------|-------|-------------|
 | `GET` | `/admin/models` | Lister tous les modèles (registre + état live) |
 | `POST` | `/admin/models` | Enregistrer un nouveau modèle (persiste dans models.yaml) |
-| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle — `enabled`, `vram_gb`, `description`, `llama_params` (hot-reload) |
-| `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (seulement si non chargé) |
+| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle — `enabled`, `vram_gb`, `description`, `llama_params` (hot-reload) — `?force=true` optionnel |
+| `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (déchargé au préalable) — `?force=true` optionnel |
 | `POST` | `/admin/models/{model_id}/load` | Pré-charger un modèle en VRAM |
-| `POST` | `/admin/models/{model_id}/unload` | Décharger un modèle spécifique |
+| `POST` | `/admin/models/{model_id}/unload` | Décharger un modèle spécifique — `?force=true` optionnel |
+
+Les routes marquées `?force=true` déchargent le modèle : elles répondent `409` si
+une génération est encore en cours. Voir
+[Déchargement et requêtes actives](#déchargement-et-requêtes-actives-409).
 
 **Exemple — lister les modèles avec état live :**
 
@@ -932,7 +1148,7 @@ curl -s "$GW/admin/models" \
 | Méthode | Route | Description |
 |---------|-------|-------------|
 | `GET` | `/admin/status` | Budget VRAM + état de tous les modèles |
-| `POST` | `/admin/unload` | Décharger tous les modèles chargés |
+| `POST` | `/admin/unload` | Décharger tous les modèles chargés (`409` si une génération est active) |
 
 ### Endpoints d'inférence exposés aux utilisateurs
 
@@ -1014,6 +1230,297 @@ curl -s "$GW/admin/metrics/overview" \
 #   }
 # }
 ```
+
+---
+
+## 8. Diagnostic préflight — `doctor`
+
+`doctor` inspecte l'**hôte** et la **configuration** et dit, avant tout
+démarrage, si la gateway pourra servir. Il ne contacte aucun service, ne charge
+aucun modèle et fonctionne donc **avant le premier `systemctl start`** comme
+pendant un incident.
+
+Quatre usages :
+
+- manuellement, après `install.sh` et avant d'activer le service ;
+- depuis `install.sh`, avant activation ;
+- depuis `update.sh`, avant et après bascule de version ;
+- lors d'un incident, pour distinguer un problème d'hôte d'un problème de code.
+
+À ne pas confondre avec les deux autres sondes :
+
+| Outil | Question à laquelle il répond | Service requis |
+|---|---|---|
+| `GET /health` | Le process répond-il ? | oui |
+| `GET /ready` | La gateway peut-elle servir maintenant ? | oui |
+| `doctor` | L'hôte et la configuration sont-ils corrects ? | **non** |
+
+### Usage
+
+```bash
+# Depuis le répertoire d'installation, avec le venv du service
+cd /opt/llm-gateway
+
+# Diagnostic complet, sortie humaine
+sudo venv/bin/python cli.py doctor
+
+# Sortie JSON (schéma stable) pour un script de déploiement
+sudo venv/bin/python cli.py doctor --json
+
+# Cibler explicitement des artefacts (utile en staging ou hors installation standard)
+sudo venv/bin/python cli.py doctor \
+    --env-file /etc/llm-gateway/env \
+    --nginx-conf /etc/nginx/sites-available/llm-gateway \
+    --systemd-unit /etc/systemd/system/llm-gateway.service
+
+# Vérifier en plus l'intégrité SHA-256 des GGUF — COÛTEUX (lecture intégrale)
+sudo venv/bin/python cli.py doctor --verify-hashes
+
+# Traiter les avertissements comme bloquants (recette de mise en production)
+sudo venv/bin/python cli.py doctor --strict
+```
+
+| Option | Effet | Défaut |
+|---|---|---|
+| `--json` | Document JSON au lieu du rapport texte | texte |
+| `--env-file` | EnvironmentFile à valider | `EnvironmentFile=` lu dans l'unité systemd, sinon `/etc/llm-gateway/env`, sinon `./.env` |
+| `--nginx-conf` | Configuration nginx à contrôler | `/etc/nginx/sites-available/llm-gateway` |
+| `--systemd-unit` | Unité systemd à contrôler | `/etc/systemd/system/llm-gateway.service` |
+| `--verify-hashes` | Calcule le SHA-256 des GGUF déclarés | désactivé |
+| `--strict` | Les avertissements deviennent bloquants | désactivé |
+
+`doctor` valide **le fichier d'environnement que systemd donnera au service**, pas
+l'environnement du shell appelant : une variable exportée dans votre session ne
+peut ni masquer ni compléter le fichier ciblé.
+
+**Sans `sudo`**, les contrôles qui exigent des droits (lecture du fichier de
+secrets, de la clé TLS) dégradent en `skip`/`warn` avec la raison, jamais en
+faux négatif silencieux.
+
+### Grille des exit codes
+
+| Code | Signification | Conduite à tenir |
+|---|---|---|
+| `0` | Tous les contrôles passent — aucun échec, aucun avertissement | démarrer / basculer |
+| `1` | Au moins un contrôle **critique** en échec | **ne pas** démarrer ni basculer ; corriger d'abord |
+| `2` | *Réservé* : erreur d'usage de la CLI (option inconnue) | corriger la ligne de commande |
+| `3` | Avertissements seulement, aucun échec bloquant | démarrage possible, dette à traiter |
+| `4` | Erreur interne de `doctor` | signaler ; ne pas conclure sur l'état de l'hôte |
+
+`2` n'est pas utilisé pour les avertissements précisément parce que Typer/Click
+le renvoie déjà pour une erreur d'usage : un script qui accepterait `2` ne
+distinguerait plus « hôte imparfait » de « faute de frappe dans le script ».
+
+Dans un script de déploiement, la lecture correcte est donc :
+
+```bash
+set +e
+sudo venv/bin/python cli.py doctor --json > /tmp/doctor.json
+status=$?
+set -e
+case "$status" in
+    0) echo "Hôte conforme." ;;
+    3) echo "Avertissements — voir /tmp/doctor.json." ;;
+    *) echo "Diagnostic bloquant (code $status) — arrêt." >&2; exit 1 ;;
+esac
+```
+
+### Contrôles effectués
+
+Statut par contrôle : `pass`, `warn`, `fail`, `skip`. Seul un `fail` **critique**
+bloque (exit 1) ; un `skip` n'est jamais un échec.
+
+Contrôles structurels, partagés avec `GET /ready` (module `readiness.py`) :
+
+| Contrôle | Ce qu'il vérifie | Mode cluster |
+|---|---|---|
+| `models_config` | `models.yaml` présent et lisible | contrôlé |
+| `enabled_models` | au moins un modèle activé | contrôlé |
+| `secrets` | secrets non laissés à `CHANGE_ME_*` (avertissement) | contrôlé |
+| `llama_server_binary` | binaire présent et exécutable | `skip` (vit sur les nœuds) |
+| `model_files` | GGUF et projecteurs présents et lisibles | `skip` (vivent sur les nœuds) |
+| `database` | répertoire et fichier SQLite inscriptibles | contrôlé |
+| `log_dir` | répertoire de logs inscriptible (avertissement) | contrôlé |
+| `vram_budget_fit` | au moins un modèle activé tient dans le budget VRAM | `skip` (budget des nœuds) |
+| `cluster_nodes_config` | `nodes.yaml` présent et lisible | contrôlé |
+| `cluster_nodes_online` | heartbeat des nœuds | **toujours `skip`** : exige un service vivant |
+| `serving_capacity` | capacité de service immédiate | **toujours `skip`** : exige un service vivant |
+
+Contrôles propres à `doctor` :
+
+| Contrôle | Ce qu'il vérifie | Bloquant | Mode cluster |
+|---|---|---|---|
+| `config_env_file` | permissions du fichier de secrets (attendu 0600/0640), lisibilité par le `User=` de l'unité, chargement de la configuration | oui | contrôlé |
+| `models_registry` | `models.yaml` se **parse** réellement : chemins absolus, `.gguf`, allowlist `ALLOWED_MODEL_DIRS`, paramètres `llama.cpp` valides | oui | contrôlé |
+| `database_permissions` | base, `-wal`, `-shm` et répertoire non exposés (jugé avec la traversée des parents) | oui si atteignable par tous | contrôlé |
+| `disk_space` | espace libre sur les volumes de la base et des logs | oui sous 0,5 Go | contrôlé |
+| `llama_server_version` | `llama-server --version` confronté à `LLAMA_SERVER_MIN_BUILD` | oui | `skip` |
+| `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability | non (avertissement) | `skip` |
+| `vram_detected` | budget VRAM net vs VRAM des devices **réellement exposés par `CUDA_VISIBLE_DEVICES`** | oui si le budget net dépasse le matériel ; avertissement si `TOTAL_VRAM_GB` est seulement nominalement supérieur | `skip` |
+| `model_artifacts` | taille et plausibilité des GGUF/mmproj ; intégrité SHA-256 **seulement** avec `--verify-hashes` | oui | `skip` |
+| `port_pool` | pool `BASE_LLAMA_PORT … +MAX_LOADED_MODELS-1` libre, pas de collision avec `GATEWAY_PORT` | oui pour la collision, avertissement pour un port occupé | `skip` |
+| `nginx_timeouts` | `proxy_read_timeout` des blocs proxifiants vs `MODEL_LOAD_TIMEOUT_SECONDS + 10` | non (avertissement) | contrôlé |
+| `tls_certificate` | certificat **fourni** : présence, lisibilité, expiration, correspondance au `server_name` ; permissions de la clé | oui | contrôlé |
+| `systemd_limits` | politique mémoire déclarée, `TasksMax` dérivé de `MAX_LOADED_MODELS`, working set des modèles `cpu_moe` sous `MemoryHigh`, répertoires de modèles déclarés | oui pour le profil mémoire | contrôlé |
+| `cluster_agent_secret` | `AGENT_SECRET` présent et ≥ 32 caractères (sans quoi le service refuse de démarrer) | oui | `skip` en local |
+| `cluster_nodes_inventory` | `nodes.yaml` se **parse**, au moins un nœud, `tls_verify` actif | oui | `skip` en local |
+
+Points de conception à connaître :
+
+- **Aucune empreinte SHA-256 n'est calculée par défaut.** Un catalogue de
+  production pèse plusieurs centaines de gigaoctets : hacher à chaque diagnostic
+  saturerait le stockage. `doctor` se limite à des `stat` ; l'intégrité est
+  réservée à `--verify-hashes`.
+- **Politique fail-closed de version.** Si `LLAMA_SERVER_MIN_BUILD > 0` mais que
+  la version du binaire est illisible, le contrôle **échoue** : on ne peut pas
+  prouver que le binaire est patché. Avec `LLAMA_SERVER_MIN_BUILD=0`, `doctor`
+  avertit que le garde-fou supply-chain est inerte.
+- **`nvidia-smi` absent** n'est pas un échec bloquant : en mode cluster c'est
+  normal (`skip`), en mode local c'est un avertissement (un hôte de
+  développement sans GPU doit rester diagnosticable).
+- **VRAM : le critère bloquant est le budget NET**, c'est-à-dire
+  `TOTAL_VRAM_GB - VRAM_OVERHEAD_GB - marge`, puisque c'est lui que le contrôle
+  d'admission distribue. Un `TOTAL_VRAM_GB` nominal légèrement supérieur à la
+  VRAM utilisable (48 « Go » commerciaux contre 46068 MiB exposés sur une L40S)
+  n'est qu'un avertissement : la marge absorbe l'écart, mais il la ronge.
+- **Un port du pool occupé n'est qu'un avertissement**, car `update.sh` appelle
+  `doctor` après bascule, où un port peut être tenu par un modèle légitimement
+  chargé.
+- **Les incohérences nginx sont signalées, pas corrigées** : `doctor` ne modifie
+  aucun fichier.
+
+### Non-divulgation
+
+Aucun secret, token Hugging Face ou valeur sensible n'apparaît dans le rapport,
+en sortie humaine comme en JSON :
+
+- les contrôles ne citent que le **nom** d'un secret, jamais sa valeur ;
+- tout message passe par une passe de rédaction alimentée par les variables du
+  fichier d'environnement dont le nom évoque un secret (`*SECRET*`, `*TOKEN*`,
+  `*KEY*`, `*PASSWORD*`) : même une valeur arrivée par un chemin de fichier ou
+  par un message d'erreur de validation est remplacée par `***` ;
+- aucun secret ne transite par `argv` (donc jamais visible dans `ps`) : les
+  seuls sous-processus lancés sont `llama-server --version` et
+  `nvidia-smi --query-gpu=…`.
+
+En revanche, les **chemins de fichiers sont conservés** : sans eux un diagnostic
+n'est pas actionnable. `doctor` est une commande locale exécutée par un
+opérateur qui a déjà accès à ces fichiers — contrairement au corps public de
+`GET /ready`, qui n'expose que des codes de contrôle.
+
+### Exemple de sortie humaine
+
+Valeurs et chemins fictifs.
+
+```text
+EVARuntime doctor — mode local
+  Configuration : /etc/llm-gateway/env
+  Généré le     : 2026-07-30T09:15:04+00:00
+
+  [ OK ] config_env_file          Fichier de secrets /etc/llm-gateway/env correctement protégé (mode 0640).
+  [ OK ] models_config            Registre des modèles présent et lisible.
+  [ OK ] models_registry          Registre chargé et validé : 5 modèle(s) déclaré(s), 3 activé(s).
+  [ OK ] enabled_models           3 modèle(s) activé(s) dans le registre.
+  [ OK ] secrets                  Aucun secret laissé à sa valeur d'exemple.
+  [ OK ] database                 Base de données inscriptible.
+  [ OK ] database_permissions     Base et fichiers WAL correctement protégés (2 fichier(s) contrôlé(s)).
+  [ OK ] log_dir                  Répertoire de logs inscriptible.
+  [ OK ] disk_space               Espace disque suffisant — base (/var/lib/llm-gateway) : 812.4 Go libres.
+  [ OK ] llama_server_binary      Binaire llama-server présent et exécutable.
+  [WARN] llama_server_version     llama-server build 6120 détecté, mais LLAMA_SERVER_MIN_BUILD=0 : aucun plancher
+                                  de version n'est imposé. Fixez LLAMA_SERVER_MIN_BUILD=6120 (ou le premier build
+                                  patché connu) pour activer le garde-fou supply-chain.
+  [ OK ] gpu_inventory            1 GPU détecté(s) — GPU 0: NVIDIA L40S, 44.4 Go, driver 550.54.15, compute 8.9.
+  [ OK ] vram_detected            1/1 GPU exposé(s) par CUDA_VISIBLE_DEVICES=0 → 44.4 Go détectés, TOTAL_VRAM_GB=44.0,
+                                  budget net 39.8 Go.
+  [ OK ] vram_budget_fit          Au moins un modèle activé tient dans le budget VRAM net (39.8 GB).
+  [ OK ] model_files              Artefacts présents et lisibles pour les 3 modèle(s) activé(s).
+  [ OK ] model_artifacts          4 artefact(s) mesuré(s) pour 3 modèle(s) activé(s), 77.5 Go au total, tailles plausibles.
+  [ OK ] port_pool                Pool de ports 8081–8085 entièrement libre sur 127.0.0.1 (5 modèle(s) simultané(s)).
+  [WARN] nginx_timeouts           Timeout nginx trop court pour chargement admin : proxy_read_timeout 30s sur
+                                  « /admin/ », alors que la gateway peut légitimement attendre 310s
+                                  (MODEL_LOAD_TIMEOUT_SECONDS + 10s, pire modèle activé). Le client recevra 504
+                                  alors que le chargement réussit côté serveur. Portez proxy_read_timeout et
+                                  proxy_send_timeout au-delà de 310s sur ce bloc (item COR-009/EVA-004).
+  [ OK ] tls_certificate          Certificat TLS fourni valide et clé protégée (/etc/ssl/certs/llm-gateway.crt).
+  [ OK ] systemd_limits           Limites de llm-gateway.service cohérentes avec la configuration
+                                  (MemoryHigh=80% → 102 Go, RAM hôte 128 Go).
+  [SKIP] cluster_nodes_config     Mode local : aucun inventaire de nœuds requis.
+  [SKIP] cluster_agent_secret     Mode local : aucun secret partagé orchestrateur ↔ nœuds.
+  [SKIP] cluster_nodes_inventory  Mode local : aucun inventaire de nœuds requis.
+  [SKIP] cluster_nodes_online     Heartbeat des nœuds non évaluable hors process vivant : doctor ne contacte aucun
+                                  node-agent. Utilisez GET /ready ou GET /admin/status.
+  [SKIP] serving_capacity         Capacité de service non évaluable hors process vivant : doctor n'interroge aucun
+                                  service. Utilisez GET /ready (COR-005) ou le smoke test (COR-006).
+
+  Résumé  : 17 conforme(s), 2 avertissement(s), 0 échec(s) dont 0 bloquant(s), 5 ignoré(s)
+  Verdict : AVERTISSEMENTS SEULEMENT
+  Exit code : 3
+```
+
+Les messages longs sont sur une seule ligne dans la sortie réelle (repliés
+ci-dessus pour la lisibilité du document).
+
+### Exemple de sortie JSON
+
+Extrait — valeurs fictives. Le document complet contient une entrée par
+contrôle, dans le même ordre que la sortie humaine.
+
+```json
+{
+  "tool": "evaruntime-doctor",
+  "schema_version": 1,
+  "generated_at": "2026-07-30T09:15:04+00:00",
+  "mode": "local",
+  "config_source": "/etc/llm-gateway/env",
+  "strict": false,
+  "status": "fail",
+  "exit_code": 1,
+  "summary": {
+    "pass": 15,
+    "warn": 2,
+    "fail": 1,
+    "skip": 6,
+    "blocking": 1
+  },
+  "checks": [
+    {
+      "name": "config_env_file",
+      "status": "pass",
+      "code": "ok",
+      "message": "Fichier de secrets /etc/llm-gateway/env correctement protégé (mode 0640).",
+      "critical": true
+    },
+    {
+      "name": "vram_detected",
+      "status": "fail",
+      "code": "vram_budget_exceeds_hardware",
+      "message": "1/2 GPU exposé(s) par CUDA_VISIBLE_DEVICES=0 → 44.4 Go détectés, TOTAL_VRAM_GB=88.0, budget net 81.6 Go. Le contrôle d'admission peut distribuer plus de VRAM qu'il n'en existe : les chargements échoueront en cours de route, sans qu'aucune éviction n'y remédie. Abaissez TOTAL_VRAM_GB à 44.4 au plus (ou relevez VRAM_OVERHEAD_GB / VRAM_SAFETY_MARGIN).",
+      "critical": true
+    },
+    {
+      "name": "serving_capacity",
+      "status": "skip",
+      "code": "service_not_running",
+      "message": "Capacité de service non évaluable hors process vivant : doctor n'interroge aucun service. Utilisez GET /ready (COR-005) ou le smoke test (COR-006).",
+      "critical": false
+    }
+  ],
+  "reason": "total_vram_gb_overcommitted"
+}
+```
+
+Champs stables, garantis par les tests (`gateway/tests/test_doctor.py`) :
+`tool`, `schema_version`, `generated_at`, `mode`, `config_source`, `strict`,
+`status` (`ok` / `warn` / `fail`), `exit_code`, `summary`
+(`pass`/`warn`/`fail`/`skip`/`blocking`), `checks[]`
+(`name`/`status`/`code`/`message`/`critical`) et `reason` (présent uniquement
+s'il existe un contrôle bloquant, contenant le `code` du premier d'entre eux
+dans l'ordre du rapport). Les `code` sont des identifiants machine stables :
+c'est sur eux qu'un script doit s'appuyer, jamais sur le texte du `message`.
+
+Toute évolution non rétro-compatible de ce document incrémente
+`schema_version`.
 
 ---
 

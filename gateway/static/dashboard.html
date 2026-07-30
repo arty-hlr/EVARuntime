@@ -1063,14 +1063,14 @@
   </div>
 </div>
 
-<!-- Delete User Confirm -->
+<!-- Anonymize User Confirm (COR-002 : la route DELETE anonymise, elle ne supprime pas) -->
 <div id="confirm-user-del-overlay" class="confirm-overlay hidden" onclick="if(event.target===this)cancelDeleteUser()">
   <div class="confirm-card">
-    <h4>Delete user?</h4>
-    <p>User <strong id="confirm-user-del-name" style="font-family:'JetBrains Mono',monospace;font-size:12px"></strong> and all their API keys will be permanently deleted. This cannot be undone.</p>
+    <h4>Anonymize user?</h4>
+    <p>User <strong id="confirm-user-del-name" style="font-family:'JetBrains Mono',monospace;font-size:12px"></strong> will be <strong>anonymized</strong> — GDPR right to erasure. Personal data (username, email, notes, API key names) is erased permanently and all their API keys are revoked. The usage history is retained under a pseudonym so billing and audit stay consistent. This cannot be undone.</p>
     <div class="confirm-actions">
       <button class="btn-cancel-del" onclick="cancelDeleteUser()">Cancel</button>
-      <button class="btn-confirm-del" id="btn-confirm-user-del" onclick="doConfirmDeleteUser()">Delete</button>
+      <button class="btn-confirm-del" id="btn-confirm-user-del" onclick="doConfirmDeleteUser()">Anonymize</button>
     </div>
   </div>
 </div>
@@ -2541,7 +2541,7 @@ function renderUsersManagement(users) {
          <div class="action-group">
            <button class="btn-action" onclick="openEditUser('${un}')" title="Edit user">${EDIT_SVG} Edit</button>
            <button class="btn-action" onclick="openKeysModal('${un}')" title="Manage API keys">${KEY_SVG} Keys</button>
-           <button class="btn-action danger" onclick="confirmDeleteUser('${un}')" title="Delete user">${USR_DEL_SVG} Delete</button>
+           <button class="btn-action danger" onclick="confirmDeleteUser('${un}')" title="Anonymize user (GDPR right to erasure, irreversible)">${USR_DEL_SVG} Anonymize</button>
          </div>
        </td>
      </tr>`;
@@ -2800,16 +2800,24 @@ async function doConfirmDeleteUser() {
   if (!_pendingDeleteUser) return;
   const username = _pendingDeleteUser;
   const btn = document.getElementById('btn-confirm-user-del');
-  btn.disabled = true; btn.textContent = 'Deleting…';
+  btn.disabled = true; btn.textContent = 'Anonymizing…';
   cancelDeleteUser();
   try {
-    await apiDel('users/' + encodeURIComponent(username));
-    showToast("User '" + username + "' deleted.", 'ok');
+    // La route répond UserAnonymizeResponse : on annonce ce qui s'est réellement
+    // passé (pseudonyme, clés révoquées), jamais « deleted ».
+    const data = await apiDel('users/' + encodeURIComponent(username));
+    const alias = data.anonymized_username || 'pseudonym';
+    const revoked = (data.keys_revoked != null) ? data.keys_revoked : 0;
+    showToast(
+      data.status === 'already_anonymized'
+        ? "User was already anonymized (" + alias + ")."
+        : "User anonymized as '" + alias + "' — " + revoked + " key(s) revoked, usage history retained.",
+      'ok');
     await fetchUsersManagement();
   } catch(e) {
-    showToast('Delete failed: ' + (e.detail || e.message), 'error');
+    showToast('Anonymize failed: ' + (e.detail || e.message), 'error');
   } finally {
-    btn.disabled = false; btn.textContent = 'Delete';
+    btn.disabled = false; btn.textContent = 'Anonymize';
   }
 }
 

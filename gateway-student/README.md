@@ -119,8 +119,11 @@ python cli.py set-quota alice --rpm 20 --daily-tokens 200000 --hourly-tokens 300
 python cli.py deactivate-student alice   # suspension immédiate
 python cli.py activate-student alice
 
-# Supprimer (RGPD)
-python cli.py delete-student alice --yes
+# Anonymiser — droit à l'effacement RGPD, IRRÉVERSIBLE.
+# Efface username/email/notes et le nom des clés, révoque toutes les clés,
+# CONSERVE la ligne et l'historique usage_log (rapports agrégés préservés).
+# `delete-student` reste un alias obsolète de cette commande.
+python cli.py anonymize-student alice --yes
 ```
 
 ### Gestion des clés API

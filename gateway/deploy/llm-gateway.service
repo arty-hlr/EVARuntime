@@ -28,8 +28,20 @@ ExecStart=/opt/llm-gateway/venv/bin/uvicorn \
     --no-use-colors
 
 # Limites de ressources
+# LimitNOFILE : la gateway multiplexe httpx (pool par llama-server) + sockets
+# clients + SQLite ; chaque llama-server ouvre son GGUF (jusqu'à 4 shards pour
+# MiniMax) et ses sockets. 65536 couvre MAX_LOADED_MODELS=5 avec 10x de marge.
 LimitNOFILE=65536
+# LimitNPROC : RLIMIT_NPROC de l'utilisateur llmservice. Au pire ~64 threads par
+# llama-server (threads + threads_http + threads internes CUDA) x 5 modèles,
+# plus les threads de la gateway. 4096 est largement au-dessus du besoin.
 LimitNPROC=4096
+# LimitMEMLOCK volontairement laissé au défaut : `build_llama_cmd` ne passe PAS
+# `--mlock`, le GGUF est lu via mmap (pages propres, réclamables — cf. bloc
+# mémoire plus bas). Si un opérateur ajoute `--mlock`, il devra à la fois
+# relever LimitMEMLOCK=infinity ET garantir que le modèle entier tient en RAM :
+# avec mlock, les pages ne sont plus réclamables et MemoryMax devient un vrai
+# plafond dur. Ne pas relever cette limite « au cas où ».
 
 # ── Durcissement sécurité (aligné sur gateway-student, adapté à l'accès GPU) ──
 # La gateway lance llama-server en sous-processus (create_subprocess_exec,
@@ -39,7 +51,15 @@ LimitNPROC=4096
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/llm-gateway /var/log/llm-gateway /models /data/models
+# Chemins d'état obligatoires (créés par install.sh) — l'absence est une erreur.
+ReadWritePaths=/var/lib/llm-gateway /var/log/llm-gateway
+# Répertoires de modèles. Préfixe « - » = ignoré s'il n'existe pas : avec
+# ProtectSystem=strict, un ReadWritePaths non préfixé qui pointe vers un
+# répertoire absent fait ÉCHOUER le démarrage de l'unité. install.sh ne crée que
+# /models ; /data/models n'existe que sur les hôtes qui l'ont provisionné (les
+# entrées MiniMax et Qwen3.5 de models.yaml y pointent). Ajouter ici tout
+# nouveau répertoire déclaré dans models.yaml (cf. docs/deployment.md §15).
+ReadWritePaths=-/models -/data/models
 # Pas de ProtectHome=true car le user n'a pas de home
 
 # Protections noyau / système — sûres pour le GPU (n'affectent pas /dev/nvidia*)
@@ -68,6 +88,13 @@ LockPersonality=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug
+# Conflit connu, durcissement CONSERVÉ : ~@resources bloque set_mempolicy, mbind,
+# migrate_pages, move_pages et sched_setaffinity. `build_llama_cmd` ne passe pas
+# `--numa`, donc llama.cpp n'emprunte pas ces chemins aujourd'hui et aucun modèle
+# approuvé n'est bloqué. En revanche, sur un hôte bi-socket, le placement NUMA
+# (`--numa distribute`) serait utile aux modèles `cpu_moe` : il faudrait alors
+# lever ~@resources — décision de sécurité explicite, à ne pas prendre en
+# passant. Voir docs/deployment.md §15.
 
 # À VALIDER en staging avant prod : DeviceAllow restreint l'accès aux nœuds
 # devices. La liste ci-dessous couvre les devices NVIDIA usuels + DRI. Si votre
@@ -86,15 +113,64 @@ DeviceAllow=char-nvidia-uvm rw
 DeviceAllow=/dev/dri rw
 DeviceAllow=char-drm rw
 
-# À VALIDER en staging avant prod : limites mémoire/tâches. MemoryMax doit être
-# supérieur à l'empreinte RAM de la gateway + tous les llama-server enfants (les
-# poids modèle sont en VRAM, mais le mmap GGUF, le KV host, et les buffers HTTP
-# consomment de la RAM). Dimensionner selon le GPU et le nombre de modèles
-# chargés simultanément (MAX_LOADED_MODELS). Valeurs de départ prudentes pour un
-# hôte L40S 48 Go avec ~128 Go de RAM ; AJUSTER à la charge réelle.
-# MemoryHigh déclenche une pression douce avant le hard-kill de MemoryMax.
-MemoryHigh=48G
-MemoryMax=64G
+# ── Limites mémoire — dérivées du profil de modèles ACTIVÉS ───────────────────
+# Les llama-server sont des ENFANTS de ce service : même cgroup, donc leur
+# mémoire est comptée dans MemoryHigh/MemoryMax. Ce que ces limites doivent
+# couvrir :
+#   • le processus gateway lui-même : ~0.3 Go ;
+#   • par llama-server chargé : ~0.5 à 1 Go de RSS (allocations hôte CUDA,
+#     buffers épinglés proportionnels à batch/ubatch, threads HTTP) ;
+#   • le page cache du mmap GGUF, imputé à CE cgroup.
+#
+# Le page cache est le point qui compte, et il se comporte de deux façons :
+#   • modèle entièrement offloadé (-ngl 999 SANS cpu_moe) : les tenseurs sont
+#     recopiés en VRAM au chargement, les pages mmap deviennent propres et
+#     jetables. Coût transitoire au chargement ≈ taille du GGUF, coût résident
+#     ≈ 0. Le KV cache suit les couches, donc il est en VRAM, pas ici :
+#     ctx_size / parallel / cache_type_k|v dimensionnent la VRAM, pas la RAM.
+#   • modèle MoE avec `cpu_moe: true` : les tenseurs d'experts FFN restent côté
+#     CPU et sont lus DEPUIS le mmap à chaque token. Ils doivent rester
+#     résidents en RAM hôte pour la durée de vie du modèle.
+#
+# Conséquence, et c'est la raison de ce bloc : une limite inférieure au working
+# set d'un modèle `cpu_moe` ne provoque pas nécessairement d'OOM-kill (les pages
+# mmap propres sont réclamables), mais elle force le noyau à les recycler en
+# boucle → refault NVMe à chaque token, TTFT et débit effondrés, sans aucune
+# erreur visible. La limite doit donc être dérivée des modèles ACTIVÉS dans
+# models.yaml, jamais d'un chiffre arbitraire.
+#
+# Pourquoi des POURCENTAGES et non des valeurs absolues : cette unité est un
+# artefact versionné, alors que le dimensionnement mémoire est une propriété de
+# l'hôte. 80 % / 90 % de la RAM physique laissent la marge nécessaire à l'OS sans
+# jamais borner le working set légitime d'un hôte correctement dimensionné.
+# La table « modèle → RAM hôte requise → VRAM requise » et la procédure
+# d'activation d'un nouveau modèle sont dans docs/deployment.md §15 ; le test
+# gateway/tests/test_deploy_memory_profiles.py vérifie la cohérence entre ce
+# fichier et models.yaml.
+#
+# RÈGLE : un profil de modèles qui ne tient pas dans 80 % de la RAM de l'hôte se
+# refuse dans models.yaml (`enabled: false`), il ne s'absorbe PAS en relevant
+# cette limite. C'est le cas de `minimax-m2.7` (~248 Go de GGUF, ~236 Go
+# d'experts résidents en RAM hôte) : il exige un hôte ≥ 320 Go de RAM sous
+# MemoryHigh=80 % et reste donc désactivé par défaut dans models.yaml.
+#
+# MemoryHigh = pression douce (reclaim + throttle) : comportement adapté à des
+# pages mmap réclamables. MemoryMax = garde-fou dur contre une fuite de mémoire
+# anonyme, délibérément placé au-dessus de tout working set légitime.
+MemoryHigh=80%
+MemoryMax=90%
+# Ne jamais swapper. Recycler une page mmap PROPRE coûte un refault NVMe ;
+# swapper une allocation anonyme de llama.cpp coûte une écriture PUIS une
+# lecture, et fait s'effondrer le TTFT de façon durable.
+MemorySwapMax=0
+# Si le noyau tue malgré tout un llama-server, ne pas laisser le service avec un
+# modèle compté « chargé » et de la VRAM orpheline : arrêter l'unité et laisser
+# Restart=on-failure repartir sur un état propre. C'est déjà le défaut
+# (DefaultOOMPolicy=stop) — rendu explicite parce qu'on en dépend.
+OOMPolicy=stop
+# TasksMax : ~64 tâches par llama-server (threads + threads_http + threads
+# internes CUDA) x MAX_LOADED_MODELS=5, plus les threads de la gateway → ~400 au
+# pire. 4096 laisse 10x de marge sans autoriser un fork-bomb.
 TasksMax=4096
 
 # Restart automatique en cas d'erreur

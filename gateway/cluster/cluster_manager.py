@@ -1144,18 +1144,25 @@ class ClusterManager:
         """
         Retourne l'état agrégé pour /admin/status — même format que LocalModelManager.
         """
-        # Seuls les nœuds ONLINE contribuent à la readiness/capacité. Le
-        # total effectif est used + available annoncé (après overhead/marge),
-        # pas la VRAM physique brute.
-        used_gb = sum(
-            s.last_health.used_vram_gb for s in self._nodes.values()
+        # Seuls les nœuds ONLINE contribuent à la readiness/capacité.
+        #
+        # Le budget NET (allouable aux modèles) est used + available annoncé par
+        # les agents, donc déjà après leur overhead et leur marge — jamais la
+        # VRAM physique brute. On expose en plus le total physique et la réserve
+        # agrégée pour tenir la même arithmétique qu'en local :
+        #   total_gb - overhead_gb == budget_net_gb
+        online = [
+            s.last_health for s in self._nodes.values()
             if s.online and s.last_health
-        )
-        available_gb = sum(
-            s.last_health.available_vram_gb for s in self._nodes.values()
-            if s.online and s.last_health
-        )
-        total_gb = used_gb + available_gb
+        ]
+        used_gb = sum(h.used_vram_gb for h in online)
+        available_gb = sum(h.available_vram_gb for h in online)
+        budget_net_gb = used_gb + available_gb
+        physical_gb = sum(h.total_vram_gb for h in online)
+        # Réserve agrégée des nœuds (overhead + marge de chacun), en GB. La
+        # `safety_margin` locale est un ratio mono-hôte : aucun sens agrégé ici,
+        # elle reste donc absente du statut cluster.
+        overhead_gb = max(0.0, physical_gb - budget_net_gb)
 
         models_status = []
         for model in self._registry.list_all():
@@ -1211,9 +1218,11 @@ class ClusterManager:
 
         return {
             "vram_budget": {
-                "total_gb": round(total_gb, 2),
+                "total_gb": round(physical_gb, 2),
+                "overhead_gb": round(overhead_gb, 2),
                 "used_gb": round(used_gb, 2),
                 "available_gb": round(max(0.0, available_gb), 2),
+                "budget_net_gb": round(budget_net_gb, 2),
                 "nodes": len(self._nodes),
                 "nodes_online": sum(1 for s in self._nodes.values() if s.online),
             },

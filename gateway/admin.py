@@ -18,7 +18,12 @@ from fastapi.responses import JSONResponse
 import database as db
 from auth import require_admin
 from config import settings
-from model_manager import CapacityQueueFull, CapacityQueueTimeout, model_manager
+from model_manager import (
+    CapacityQueueFull,
+    CapacityQueueTimeout,
+    ModelBusyError,
+    model_manager,
+)
 from schemas import (
     GatewayStatus,
     KeyCreate,
@@ -30,6 +35,7 @@ from schemas import (
     ModelStatusResponse,
     UsageEntry,
     UsageSummaryEntry,
+    UserAnonymizeResponse,
     UserCreate,
     UserResponse,
     UserUpdate,
@@ -66,6 +72,70 @@ def _warn_kv_cache(model_id: str, vram_gb: float, lp: LlamaParamsSchema) -> None
             "Vérifiez que vram_gb inclut bien les poids ET le KV cache.",
             model_id, kv_gb, lp.ctx_size, lp.parallel, vram_gb,
         )
+
+
+# ── Déchargement protégé (COR-004) ────────────────────────────────────────────
+#
+# INVARIANT (AGENTS.md) : un modèle qui traite une requête active ne doit pas
+# être évincé. Toutes les opérations admin qui déchargent un modèle passent par
+# `_unload_for_admin` : drain borné, puis 409 explicite si des requêtes sont
+# encore actives. Le forçage est possible mais jamais implicite.
+
+_FORCE_DESCRIPTION = (
+    "Interrompre les requêtes actives au lieu de refuser en 409. "
+    "À n'utiliser que sur décision explicite de l'opérateur."
+)
+
+# Marqueurs de conflit « requêtes actives » du mode cluster. ClusterManager
+# signale ce refus par un RuntimeError (pas de ModelBusyError) ; on le mappe sur
+# le même code HTTP pour que le contrat d'erreur soit identique dans les deux
+# modes de déploiement.
+_BUSY_CONFLICT_MARKERS = ("requêtes actives", "ne peut pas être déchargé")
+
+
+def _unload_conflict_detail(exc: Exception) -> str | None:
+    """Détail du conflit si `exc` signale des requêtes actives, sinon None."""
+    if isinstance(exc, ModelBusyError):
+        return str(exc)
+    text = str(exc)
+    if any(marker in text for marker in _BUSY_CONFLICT_MARKERS):
+        return text
+    return None
+
+
+async def _unload_for_admin(model_id: str, *, force: bool = False) -> None:
+    """
+    Décharge un modèle pour le compte d'une route admin.
+
+    Lève HTTPException 409 si des requêtes sont encore actives après le drain
+    (`ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS`), 503 si le backend n'a pas confirmé le
+    déchargement. Le corps d'erreur reste au format admin habituel
+    (`{"detail": "<message actionnable>"}`), pas au format OpenAI des routes /v1.
+    """
+    supports_force = getattr(model_manager, "supports_unload_force", False)
+
+    try:
+        if supports_force:
+            await model_manager.unload_model(model_id, force=force)
+        else:
+            # Mode cluster : aucun chemin de forçage n'existe (les node-agents
+            # refusent tout modèle avec des requêtes actives). On tente le
+            # déchargement normal — force=true n'a de conséquence que sur un
+            # modèle occupé, cas traité ci-dessous.
+            await model_manager.unload_model(model_id)
+    except RuntimeError as exc:
+        detail = _unload_conflict_detail(exc)
+        if detail is None:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if force and not supports_force:
+            # Ne jamais ignorer un force=true en silence : dire qu'il est
+            # indisponible dans ce mode de déploiement.
+            detail += (
+                " Note : force=true n'est pas supporté par ce mode de déploiement — "
+                "un modèle traitant des requêtes actives ne peut pas être déchargé "
+                "de force en mode cluster."
+            )
+        raise HTTPException(status_code=409, detail=detail) from exc
 
 
 def _max_model_capacity_gb() -> float | None:
@@ -183,16 +253,21 @@ async def register_model(
 async def update_model(
     model_id: str,
     body: ModelEntryUpdate,
+    force: bool = Query(False, description=_FORCE_DESCRIPTION),
     _: None = Depends(require_admin),
 ) -> dict:
     """
     Met à jour les métadonnées d'un modèle (enabled, vram_gb, description, llama_params).
 
     llama_params — remplacement complet. Si fourni, le modèle chargé est déchargé
-    immédiatement pour que la prochaine requête le relance avec les nouveaux paramètres.
+    pour que la prochaine requête le relance avec les nouveaux paramètres.
     Cela permet de corriger cpu_moe, ctx_size, parallel, etc. sans redémarrer la gateway.
 
-    enabled=false — décharge le modèle immédiatement.
+    enabled=false — décharge le modèle.
+
+    Ces deux cas déchargent le modèle : ils sont donc refusés en 409 si des
+    requêtes sont encore actives après le drain, et le registre n'est alors PAS
+    modifié (jamais de `enabled: false` persisté sur un modèle qui sert encore).
     """
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
@@ -212,27 +287,40 @@ async def update_model(
                 ),
             )
 
+    # Hot-reload : si llama_params changent, le processus doit être relancé.
+    # enabled=false : le modèle doit cesser de servir.
+    #
+    # Le déchargement a lieu AVANT la mise à jour du registre : un refus (409)
+    # doit laisser le registre intact, sinon on persisterait un état incohérent
+    # (« désactivé » alors que llama-server continue de répondre). Aucun `await`
+    # ne sépare le retour de `_unload_for_admin` de `registry.update` : en
+    # asyncio coopératif, aucune requête ne peut s'intercaler pour recharger le
+    # modèle avec les anciens paramètres.
+    unload_reason = None
+    if "llama_params" in updates:
+        unload_reason = "llama_params modifiés"
+    elif updates.get("enabled") is False:
+        unload_reason = "modèle désactivé"
+
+    if unload_reason:
+        await _unload_for_admin(model_id, force=force)
+
     try:
         model = model_manager.registry.update(model_id, **updates)
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    if unload_reason:
+        log.info(
+            "Admin : %s pour '%s' — modèle déchargé, rechargement automatique "
+            "à la prochaine requête.",
+            unload_reason, model_id,
+        )
+
     # Avertissement KV cache si vram_gb ou llama_params ont changé
     if "vram_gb" in updates or "llama_params" in updates:
         lp_schema = LlamaParamsSchema(**model.llama_params.__dict__)
         _warn_kv_cache(model_id, model.vram_gb, lp_schema)
-
-    # Hot-reload : si llama_params changent, le processus doit être relancé
-    if "llama_params" in updates:
-        await model_manager.unload_model(model_id)
-        log.info(
-            "Admin : llama_params modifiés pour '%s' — modèle déchargé, "
-            "rechargement automatique à la prochaine requête.",
-            model_id,
-        )
-    elif updates.get("enabled") is False:
-        await model_manager.unload_model(model_id)
-        log.info("Admin : modèle '%s' désactivé et déchargé", model_id)
 
     # Récupérer l'état live
     status_list = model_manager.status()["models"]
@@ -243,17 +331,22 @@ async def update_model(
 @router.delete("/models/{model_id}", status_code=200)
 async def delete_model(
     model_id: str,
+    force: bool = Query(False, description=_FORCE_DESCRIPTION),
     _: None = Depends(require_admin),
 ) -> dict:
     """
     Supprime un modèle du registre.
     Le modèle doit être déchargé au préalable (ou sera déchargé automatiquement).
+
+    Refusé en 409 si le modèle traite encore des requêtes après le drain : dans
+    ce cas le modèle reste dans le registre et continue de servir.
     """
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
 
-    # Décharger d'abord si chargé
-    await model_manager.unload_model(model_id)
+    # Décharger d'abord si chargé (protégé contre les requêtes actives).
+    # Un refus lève une 409 ici même : le registre n'est pas touché.
+    await _unload_for_admin(model_id, force=force)
 
     try:
         model_manager.registry.remove(model_id)
@@ -296,31 +389,45 @@ async def load_model(
 @router.post("/models/{model_id}/unload")
 async def unload_model(
     model_id: str,
+    force: bool = Query(False, description=_FORCE_DESCRIPTION),
     _: None = Depends(require_admin),
 ) -> dict:
     """
     Décharge un modèle spécifique et libère sa VRAM.
     Sans effet si le modèle n'est pas chargé.
+
+    Le modèle est mis en quarantaine (plus aucune nouvelle requête admise) puis
+    drainé pendant `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS`. S'il traite encore des
+    requêtes à l'expiration, la route répond 409 et le modèle reste chargé et
+    utilisable — aucune génération n'est interrompue en silence.
     """
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
 
-    await model_manager.unload_model(model_id)
+    await _unload_for_admin(model_id, force=force)
     log.info("Admin : modèle '%s' déchargé", model_id)
     return {"message": f"Modèle '{model_id}' déchargé. VRAM libérée."}
 
 
 @router.post("/unload")
 async def unload_all(_: None = Depends(require_admin)) -> dict:
-    """Décharge tous les modèles sans arrêter le gestionnaire d'inférence."""
+    """
+    Décharge tous les modèles sans arrêter le gestionnaire d'inférence.
+
+    Refusé en 409 si une génération est encore active après le drain — aucun
+    modèle n'est déchargé dans ce cas. Il n'y a pas de forçage global : utiliser
+    POST /admin/models/{id}/unload?force=true modèle par modèle.
+    """
     try:
         await model_manager.unload_all_models()
     except RuntimeError as exc:
         # 409 si l'opération entre en conflit avec un stream actif; 503 si un
-        # agent n'a pas confirmé le déchargement. Dans les deux cas, le cluster
+        # agent n'a pas confirmé le déchargement. Dans les deux cas, la gateway
         # conserve son inventaire au lieu d'annoncer à tort de la VRAM libérée.
-        status_code = 409 if "requêtes actives" in str(exc) else 503
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        detail = _unload_conflict_detail(exc)
+        if detail is not None:
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"message": "Tous les modèles déchargés. VRAM entièrement libérée."}
 
 
@@ -429,9 +536,12 @@ async def create_key(
         expires_at=body.expires_at,
     )
 
+    # On journalise l'`id` technique, jamais le `username` : celui-ci est une
+    # donnée personnelle, et l'anonymisation RGPD (COR-002) serait vaine si le
+    # journal en gardait une copie. Le préfixe de clé n'est pas un secret.
     log.info(
-        "Nouvelle clé API créée pour '%s' (préfixe: %s)",
-        username, key_row["key_prefix"],
+        "Nouvelle clé API créée pour l'utilisateur id=%s (préfixe: %s)",
+        user["id"], key_row["key_prefix"],
     )
 
     return {
@@ -456,22 +566,64 @@ async def list_keys(
     return await db.list_keys_for_user(user["id"])
 
 
-@router.delete("/users/{username}", status_code=200)
-async def delete_user(
+@router.delete(
+    "/users/{username}",
+    status_code=200,
+    response_model=UserAnonymizeResponse,
+    summary="Anonymiser un utilisateur (droit à l'effacement RGPD)",
+)
+async def anonymize_user(
     username: str,
     _: None = Depends(require_admin),
 ) -> dict:
-    """Supprime un utilisateur et toutes ses clés API (action irréversible)."""
+    """
+    Anonymise un utilisateur — **irréversible**. Chemin du droit à l'effacement.
+
+    La route conserve le verbe `DELETE` et son chemin pour ne pas casser les
+    scripts opérateur existants, mais son effet est une ANONYMISATION, pas une
+    suppression de ligne (politique DEC-001) :
+
+    - effacé   : `username` (remplacé par un pseudonyme stable), `email`,
+      `notes`, et le champ libre `name` de chaque clé API ;
+    - conservé : la ligne `users` (`id`, `created_at`) et tout l'historique
+      `usage_log`, pour que la facturation et l'audit restent exploitables ;
+    - le compte est désactivé et **toutes** ses clés sont révoquées.
+
+    Un `DELETE` réel était impossible : `usage_log.user_id` n'a pas de
+    `ON DELETE CASCADE`, la route répondait donc 500 pour tout utilisateur ayant
+    servi au moins une requête (COR-002).
+
+    Idempotente : un second appel répond 200 sans réécrire l'horodatage initial.
+    """
     user = await db.get_user_by_username(username)
     if not user:
         raise HTTPException(status_code=404, detail=f"Utilisateur '{username}' introuvable.")
 
-    deleted = await db.delete_user(user["id"])
-    if not deleted:
-        raise HTTPException(status_code=500, detail="Échec de la suppression.")
+    result = await db.anonymize_user(user["id"])
+    if result is None:  # pragma: no cover — la ligne vient d'être lue
+        raise HTTPException(status_code=404, detail=f"Utilisateur '{username}' introuvable.")
 
-    log.info("Admin : utilisateur '%s' supprimé", username)
-    return {"message": f"Utilisateur '{username}' supprimé avec succès."}
+    # Journalisation volontairement sans donnée personnelle : ni le nom effacé,
+    # ni l'e-mail, ni les notes ne doivent réapparaître dans les logs (§14).
+    log.info(
+        "Admin : utilisateur id=%s anonymisé (RGPD) — %d clé(s) révoquée(s), "
+        "déjà anonymisé : %s",
+        result["user_id"], result["keys_revoked"], result["already_anonymized"],
+    )
+    return {
+        "status": "already_anonymized" if result["already_anonymized"] else "anonymized",
+        "message": (
+            "Utilisateur anonymisé : données personnelles effacées "
+            "définitivement, clés révoquées, historique d'usage conservé."
+        ),
+        "user_id": result["user_id"],
+        "anonymized_username": result["username"],
+        "anonymized_at": result["anonymized_at"],
+        "keys_revoked": result["keys_revoked"],
+        "keys_total": result["keys_total"],
+        "erased_fields": ["username", "email", "notes", "api_keys.name"],
+        "retained": ["users.id", "users.created_at", "usage_log"],
+    }
 
 
 @router.delete("/keys/{key_prefix}", status_code=200)

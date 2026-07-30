@@ -29,6 +29,7 @@ from model_manager import model_manager
 from model_registry import IntegrityError
 from proxy import aclose_http_client, init_http_client, models_response, proxy_request
 from rate_limiter import check_rate_limit
+from readiness import caller_is_privileged, evaluate_readiness
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -242,6 +243,32 @@ app.include_router(metrics_router)
 
 # ── Middleware de logging des requêtes ────────────────────────────────────────
 
+# Routes dont le chemin porte un nom d'utilisateur : `/admin/users/<username>`
+# et `/admin/users/<username>/keys`. Le nom est une donnée personnelle, et
+# l'anonymisation RGPD (COR-002) serait vaine si le journal d'accès en gardait
+# une copie — c'est aussi une exigence explicite de la Definition of Done
+# (« aucune donnée sensible n'est journalisée »). Le segment est donc remplacé
+# avant écriture, sans masquer la route elle-même, qui reste exploitable.
+_USER_PATH_PREFIX = "/admin/users/"
+
+
+def _redact_path(path: str) -> str:
+    """
+    Remplace un nom d'utilisateur présent dans le chemin par `<redacted>`.
+
+    Conserve la forme de la route (méthode, ressource, sous-ressource) pour que
+    le journal reste utile au diagnostic, sans conserver l'identifiant.
+    """
+    if not path.startswith(_USER_PATH_PREFIX):
+        return path
+    remainder = path[len(_USER_PATH_PREFIX):]
+    if not remainder:
+        return path
+    # Seul le premier segment est un nom ; le reste (`/keys`) est structurel.
+    _, sep, tail = remainder.partition("/")
+    return f"{_USER_PATH_PREFIX}<redacted>{sep}{tail}"
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
@@ -253,7 +280,7 @@ async def log_requests(request: Request, call_next):
         log.info(
             "%s %s %d %dms",
             request.method,
-            request.url.path,
+            _redact_path(request.url.path),
             response.status_code,
             duration_ms,
         )
@@ -283,57 +310,36 @@ async def health():
 
 
 @app.get("/ready", include_in_schema=False)
-async def ready():
+async def ready(request: Request):
     """
-    Readiness (distincte de la liveness de /health).
+    Readiness STRUCTURELLE stricte (distincte de la liveness de /health).
 
-    Renvoie 200 si la gateway peut SERVIR au moins une requête d'inférence :
-      - au moins un modèle est déjà ready, OU
-      - il reste de la capacité VRAM pour en charger un (mode local),
-        ou au moins un nœud est online (mode cluster).
-    Sinon 503 (aucun modèle ready ET aucune capacité / tous nœuds offline).
+    Renvoie 200 seulement si tous les contrôles structurels critiques passent :
+    registre lisible, au moins un modèle activé, binaire llama-server exécutable,
+    GGUF des modèles activés présents et lisibles, base inscriptible, au moins un
+    modèle qui tient dans le budget VRAM, et capacité de service disponible. En
+    mode cluster, binaire et GGUF sont délégués aux node-agents : l'équivalent
+    structurel est « inventaire de nœuds lisible ET au moins un nœud en ligne ».
+    Sinon 503, avec le code du premier contrôle critique en échec dans `reason`.
 
-    /health reste inchangé (liveness : le process répond). Le corps précise la
-    raison sans divulguer d'infra sensible (pas de chemins fichiers, pas d'URL).
+    Ce que /ready NE garantit PAS : qu'un modèle génère effectivement des tokens.
+    C'est la serving readiness, exposée en information (`levels.serving`) mais
+    prouvée seulement par le smoke test de mise à jour (COR-006).
+
+    Le corps public ne divulgue aucun chemin de fichier, URL de nœud ni secret :
+    seulement des identifiants de contrôle et des codes stables. Un appelant
+    présentant `ADMIN_SECRET` reçoit en plus les messages actionnables détaillés
+    (qui, eux, contiennent des chemins) — même niveau de confiance que /admin/*.
     """
-    try:
-        status = model_manager.status()
-    except Exception:
-        # status() ne devrait pas lever, mais fail-safe : pas de fuite d'infra.
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "reason": "status_unavailable"},
-        )
+    report = await evaluate_readiness(model_manager, config=settings)
 
-    models = status.get("models") or []
-    ready_models = [m["id"] for m in models if m.get("state") == "ready"]
-
-    budget = status.get("vram_budget") or {}
-    available_gb = budget.get("available_gb") or 0.0
-    # En cluster, status() expose nodes_online dans vram_budget ; en local,
-    # cette clé est absente → None (non contraignant côté local).
-    nodes_online = budget.get("nodes_online")
-
-    has_capacity = available_gb > 0.0
-    cluster_has_node = nodes_online is None or nodes_online > 0
-
-    is_ready = bool(ready_models) or (has_capacity and cluster_has_node)
-
-    body = {
-        "status": "ready" if is_ready else "not_ready",
-        "models_ready": ready_models,
-        "vram_available_gb": round(float(available_gb), 2),
-    }
-    if nodes_online is not None:
-        body["nodes_online"] = nodes_online
-
-    if is_ready:
-        return body
-
-    if nodes_online is not None and nodes_online == 0:
-        body["reason"] = "all_nodes_offline"
+    if caller_is_privileged(request.headers.get("authorization"), settings):
+        body = report.detailed_body()
     else:
-        body["reason"] = "no_model_ready_and_no_capacity"
+        body = report.public_body()
+
+    if report.structural_ok:
+        return body
     return JSONResponse(status_code=503, content=body)
 
 
@@ -455,7 +461,9 @@ async def detokenize(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    log.exception("Erreur non gérée sur %s %s", request.method, request.url.path)
+    log.exception(
+        "Erreur non gérée sur %s %s", request.method, _redact_path(request.url.path)
+    )
     return JSONResponse(
         status_code=500,
         content={
