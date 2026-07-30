@@ -9,59 +9,90 @@
 
 ## 0. État d'avancement de l'implémentation
 
-> **Cette section est l'en-tête de suivi vivant.** Elle est mise à jour à chaque
-> lot livré. Le reste du document (§1 à §17) reste le plan de référence et ne
-> change pas, sauf pour passer un marqueur d'état.
+> **Cette section est l'en-tête de suivi vivant : lisez-la en premier.** Elle
+> répond en trente secondes à « où en est-on, qu'est-ce qui tourne, qu'est-ce
+> qui vient ensuite ». Elle est mise à jour à chaque lot livré. Le reste du
+> document (§1 à §17) est le **plan de référence** : il ne change pas, sauf pour
+> passer un marqueur d'état sur une ligne de backlog.
+
+### 0.0 En un coup d'œil
+
+| | |
+|---|---|
+| **Où en est-on** | Jalon **M0 atteint**, puis **premier déploiement réel sur deux VMs** joué de bout en bout — il a révélé 6 défauts invisibles en CI (§0.10). **Ces 6 défauts sont fermés** (vague 4, §0.11), avec COR-009 en prime |
+| **Ce qui vient ensuite** | Jalon **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage. **Plus aucun P0 ouvert dans le Lot A** |
+| **Santé des tests** | **758 tests verts** (695 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
+| **Reste à faire** | 41 items sur 62 (§0.3). Les 5 items ouverts du Lot A sont tous en P1/P2 |
+| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU |
+
+**Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
+décisions tranchées, §0.7 le journal des livraisons, §0.8 et §0.10 les défauts
+trouvés en implémentant et en déployant — ceux qu'aucun des deux audits n'avait
+vus —, §0.9 ce que l'exploitation doit savoir.
 
 ### 0.1 Situation
 
 | Champ | Valeur |
 |---|---|
 | Dernière mise à jour | 2026-07-30 |
-| Phase | **Jalon M0 atteint** — les 8 items livrés et vérifiés |
-| Jalon visé | **M0 — socle fonctionnel fiable** (§13) |
-| Branche de travail | `feat/lot-a-m0-invariants` (créée depuis `dev` @ `49f8d59`) |
-| Base de référence | `dev` @ `49f8d59` |
-| Périmètre livré | COR-001, COR-002, COR-004 → COR-007, COR-014, AUT-012, OPS-006, SEC-008, TST-001 |
+| Phase | **Vague 4 livrée** — les retours du premier déploiement réel sont fermés (§0.11) |
+| Jalon atteint | **M0 — socle fonctionnel fiable** (§13), sortie prononcée (§0.7.1) |
+| Jalon visé | **M1 — planificateur de bootstrap** (§13) |
+| Branche de travail | `feat/lot-a-vague4-retours-deploiement` (créée depuis `dev` @ `3a60f19`) |
+| Base de référence | `dev` @ `3a60f19` — 678 tests verts, `ruff` propre |
+| Périmètre livré à ce jour | COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, AUT-012, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
+| Périmètre de la vague 4 | COR-009, COR-015 → COR-017, TST-006, OPS-008, OPS-009 — **7 items, tous `[x]`** — plus OPS-010, né de la vague (§0.11) |
 | Prochain jalon | **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage |
 
 ### 0.2 Base de référence des tests et état courant
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **633** 🔬 |
-| `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **45** 🔬 |
-| **Total** | — | **354** | **678** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **695** 🔬 |
+| `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
+| **Total** | — | **354** | **758** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+324 tests** ajoutés par le jalon M0, tous des régressions rouges avant
-correctif et vertes après. Les scripts de déploiement passent `bash -n`.
+**+324 tests** ajoutés par le jalon M0, puis **+80 par la vague 4**, tous des
+régressions rouges avant correctif et vertes après. Les scripts de déploiement
+passent `bash -n`.
 
 > **Retrait du composant `gateway-student` (DEC-009, 30 juillet 2026).** Les
 > totaux ci-dessus perdent mécaniquement les 79 tests de référence et 138 tests
 > courants de ce composant. Le journal §0.7 conserve les chiffres tels qu'ils
 > étaient au moment de chaque livraison.
-`shellcheck` et `ruff` ne sont installés dans aucun environnement du dépôt : ce
-sont des lacunes d'outillage, à traiter avec EVA-044.
+
+`ruff` **est** installé dans les deux venv du dépôt et passe au vert sur
+`gateway` comme sur `node_agent` — le constat inverse de §0.9 date de la vague 1
+et n'est plus vrai. `shellcheck` reste absent : la syntaxe des scripts est
+vérifiée par `bash -n`, à compléter avec EVA-044.
 
 ### 0.3 Avancement par lot
 
-| Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Bloqué |
+| Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[–]` Annulé |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 17 | 7 | 2 | 8 | 0 |
+| A — bloqueurs et invariants | 17 | 11 | 0 | 5 | 1 |
 | B — bootstrap automatisé | 13 | 1 | 0 | 12 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
 | D — sécurité et supply-chain | 8 | 1 | 0 | 7 | 0 |
-| E — tests et exploitation | 15 | 1 | 0 | 14 | 0 |
-| **Total** | **61** | **10** | **2** | **49** | **0** |
+| E — tests et exploitation | 16 | 4 | 1 | 9 | 2 |
+| **Total** | **62** | **17** | **1** | **41** | **3** |
 
-Huit items ont été **ajoutés au backlog** après coup, d'où 61 au lieu de 53 :
+Neuf items ont été **ajoutés au backlog** après coup, d'où 62 au lieu de 53 :
 COR-014 (Lot A) et SEC-008 (Lot D) pendant l'implémentation (§0.8), puis
 COR-015 à COR-017 (Lot A) et TST-006, OPS-008, OPS-009 (Lot E) lors du premier
-déploiement réel sur deux VMs (§0.10).
+déploiement réel sur deux VMs (§0.10), enfin **OPS-010** (Lot E) né de la
+vague 4 elle-même.
 
-Les **8 items du jalon M0 sont terminés et vérifiés.**
+Les **8 items du jalon M0 sont terminés et vérifiés**, ainsi que les **7 items
+de la vague 4**. Les deux items qui étaient `[~]` faute de test (COR-015,
+COR-016) portent désormais le leur. Le seul `[~]` restant est **OPS-010**, dont
+la part venvs est livrée et testée mais dont la borne sur les sauvegardes
+`*.pre-migration.*.bak` reste à poser, sous OPS-002.
+
+**Il ne reste aucun P0 ouvert dans le Lot A.** Les 5 items restants
+(COR-003, COR-008, COR-010, COR-012, COR-013) sont en P1/P2.
 
 ### 0.4 Vague en cours — jalon M0
 
@@ -133,6 +164,15 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-30 | COR-014 | `06b50af` | `pytest tests -q` (gateway + student) | 587 / 138 réussis, les fichiers d'exemple livrés sont chargeables 🔬 |
 | 2026-07-30 | COR-006 | `0102760` | `pytest tests -q` (gateway) + `bash -n` | 632 réussis, un flux sans contenu est un échec, rollback fonctionnel 🔬 |
 | 2026-07-30 | **M0** | `0102760` | Les 3 suites + syntaxe des 9 scripts de déploiement | **815 réussis** (632 / 138 / 45), jalon atteint 🔬 |
+| 2026-07-30 | TST-006 | `40a22f4` | `pytest tests -q` (gateway) + rougeur rejouée par l'orchestrateur | 638 réussis ; `n.node_id` réintroduit → 2 échecs sur `AttributeError` 🔬 |
+| 2026-07-30 | COR-015 | — | Clôturé par TST-006, correctif déjà présent sur `dev` | Passe `[~]` → `[x]` 🔬 |
+| 2026-07-30 | COR-016 | `5a080a2` | `pytest tests -q` (node_agent) + rougeur rejouée | 56 réussis ; `mv` de venv réintroduit → 3 échecs, shebang pointant sur le staging supprimé 🔬 |
+| 2026-07-30 | COR-017 | `5fe61d8`, `8961607` | `pytest tests -q` (gateway + node_agent) + rougeur rejouée | 652 / 56 réussis ; `reset-failed` retiré → 4 échecs, dont le rollback laissé en indisponibilité 🔬 |
+| 2026-07-30 | OPS-008 | `ad953bc` | `pytest tests -q` (gateway) | Timer armé avec `--now`, après l'initialisation de la base 🔬 |
+| 2026-07-30 | COR-009 | `0c2efcb` | `pytest tests -q` (gateway) | 649 réussis ; timeouts dérivés du registre (900 s), `/ready` et `/completion` exposés 🔬 |
+| 2026-07-30 | OPS-009 | `28acf1c`, `66140b1` | `pytest tests -q` (gateway) + rougeur rejouée | 685 réussis ; HTTP/2 rendu selon `nginx -v`, seuil inversé → 4 échecs 🔬 |
+| 2026-07-30 | OPS-010 | `d58b365` | `pytest tests -q` (gateway + node_agent) | Rétention bornée des venvs, cible du symlink protégée ; rouge en retirant cette protection 🔬 |
+| 2026-07-30 | **Vague 4** | `532a5da` | Les 2 suites + `bash -n` sur les 12 scripts de déploiement | **758 réussis** (695 / 63), 6 défauts terrain fermés + OPS-010 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -172,7 +212,20 @@ n'avaient relevés. Ils sont corrigés dans le commit de l'item qui les a trouv�
 | Les journaux conservaient une copie du nom d'utilisateur, ce qui **vide de son effet** l'anonymisation RGPD : le middleware d'accès journalisait `request.url.path` (donc `/admin/users/<username>`), et `admin.create_key` journalisait le nom en clair. Deux fuites distinctes — la seconde a été trouvée par le test écrit pour la première. | COR-002, puis le test de SEC-008 | Nouvel item **SEC-008**, corrigé 🔬 |
 | **Trois réglages de liste étaient inutilisables tels que documentés** : pydantic-settings décode un champ `list[str]` comme du JSON dans la source d'environnement, avant tout validateur. `ALLOWED_MODEL_DIRS` échouait au format CSV documenté **et** à la valeur vide livrée dans `.env.example` — copier ce fichier vers `/etc/llm-gateway/env` produisait un service mort. Le validateur `split_cors_origins` de `CORS_ALLOW_ORIGINS` ne s'exécutait jamais. Reproduit sur les deux sources, dont celle de la production. | AUT-012, reproduit puis élargi | Nouvel item **COR-014**, corrigé 🔬 |
 
-Conséquence de la dernière ligne pour SEC-002 : l'allowlist `ALLOWED_MODEL_DIRS`
+#### Découvertes de la vague 4
+
+| Découverte | Trouvé par | Traitement |
+|---|---|---|
+| **Une branche d'erreur inatteignable dans `_build_manager()`** : le `RuntimeError` qui cite `settings.cluster_nodes_path` — le message le plus actionnable pour l'opérateur — ne s'affiche jamais, car `load_nodes_config()` lève un `ValueError` plus vague en amont. | TST-006 | Constat 📖 — à trancher : supprimer la branche morte ou unifier le message |
+| **`doctor` est aveugle à la classe de défaut de COR-015** : il lit les nœuds via `getattr(n, "id", "?")`. Un renommage d'attribut n'y produirait aucune erreur — `doctor` afficherait `?, ?` et resterait au vert. L'outil censé détecter ce type de panne ne la voit pas. | TST-006 | Constat 📖 — angle mort de détection, à reprendre |
+| **`chown -R` ne traverse pas un symlink** : une fois `venv-agent` devenu un lien, `install-agent.sh` n'aurait plus chowné la release réelle lors d'une réinstallation par-dessus une mise à jour. | COR-016 | Corrigé dans le même commit (`readlink -f` + `chown -h`) 📖 |
+| **La branche `enabled` d'`update.sh` ne réparait rien** : sur un hôte déjà mis à jour, le timer est `enabled` mais `inactive`, et la branche se contentait d'un `info`. OPS-008 aurait donc survécu à *toutes* les mises à jour futures. Le critère d'acceptation de l'item ne tenait pas sans cette réparation, qu'il ne mentionnait pas. | OPS-008 | Corrigé 🔬 |
+| **`rollback_failed_transaction` était pire qu'un `\|\| true`** : son `systemctl start` tournait sous `set +e` sans aucun garde, l'échec était avalé *silencieusement*, sans même l'intention qu'aurait signalée un `\|\| true`. | COR-017 | Corrigé 🔬 |
+| **Armer le timer devenait un risque de rollback** : en `update.sh`, `systemctl enable` est sous `set -e` + trap ERR. Avec `--now`, un timer récalcitrant aurait pu déclencher le rollback transactionnel d'un déploiement sain. | OPS-008 | Armements placés en position de condition, verrouillé par un test 🔬 |
+| **`http2 on;` casse les deux LTS supportées, pas seulement la plus ancienne** : Ubuntu 22.04 livre nginx 1.18 et 24.04 livre 1.24, or la directive n'existe qu'à partir de 1.25.1. L'audit initial ne relevait que la dépréciation, pas l'incompatibilité descendante. | OPS-009 | Rendu conditionnel à la version détectée 🔬 |
+| **Debian 13 — l'hôte du premier déploiement réel — n'est pas dans la matrice de support** de `docs/deployment.md`, qui ne cite aucune distribution Debian. | OPS-009 | Constat 🧭 — décision produit, matrice à trancher |
+
+Conséquence de la dernière ligne du premier tableau pour SEC-002 : l'allowlist `ALLOWED_MODEL_DIRS`
 n'était pas seulement absente de l'environnement généré — elle était
 **impossible à activer**. Les deux audits avaient relevé l'absence, pas
 l'impossibilité. SEC-002 devient réalisable.
@@ -219,6 +272,7 @@ automatisé.
 | **Le timer de sauvegarde quotidienne n'est jamais armé.** `install.sh` et `update.sh` font `systemctl enable` sans `--now` : le timer est `enabled` mais `inactive`, absent de `list-timers`, et aucune sauvegarde ne tourne **jusqu'au prochain reboot**. Le commentaire du code craint qu'un `--now` déclenche un rattrapage `Persistent=true` immédiat ; vérifié faux : un premier `start` sans stamp pose le stamp sans exécuter le job. | Reproduit : `is-enabled=enabled`, `is-active=inactive`, aucune ligne dans `list-timers` 🔬 | **OPS-008** |
 | **`deploy/nginx.conf` utilise la directive dépréciée `listen … ssl http2`**, retirée au profit de `http2 on;` depuis nginx 1.25. Debian 13 émet deux warnings à chaque `nginx -t` et à chaque reload. | Reproduit sur nginx de Debian 13 🔬 | **OPS-009** |
 | **Aucun test ne construit le manager en mode cluster.** `_build_manager()` n'apparaît que dans `test_doctor.py`. Les 633 tests gateway passent avec COR-015 présent : c'est exactement la classe de régression que la CI doit fermer. | Constat sur la suite de tests 🔬 | **TST-006** |
+| **Les venvs de release ne sont jamais purgés.** Corollaire de la stratégie de bascule par symlink (`update.sh` de longue date, `update-agent.sh` depuis COR-016) : plus aucun venv n'est écrasé, donc chaque mise à jour laisse une arborescence complète (~200 Mo sur un nœud) sous `venv-release-*` / `venv-agent-release-*`, plus un éventuel `*-pre-update-*` issu de la migration. Aucun des deux scripts ne borne cette accumulation, et rien ne la signale : `/opt` sature en silence. Même classe de défaut que les sauvegardes `*.pre-migration.*.bak` d'OPS-006 (suivi sous OPS-002). | Constat de lecture des deux scripts de mise à jour, confirmé par le nommage horodaté des releases | **OPS-010** |
 
 **Ce que le run a validé, lui, en conditions réelles** 🔬 : `doctor` (exit 3,
 diagnostics pertinents dont COR-009 correctement signalé), `--verify-hashes`,
@@ -244,6 +298,82 @@ arbitrer :
 | Pendant qu'un nœud est `offline`, `/admin/cluster` continue d'afficher ses `loaded_models` d'avant la panne. | Le drapeau `online: false` est bien présent, mais la liste de modèles induit en erreur dans un diagnostic d'incident. | À vider ou à marquer `unavailable`, conformément à `docs/deployment.md` §13 |
 | Le dashboard affiche `active_users_7d: 2` pour `total_users: 1`. | Conséquence directe et attendue de DEC-001 (usage conservé sous pseudonyme après anonymisation), mais l'affichage paraît incohérent. | Libellé à préciser côté dashboard |
 | Un `git clone --depth 1` de llama.cpp produit un binaire qui se déclare `version: 1`. | `LLAMA_SERVER_MIN_BUILD` deviendrait impossible à satisfaire sur un clone superficiel. Le garde-fou supply-chain suppose un clone complet, ce que `docs/deployment.md` §2 fait bien — mais sans dire pourquoi. | À mentionner dans la note de §2 quand SEC-005 sera traité |
+
+### 0.11 Vague 4 — fermeture des retours du premier déploiement réel
+
+Le déploiement de §0.10 a produit six items. Cette vague les ferme. Elle y
+ajoute **COR-009**, parce que son défaut de timeout a été reproduit sur VM
+(§0.9) et qu'il touche le même fichier que OPS-009 : les traiter ensemble évite
+deux passes sur `nginx.conf`.
+
+Les chantiers sont regroupés par **propriété exclusive de fichiers**, de sorte
+que deux chantiers menés en parallèle ne puissent jamais se marcher dessus.
+Chacun est mené dans un worktree git isolé, sur sa propre branche, et produit
+des commits atomiques ensuite fusionnés dans la branche de lot.
+
+| Chantier | Items | Priorité | Fichiers possédés | Commits | Tests | État |
+|---|---|---|---|---|---:|---|
+| C1 | TST-006, clôture COR-015 | P0 | `gateway/model_manager.py`, tests cluster | `40a22f4` | +5 | `[x]` |
+| C2 | COR-016, COR-017 (part agent) | P0 | `node_agent/deploy/`, `node_agent/tests/` | `5a080a2`, `5fe61d8` | +11 | `[x]` |
+| C3 | COR-017 (part gateway), OPS-008 | P0 / P1 | `gateway/deploy/install.sh`, `update.sh` | `8961607`, `ad953bc` | +19 | `[x]` |
+| C4 | OPS-009, COR-009 | P2 / P1 | `gateway/deploy/nginx.conf`, `docs/api.md` | `28acf1c`, `0c2efcb` | +16 | `[x]` |
+| — | OPS-009 (complément) | P2 | `gateway/deploy/nginx-lib.sh` | `66140b1` | +12 | `[x]` |
+| — | OPS-010 (corollaire) | P1 | `*/deploy/*venv*-lib.sh` | `d58b365` | +17 | `[~]` |
+
+**Total : +80 tests**, chacun vérifié rouge avant correctif et vert après. La
+rougeur de C1, C2 et C3 a été **re-jouée indépendamment par l'orchestrateur**
+avant fusion, pas seulement rapportée par le chantier.
+
+#### OPS-010, le défaut que la vague a elle-même créé
+
+COR-016 supprime le déplacement de venv au profit d'une bascule par symlink.
+Corollaire immédiat, et signalé par le chantier lui-même : **plus aucun venv
+n'est écrasé**, donc chaque mise à jour laisse une arborescence complète sur le
+disque — environ 200 Mo par mise à jour et par nœud — sans que rien ne borne
+l'accumulation ni ne la signale. `gateway/deploy/update.sh` portait d'ailleurs
+le même comportement depuis toujours ; COR-016 l'a rendu visible en
+l'étendant au node-agent.
+
+La rétention est désormais explicite et bornée des deux côtés (`EVA_*_VENV_KEEP`,
+défaut 2 : l'active et la précédente, celle que réclame le retour arrière manuel).
+Trois garde-fous méritent d'être connus : la cible courante du symlink n'est
+**jamais** supprimée quel que soit son âge, l'ordre est celui des dates de
+modification et non des noms (un nom de release gateway commence par un hash de
+commit et ne se trie pas), et la purge n'a lieu qu'**après** validation — purger
+plus tôt supprimerait ce vers quoi le rollback rebascule.
+
+L'item reste `[~]` : les venvs sont bornés, les sauvegardes
+`*.pre-migration.*.bak` d'OPS-006 ne le sont toujours pas (suivi sous OPS-002).
+
+#### Les deux points de vigilance, et ce qu'ils ont donné
+
+- **COR-015 était déjà corrigé dans le code** (`n.node_id` → `n.id`, présent sur
+  `dev`) et ne restait `[~]` que faute de test. C1 n'a donc pas réécrit le
+  correctif : il a livré la régression qui le verrouille. Rougeur confirmée —
+  réintroduire `n.node_id` fait tomber 2 tests sur `AttributeError`.
+- **OPS-009 n'était pas cosmétique sans condition**, et le piège était pire que
+  prévu. `http2 on;` demande nginx ≥ 1.25.1, mais le socle documenté est
+  **Ubuntu 22.04 (nginx 1.18) et 24.04 (nginx 1.24)** : la directive moderne
+  aurait empêché nginx de démarrer sur **les deux LTS supportées**, pas
+  seulement sur la plus ancienne. C4 a donc refusé de restreindre le socle et a
+  livré une conf neutre, sans HTTP/2.
+
+  **Cet arbitrage a été révisé.** Retirer HTTP/2 faisait perdre la
+  fonctionnalité aux deux plateformes supportées pour supprimer un
+  avertissement qui n'apparaît qu'à partir de 1.25.1 — donc sur une plateforme
+  *absente de la matrice de support*, Debian 13, celle de l'incident. Le
+  complément `66140b1` rend l'activation **conditionnelle à la version
+  détectée** (`deploy/nginx-lib.sh`, sourcé par `install.sh` et `update.sh`) :
+  `listen … ssl http2` en dessous de 1.25.1, `http2 on;` au-dessus. Personne ne
+  perd HTTP/2, `nginx -t` est silencieux de 1.18 à 1.29, et le repli sur une
+  version illisible est délibérément la forme sans HTTP/2 — un avertissement
+  cosmétique vaut mieux qu'un service mort.
+
+#### Décision de sortie de vague
+
+Les six défauts du premier déploiement réel sont fermés, chacun par un test qui
+échoue sans son correctif. **Le Lot A n'a plus de P0 ouvert** : le travail de
+bootstrap (Lot B / jalon M1) peut démarrer sans dette bloquante.
 
 ---
 
@@ -1113,15 +1243,15 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-006 | `[x]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
 | COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
 | COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
-| COR-009 | `[ ]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. |
+| COR-009 | `[x]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. **Livré le 2026-07-30** : `/ready` et `/completion` étaient documentés sur l'URL publique mais retombaient en 404 côté nginx ; les timeouts sont désormais dérivés du `load_timeout_seconds` maximal du registre (900 s) au lieu des 30 s qui faisaient échouer tout pré-chargement admin en 504. |
 | COR-010 | `[ ]` | P1 | Corriger `revoke_key()` | `%` et `_` sont littéraux ou rejetés ; seconde révocation a un comportement défini. |
 | COR-011 | `[–]` | — | ~~Corriger le slot student abandonné~~ | Annulé : composant supprimé (DEC-009). |
 | COR-012 | `[ ]` | P1 | Définir une réservation de quota | Les requêtes concurrentes ne dépassent pas silencieusement le budget, ou le dépassement maximal accepté est borné et documenté. |
 | COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. |
 | COR-014 | `[x]` | P0 | Rendre chargeables les réglages de liste de l'environnement | `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `ALLOWED_MODELS` acceptent la syntaxe documentée sans faire échouer le démarrage ; les fichiers d'exemple livrés sont chargeables. **Item ajouté le 2026-07-30**, découvert par AUT-012 : ces trois réglages étaient inutilisables tels que documentés. |
-| COR-015 | `[~]` | P0 | Réparer le démarrage en mode cluster | `CLUSTER_MODE=cluster` démarre et sert ; la régression est verrouillée par TST-006. **Item ajouté le 2026-07-30** (§0.10). Correctif d'une ligne appliqué et vérifié sur VM (`n.node_id` → `n.id` dans `model_manager._build_manager()`), **mais sans test automatisé** : reste `[~]` tant que TST-006 n'est pas livré. |
-| COR-016 | `[~]` | P0 | Rendre `update-agent.sh` capable de réussir | Une mise à jour de node-agent aboutit sans rollback, et la stratégie de venv est la même que celle de `update.sh` (construction à l'emplacement final, bascule par symlink) plutôt qu'un déplacement de venv. **Item ajouté le 2026-07-30** (§0.10). Contournement appliqué et vérifié sur VM (`ExecStart` via `python -m uvicorn`, insensible au déplacement) ; le correctif structurel de `update-agent.sh` reste à faire, ainsi qu'un test de non-régression. |
-| COR-017 | `[ ]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10) : reproduit en indisponibilité réelle lors de la bascule cluster. |
+| COR-015 | `[x]` | P0 | Réparer le démarrage en mode cluster | `CLUSTER_MODE=cluster` démarre et sert ; la régression est verrouillée par TST-006. **Item ajouté le 2026-07-30** (§0.10). Correctif d'une ligne appliqué et vérifié sur VM (`n.node_id` → `n.id` dans `model_manager._build_manager()`), puis **verrouillé par TST-006** le 2026-07-30 : réintroduire `n.node_id` fait échouer 2 tests sur `AttributeError`. |
+| COR-016 | `[x]` | P0 | Rendre `update-agent.sh` capable de réussir | Une mise à jour de node-agent aboutit sans rollback, et la stratégie de venv est la même que celle de `update.sh` (construction à l'emplacement final, bascule par symlink) plutôt qu'un déplacement de venv. **Item ajouté le 2026-07-30** (§0.10). Contournement appliqué et vérifié sur VM (`ExecStart` via `python -m uvicorn`, conservé en défense en profondeur), puis **correctif structurel livré** le 2026-07-30 : le venv est construit à son emplacement définitif et `venv-agent` devient un symlink que l'on bascule, comme dans `update.sh`. Un agent installé par l'ancien script est migré en place, sans action opérateur. Test de non-régression : un exécutable de `bin/` doit rester lançable après la bascule. |
+| COR-017 | `[x]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10), **livré le même jour** : `reset-failed` avant chaque démarrage dans les 4 scripts de déploiement, et l'échec de redémarrage d'un rollback sort désormais en code 9 « INDISPONIBILITÉ », distinct du code 1 « version précédente restaurée et en service ». |
 
 ### Lot B — bootstrap automatisé
 
@@ -1183,9 +1313,10 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-005 | `[–]` | — | ~~Automatiser la gateway étudiante~~ | Annulé : composant supprimé (DEC-009). |
 | OPS-006 | `[x]` | P0 | Versionner les migrations SQLite | `PRAGMA user_version` ou équivalent, migration transactionnelle, sauvegarde préalable et test depuis chaque version supportée. |
 | OPS-007 | `[–]` | — | ~~Définir la rétention d'audit student~~ | Annulé : composant supprimé (DEC-009). |
-| OPS-008 | `[ ]` | P1 | Armer réellement le timer de sauvegarde | Après `install.sh` puis après `update.sh`, `systemctl is-active llm-gateway-backup.timer` retourne `active` et le timer apparaît dans `list-timers`, sans reboot et sans déclencher de sauvegarde immédiate avant l'initialisation de la base. **Item ajouté le 2026-07-30** (§0.10) : `enable` sans `--now` laissait la sauvegarde quotidienne inerte jusqu'au prochain redémarrage. |
-| OPS-009 | `[ ]` | P2 | Moderniser les directives nginx livrées | `nginx -t` ne produit aucun avertissement de dépréciation sur les versions supportées (`http2 on;` au lieu de `listen … ssl http2`). **Item ajouté le 2026-07-30** (§0.10) : le bruit à chaque reload masque les avertissements utiles. |
-| TST-006 | `[ ]` | P0 | Couvrir la construction du manager en mode cluster | Un test construit `model_manager._build_manager()` avec `CLUSTER_MODE=cluster` et un `nodes.yaml` minimal ; il échoue sur le code d'avant COR-015 et passe après. **Item ajouté le 2026-07-30** (§0.10) : 633 tests passaient alors que le mode cluster ne démarrait pas. Complète TST-005, qui vise le parcours E2E et non la construction à l'import. |
+| OPS-008 | `[x]` | P1 | Armer réellement le timer de sauvegarde | Après `install.sh` puis après `update.sh`, `systemctl is-active llm-gateway-backup.timer` retourne `active` et le timer apparaît dans `list-timers`, sans reboot et sans déclencher de sauvegarde immédiate avant l'initialisation de la base. **Item ajouté le 2026-07-30** (§0.10) : `enable` sans `--now` laissait la sauvegarde quotidienne inerte jusqu'au prochain redémarrage. |
+| OPS-009 | `[x]` | P2 | Moderniser les directives nginx livrées | `nginx -t` ne produit aucun avertissement de dépréciation sur les versions supportées (`http2 on;` au lieu de `listen … ssl http2`). **Item ajouté le 2026-07-30** (§0.10) : le bruit à chaque reload masque les avertissements utiles. |
+| OPS-010 | `[~]` | P1 | Borner la rétention des venvs de release | Après N mises à jour successives, `gateway/deploy/update.sh` et `node_agent/deploy/update-agent.sh` laissent au plus 2 arborescences de venv (l'active et la précédente) et la cible du symlink n'est jamais supprimée. **Item ajouté le 2026-07-30** : sans purge, chaque mise à jour ajoutait ~200 Mo au disque du nœud, en silence. Rétention livrée et testée dans les deux scripts (`EVA_GATEWAY_VENV_KEEP` / `EVA_AGENT_VENV_KEEP`, défaut 2). **Reste à faire** : la même borne pour les sauvegardes `*.pre-migration.*.bak` d'OPS-006, suivie sous OPS-002. |
+| TST-006 | `[x]` | P0 | Couvrir la construction du manager en mode cluster | Un test construit `model_manager._build_manager()` avec `CLUSTER_MODE=cluster` et un `nodes.yaml` minimal ; il échoue sur le code d'avant COR-015 et passe après. **Item ajouté le 2026-07-30** (§0.10) : 633 tests passaient alors que le mode cluster ne démarrait pas. Complète TST-005, qui vise le parcours E2E et non la construction à l'import. |
 
 ## 13. Jalons
 
@@ -1319,4 +1450,5 @@ Une entrée de backlog n'est terminée que si :
 | Date | Auteur | Modification | Preuve |
 |---|---|---|---|
 | 2026-07-30 | Codex | Création du plan consolidé, analyse du rapport externe et architecture du bootstrap | Audit local, 433 tests, sources officielles listées ci-dessus |
+| 2026-07-30 | Claude | Vague 4 : fermeture des 6 défauts du premier déploiement réel, plus COR-009 et OPS-010. En-tête de suivi §0.0 ajouté | 4 chantiers en worktrees isolés, **758 tests** (+80), rougeur de chaque correctif rejouée indépendamment avant fusion |
 | 2026-07-30 | Codex | Relecture de `claude-analyse-projet.md`; correction du statut de la supposée course pin, ajout de doctor, inspection GGUF, migrations et ordre de travail performance | Lecture intégrale du document Claude, vérification du segment asyncio et du paquet officiel `gguf` |

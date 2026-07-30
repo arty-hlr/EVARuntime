@@ -16,6 +16,8 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=deploy-mode-lib.sh
 source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
+# shellcheck source=nginx-lib.sh
+source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 
 usage() {
     cat <<EOF
@@ -68,6 +70,25 @@ NC='\033[0m'
 info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+# ── Démarrages systemd (COR-017) ──────────────────────────────────────────────
+# Une unité qui a échoué plusieurs fois de suite atteint son start-limit :
+# systemd refuse alors TOUT démarrage (« Start request repeated too quickly »)
+# tant que le compteur n'est pas remis à zéro. `reset-failed` remet ce compteur
+# à zéro; sur une unité saine c'est un no-op, donc sans risque avant chaque
+# démarrage. Toute (re)mise en marche d'une unité passe par ces fonctions.
+systemctl_restart() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl restart "$unit"
+}
+
+# `enable --now` = enable + start : il arme réellement le timer (OPS-008).
+systemctl_enable_now() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl enable --now "$unit"
+}
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -372,35 +393,20 @@ else
 fi
 systemctl daemon-reload
 systemctl enable llm-gateway.service
+# Réinstallation sur un hôte où l'unité était en `failed` : sans cette remise à
+# zéro, le `systemctl start` que l'opérateur lance à l'étape finale peut se voir
+# refuser par le start-limit systemd (COR-017).
+systemctl reset-failed llm-gateway.service 2>/dev/null || true
 info "Service systemd installé et activé."
-
-# ── 7b. Timer de sauvegarde quotidienne de la DB ──────────────────────────────
-# Le service oneshot exécute /opt/llm-gateway/deploy/llm-gateway-backup.sh ; le
-# script doit donc être déployé dans INSTALL_DIR (pas seulement dans le dépôt).
-
-info "Installation du timer de sauvegarde SQLite…"
-mkdir -p "$INSTALL_DIR/deploy"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
-chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
-chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
-systemctl daemon-reload
-# `enable` (sans --now) : planifie le prochain 03:15 sans lancer de backup
-# immédiat — la DB n'est initialisée qu'à l'étape 9.
-if command -v sqlite3 &>/dev/null; then
-    systemctl enable llm-gateway-backup.timer
-    info "Timer de sauvegarde activé (quotidien 03:15, rétention 14 j)."
-else
-    warn "sqlite3 introuvable — timer copié mais NON activé. Après 'apt install sqlite3' :"
-    warn "  sudo systemctl enable --now llm-gateway-backup.timer"
-fi
 
 # ── 8. Nginx ──────────────────────────────────────────────────────────────────
 
 if command -v nginx &>/dev/null; then
     info "Configuration nginx…"
-    cp "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+    # HTTP/2 est activé sous la forme que comprend le nginx local (OPS-009) :
+    # la conf livrée reste neutre, le script écrit la bonne directive.
+    nginx_render_conf "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+    info "nginx ${NGINX_DETECTED_VERSION:-?} — HTTP/2 : ${NGINX_HTTP2_FORM}"
     ln -sf /etc/nginx/sites-available/llm-gateway /etc/nginx/sites-enabled/llm-gateway 2>/dev/null || true
 
     if nginx -t 2>/dev/null; then
@@ -422,7 +428,7 @@ if [[ ! -f "$JOURNALD_DROPIN" ]]; then
     info "Installation de la rotation journald…"
     mkdir -p /etc/systemd/journald.conf.d
     cp "$SCRIPT_DIR/deploy/journald-llm-gateway.conf" "$JOURNALD_DROPIN"
-    systemctl restart systemd-journald
+    systemctl_restart systemd-journald
     info "Rotation journald installée (SystemMaxUse=500M, rétention 30 j)."
 else
     info "Configuration journald existante conservée : $JOURNALD_DROPIN"
@@ -441,6 +447,41 @@ asyncio.run(database.init_db())
 print('DB initialisée.')
 "
 chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/gateway.db" 2>/dev/null || true
+
+# ── 9b. Timer de sauvegarde quotidienne de la DB ──────────────────────────────
+# Le service oneshot exécute /opt/llm-gateway/deploy/llm-gateway-backup.sh ; le
+# script doit donc être déployé dans INSTALL_DIR (pas seulement dans le dépôt).
+#
+# ORDRE (OPS-008) : cette étape suit délibérément l'initialisation de la base.
+# Le timer est armé avec `--now`, et sur une RÉinstallation le stamp
+# `Persistent=true` peut être périmé — systemd rattraperait alors l'occurrence
+# manquée immédiatement. Armer après l'étape 9 garantit qu'une sauvegarde
+# déclenchée aussitôt trouve une base déjà initialisée.
+
+info "Installation du timer de sauvegarde SQLite…"
+mkdir -p "$INSTALL_DIR/deploy"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
+systemctl daemon-reload
+# `--now` est INDISPENSABLE : `enable` seul crée le lien dans timers.target mais
+# laisse le timer `inactive` jusqu'au prochain reboot — absent de `list-timers`,
+# aucune sauvegarde. Sur une installation neuve, ce premier `start` ne déclenche
+# PAS de rattrapage : sans stamp préexistant, systemd pose le stamp sans exécuter
+# le job.
+if command -v sqlite3 &>/dev/null; then
+    if systemctl_enable_now llm-gateway-backup.timer; then
+        info "Timer de sauvegarde armé (quotidien 03:15, rétention 14 j)."
+    else
+        warn "Timer de sauvegarde NON armé — vérifiez puis relancez :"
+        warn "  sudo systemctl enable --now llm-gateway-backup.timer"
+    fi
+else
+    warn "sqlite3 introuvable — timer copié mais NON armé. Après 'apt install sqlite3' :"
+    warn "  sudo systemctl enable --now llm-gateway-backup.timer"
+fi
 
 # ── 10. Résumé ────────────────────────────────────────────────────────────────
 

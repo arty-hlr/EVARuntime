@@ -760,7 +760,7 @@ Client             nginx               FastAPI             llama-server
 proxy_buffering        off;
 add_header X-Accel-Buffering no always;
 chunked_transfer_encoding on;
-proxy_read_timeout     600s;
+proxy_read_timeout     900s;   # dérivé du load_timeout_seconds max du registre
 ```
 
 ---

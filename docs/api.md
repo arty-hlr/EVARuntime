@@ -884,7 +884,13 @@ curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
 | `POST /v1/tokenize` | `content` (string) | `{"tokens": [...]}` | Compter les tokens avant envoi |
 | `POST /v1/detokenize` | `tokens` (array) | `{"content": "…"}` | Reconstruire du texte depuis des IDs |
 | `GET /v1/models` | — | OpenAI standard | Lister les modèles activés |
-| `GET /health` | — | JSON | État du service (sans authentification) |
+| `GET /v1/capacity` | — | JSON | État de la queue d'admission VRAM ([§2](#2-premier-test--curl)) |
+| `GET /health` | — | JSON | Liveness du service (sans authentification) |
+| `GET /ready` | — | JSON | Readiness — capacité à servir maintenant (sans authentification) |
+
+Tous ces chemins sont exposés sur l'URL publique. Aucun autre n'y répond : les
+routes d'administration sont restreintes au réseau campus par le reverse-proxy,
+et tout chemin non listé ici renvoie `404`.
 
 ---
 
@@ -1069,10 +1075,12 @@ import httpx
 
 # Option 1 — timeout long : le plus simple et le plus recommandé.
 # Le client attend silencieusement le chargement du modèle.
+# 330s couvre le plus lent des modèles activés (les modèles MoE demandent
+# jusqu'à ~310s à froid) ; le reverse-proxy, lui, laisse 900s.
 client = OpenAI(
     base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
-    timeout=150.0,
+    timeout=330.0,
 )
 response = client.chat.completions.create(
     model="qwen3.5-9b-q5_k_m",

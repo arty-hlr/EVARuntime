@@ -40,7 +40,7 @@ GPU local et pilote des node-agents installés séparément.
 | Python | 3.11+ | `python3 --version` |
 | CUDA toolkit | 12.x | Mode local et chaque node-agent; inutile sur l'orchestrateur cluster |
 | Pilotes NVIDIA | 535+ | `nvidia-smi` sur les hôtes d'inférence, pas sur l'orchestrateur |
-| nginx | 1.18+ | `apt install nginx` |
+| nginx | 1.18+ | `apt install nginx`. La conf livrée est valide de 1.18 à 1.29 ; **HTTP/2 est activé automatiquement** par `install.sh`/`update.sh` dans la forme qu'accepte la version installée — [§8](#8-configuration-nginx) |
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
@@ -527,6 +527,43 @@ sudo ln -sf /etc/nginx/sites-available/llm-gateway \
 sudo nginx -s reload
 ```
 
+### HTTP/2 : activé automatiquement, dans la forme qu'accepte votre nginx
+
+Aucune écriture de la directive HTTP/2 n'est acceptée par l'ensemble du socle
+supporté :
+
+| Version nginx | `listen … ssl http2` | `http2 on;` |
+|---------------|----------------------|-------------|
+| 1.18 (Ubuntu 22.04 LTS) | fonctionne, sans avertissement | **`unknown directive` — nginx refuse de démarrer** |
+| 1.24 (Ubuntu 24.04 LTS) | fonctionne, sans avertissement | **`unknown directive` — nginx refuse de démarrer** |
+| ≥ 1.25.1 (Debian 13, nginx.org) | **déprécié — warning à chaque `nginx -t` et à chaque reload** | forme recommandée |
+
+Le fichier `deploy/nginx.conf` est donc livré dans la seule forme valide partout
+— un `listen` nu, sans HTTP/2 — pour qu'une copie manuelle ne casse jamais rien.
+
+Mais `install.sh` et `update.sh` ne s'en tiennent pas là : ils lisent `nginx -v`
+et **écrivent la forme adaptée à la version installée** (`deploy/nginx-lib.sh`).
+Vous conservez donc HTTP/2 sur les deux LTS supportées *et* un `nginx -t`
+silencieux sur les versions récentes. Les scripts annoncent leur choix :
+
+```
+[INFO] nginx 1.24.0 — HTTP/2 : listen … ssl http2
+```
+
+Sur un doute (version illisible, nginx absent), les scripts retombent
+délibérément sur la forme sans HTTP/2 : un avertissement cosmétique est
+préférable à un nginx qui refuse de démarrer.
+
+**Copie manuelle de la conf** — si vous déployez `deploy/nginx.conf` à la main
+plutôt que par les scripts, vous obtenez HTTP/1.1. Sur nginx ≥ 1.25.1,
+décommentez `http2 on;` ; en dessous, ajoutez `http2` aux deux lignes `listen`.
+Le streaming SSE, `proxy_buffering off` et les timeouts longs se comportent à
+l'identique dans les deux cas — HTTP/2 n'apporte ici que le multiplexage de
+plusieurs requêtes sur une même connexion cliente.
+
+`nginx -t` ne doit produire **aucun** avertissement, quelle que soit la version :
+un warning de dépréciation à chaque reload finit par masquer les vrais.
+
 ---
 
 ## 9. Démarrage et vérification
@@ -785,12 +822,48 @@ Ce que fait le script :
 11. Repasse `doctor` sur l'hôte basculé, en constat non bloquant
 12. **Rollback automatique** du code déployé, du venv, du mode et de l'unité si la
     readiness ou la recette échoue
+13. **Purge les venvs de release excédentaires** une fois la version validée, en
+    conservant l'actif et le précédent (voir ci-dessous)
 
 > **Conservation :** les secrets, `nodes.yaml`, le contenu du registre, la DB et
 > les GGUF ne sont jamais remplacés. Le script ne modifie dans `env` que les clés
 > nécessaires au mode explicitement confirmé. Il peut copier l'ancien registre
 > `/etc/llm-gateway/models.yaml` vers `/var/lib/llm-gateway/models.yaml` pour
 > corriger les permissions d'écriture atomique; l'original reste en place.
+
+#### Rétention des venvs de release
+
+`update.sh` ne remplace jamais un venv : il en construit un neuf à son
+emplacement définitif (`/opt/llm-gateway/venv-release-<commit>-<horodatage>`)
+puis fait basculer le symlink `/opt/llm-gateway/venv`, le chemin figé dans
+l'unité systemd. C'est ce qui rend le rollback instantané — mais aussi ce qui
+ferait grossir `/opt` indéfiniment, une arborescence complète par mise à jour.
+
+La rétention est donc **bornée et explicite** : une fois la version validée par
+la recette du premier token, le script conserve **la release active et la
+précédente**, et purge les plus anciennes. La cible courante du symlink n'est
+jamais supprimée, quel que soit son âge — y compris après un retour arrière
+manuel vers une vieille release. Le `venv-pre-update-*` laissé par la migration
+depuis l'ancien schéma est traité comme une release ordinaire.
+
+- Le nombre de releases conservées se règle par `EVA_GATEWAY_VENV_KEEP`
+  (défaut : `2`, minimum : `1`).
+- `--dry-run` annonce ce que la purge emporterait, sans rien supprimer.
+- Un échec de purge n'échoue **jamais** la mise à jour : la gateway sert, seul
+  l'espace disque manque. Le script le signale en avertissement.
+- La purge n'a lieu **qu'après** la validation. Avant, la release précédente est
+  encore ce vers quoi le rollback rebascule.
+
+Retour arrière manuel, tant que la release est conservée :
+
+```bash
+ls -dt /opt/llm-gateway/venv-release-*
+sudo ln -sfn /opt/llm-gateway/venv-release-<…> /opt/llm-gateway/venv
+sudo systemctl restart llm-gateway
+```
+
+Le node-agent applique la même politique sur ses propres releases — voir
+« Stratégie de venv du node-agent ».
 
 #### Sauvegarde automatique avant mise à jour
 
@@ -897,14 +970,14 @@ sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
 - `--base-url` sur la **gateway en direct** (défaut) ne couvre **rien** de tout
   cela : un premier token vert en direct peut rester invisible côté client
   derrière un nginx mal configuré.
-- `--admin-url` vise la gateway **en direct** par défaut, volontairement :
-  `/ready` n'est pas proxifiée par `deploy/nginx.conf` (`location /` renvoie
-  404), et `location /admin/` impose `proxy_read_timeout 30s` alors qu'un
-  `POST /admin/models/{id}/load` peut légitimement attendre jusqu'à ~310 s
-  (`MODEL_LOAD_TIMEOUT_SECONDS + 10`). À travers nginx, le chargement
-  renverrait 504 alors qu'il **réussit** côté serveur, et la recette conclurait
-  à tort à une régression. Ce défaut est suivi par l'item COR-009 et n'est pas
-  corrigé par la recette : elle le contourne.
+- `--admin-url` vise la gateway **en direct** par défaut, volontairement : les
+  routes `/admin/*` sont restreintes au réseau campus par nginx, et la recette
+  doit rester exécutable depuis l'hôte lui-même. Depuis COR-009, viser nginx
+  fonctionne aussi : `/ready` y est proxifiée et `location /admin/` laisse 900 s,
+  soit au-delà des ~310 s qu'un `POST /admin/models/{id}/load` peut légitimement
+  attendre (`load_timeout_seconds + 10`, pire modèle activé). Avant COR-009 ce
+  même appel renvoyait 504 à travers nginx (`proxy_read_timeout 30s`) alors qu'il
+  **réussissait** côté serveur, et la recette concluait à tort à une régression.
 
 ##### Sécurité de la recette
 
@@ -999,7 +1072,7 @@ Cas particuliers :
 | Cause rapportée | Interprétation |
 |---|---|
 | `readiness_failed:model_file_missing` | Un GGUF d'un modèle `enabled: true` manque. Le télécharger, corriger son `path`, ou passer le modèle à `enabled: false`. |
-| `model_load_failed:504` | L'appel a traversé nginx : `proxy_read_timeout 30s` sur `/admin/` (COR-009). Viser `--admin-url` en direct. |
+| `model_load_failed:504` | Un reverse-proxy a coupé avant la fin du chargement. La conf livrée laisse 900 s sur `/admin/` depuis COR-009 : vérifier que l'hôte n'a pas gardé une conf antérieure (`doctor` le signale, contrôle `nginx_timeouts`), ou viser `--admin-url` en direct. |
 | `generation:no_content` | Le stream s'ouvre en 200 mais n'émet aucun token : régression du proxy d'inférence ou backend muet. |
 | `generation:no_done` | Le stream est tronqué : coupure réseau, timeout nginx trop court, ou `llama-server` tué (`MemoryMax`). |
 | `usage_log_missing` | La génération réussit mais n'est pas comptabilisée : la facturation serait fausse. |
@@ -1020,6 +1093,31 @@ ne confonde pas restauration et déploiement réussi.
 Un échec bloquant de `doctor` **avant** la bascule restaure lui aussi le code
 synchronisé, mais **sans jamais arrêter le service** : la version en production
 continue de servir pendant toute la détection.
+
+#### Redémarrages et start-limit systemd (COR-017)
+
+Une unité qui a échoué plusieurs fois de suite atteint son **start-limit** :
+systemd refuse alors tout démarrage (`Start request repeated too quickly`), y
+compris celui du rollback. Tous les démarrages d'`install.sh` et `update.sh`
+sont donc précédés d'un `systemctl reset-failed` — un no-op sur une unité saine.
+
+Sur un chemin de rollback, un démarrage refusé n'est plus un avertissement mais
+une **indisponibilité** : `update.sh` sort en erreur avec un bloc
+`[INDISPONIBILITÉ]` qui rappelle que la gateway est à terre et donne la
+commande de rétablissement. La restauration (mode, code, venv, unité) est
+toujours menée à son terme **avant** que l'échec soit signalé.
+
+```
+[INDISPONIBILITÉ] Rollback vers /var/lib/llm-gateway/backups/code-pre-update-… : démarrage refusé par systemd.
+[INDISPONIBILITÉ] llm-gateway n'a PAS redémarré : la gateway est À TERRE.
+  Rétablissement manuel immédiat :
+    sudo systemctl reset-failed llm-gateway
+    sudo systemctl start llm-gateway
+```
+
+Sur le chemin **nominal**, un démarrage en échec reste délibérément non fatal :
+la sonde `/ready` qui suit enchaîne sur le rollback, qu'un arrêt immédiat
+court-circuiterait.
 
 Le rollback **ne restaure pas** la base de données automatiquement : le schéma
 peut avoir évolué et écraser la base sans arbitrage humain serait plus risqué
@@ -1381,6 +1479,96 @@ continuer maintient la capacité si le cluster possède au moins un autre nœud
 capable d'héberger les modèles. L'orchestrateur ne fait aucune mise à jour SSH
 ou distante implicite.
 
+#### Stratégie de venv du node-agent
+
+`update-agent.sh` applique la même stratégie que `update.sh` : le venv neuf est
+construit **à son emplacement définitif**
+(`/opt/llm-gateway/venv-agent-release-<horodatage>-<pid>`), puis le symlink
+`/opt/llm-gateway/venv-agent` — le chemin figé dans l'unité systemd — est
+basculé d'une release à l'autre. Aucun venv n'est jamais déplacé.
+
+Un venv **n'est pas relogeable** : les scripts console de `bin/` portent un
+shebang absolu vers `<venv>/bin/python`. La version précédente construisait le
+venv dans un staging `mktemp` puis le déplaçait, ce qui laissait `bin/uvicorn`
+pointer vers un staging root-only puis supprimé : `203/EXEC Permission denied`,
+cinq health-checks en échec et rollback systématique — aucune mise à jour de
+node-agent ne pouvait aboutir. `ExecStartPre` passait, lui, car `bin/python` est
+un lien vers l'interpréteur système : le symptôme désignait le mauvais coupable.
+
+Conséquences pratiques :
+
+- **Agent installé avant ce correctif** : la première mise à jour migre le venv
+  en place. Le venv réel est écarté une seule fois vers
+  `venv-agent-pre-update-<horodatage>` et le symlink est créé. Aucune action
+  opérateur, et les mises à jour suivantes ne repassent plus par ce cas.
+- **Rollback** : le symlink est rebasculé vers la release précédente, restée
+  intacte à son emplacement. Un rollback ne déplace donc aucun venv non plus.
+- **Retour arrière manuel** possible tant que la release est conservée :
+
+```bash
+ls -dt /opt/llm-gateway/venv-agent-release-*
+sudo ln -sfn /opt/llm-gateway/venv-agent-release-<…> /opt/llm-gateway/venv-agent
+sudo systemctl restart llm-gateway-agent
+```
+
+- L'unité conserve `ExecStart=…/venv-agent/bin/python -m uvicorn` : défense en
+  profondeur validée en production, insensible par construction au shebang.
+
+**Rétention des releases.** Puisque aucun venv n'est plus écrasé, chaque mise à
+jour laisse une arborescence complète (~200 Mo) sur le disque du nœud, plus un
+éventuel `venv-agent-pre-update-*` issu de la migration. `update-agent.sh` purge
+donc les releases excédentaires **après une mise à jour réussie**, en conservant
+**l'active et la précédente** — soit exactement ce que réclame le retour arrière
+manuel ci-dessus. La politique est la même que celle de la gateway :
+
+- La cible courante du symlink n'est **jamais** supprimée, quel que soit son
+  âge : c'est le venv sur lequel l'agent tourne. Après un retour arrière manuel
+  vers une vieille release, celle-ci est donc protégée bien qu'elle soit la plus
+  ancienne du répertoire.
+- L'ordre de purge est celui des **dates de modification**, pas des noms.
+- Le nombre de releases conservées se règle par `EVA_AGENT_VENV_KEEP`
+  (défaut : `2`, minimum : `1`).
+- `--dry-run` annonce ce que la purge emporterait, sans rien supprimer.
+- La purge n'a lieu **qu'après** la validation (health-check passé, rollback
+  désarmé). Avant, la release précédente est encore ce vers quoi le rollback
+  rebascule — un rollback ne doit jamais trouver une release supprimée.
+- Un échec de purge n'échoue **jamais** la mise à jour : l'agent est en service,
+  seul l'espace disque manque. Le script le signale en avertissement.
+
+Vérifier ce qui reste sur un nœud :
+
+```bash
+du -sh /opt/llm-gateway/venv-agent-release-* /opt/llm-gateway/venv-agent-pre-update-* 2>/dev/null
+readlink -f /opt/llm-gateway/venv-agent
+sudo bash node_agent/deploy/update-agent.sh --dry-run --no-pull   # annonce la purge
+```
+
+#### Start-limit systemd et codes de sortie de `update-agent.sh`
+
+Après plusieurs redémarrages rapprochés, systemd refuse de démarrer une unité
+(« Start request repeated too quickly ») et la laisse en `failed`. Un rollback
+qui se contente de `systemctl start` laisse alors le **nœud à terre**. Chaque
+`systemctl start` des scripts de déploiement node-agent est donc précédé d'un
+`systemctl reset-failed` — no-op sur une unité saine, donc sans risque —, y
+compris dans le chemin de rollback et après une réinstallation.
+
+Codes de sortie de `update-agent.sh` :
+
+| Code | Signification | Action |
+|------|---------------|--------|
+| `0` | Mise à jour déployée et health-check passé | aucune |
+| `1` | Échec : version précédente restaurée, agent **en service** | investiguer avant de réessayer |
+| `9` | **INDISPONIBILITÉ** : rollback effectué mais l'agent ne redémarre pas | intervention immédiate |
+
+Un `9` n'est jamais un simple avertissement : le nœud ne sert plus aucune
+requête et l'orchestrateur le passera `offline` après ~30 s.
+
+```bash
+sudo systemctl reset-failed llm-gateway-agent
+sudo systemctl start llm-gateway-agent
+sudo journalctl -u llm-gateway-agent -n 100 --no-pager
+```
+
 ### Migration explicite local ↔ cluster
 
 Une migration n'est jamais déduite d'un simple rerun. Elle exige `--mode` et
@@ -1445,16 +1633,32 @@ propriétaire `llmservice`).
 
 ### Installation du timer de sauvegarde quotidienne
 
-**Automatique.** `install.sh` déploie le script + les unités et active le timer
-(si `sqlite3` est présent). `update.sh` rafraîchit ensuite ces fichiers à chaque
-mise à jour, et active le timer la première fois. Un timer que vous auriez
-volontairement désactivé (`systemctl disable`) n'est jamais réactivé
-automatiquement. Il n'y a donc normalement **rien à faire manuellement**.
+**Automatique.** `install.sh` déploie le script + les unités et **arme** le timer
+avec `enable --now` (si `sqlite3` est présent). `update.sh` rafraîchit ensuite
+ces fichiers à chaque mise à jour, et arme le timer la première fois. Un timer
+que vous auriez volontairement désactivé (`systemctl disable`) n'est jamais
+réactivé automatiquement. Il n'y a donc normalement **rien à faire
+manuellement**.
+
+> **OPS-008 — `--now` est indispensable.** Un `systemctl enable` seul crée le
+> lien dans `timers.target` mais laisse l'unité `inactive` : elle n'apparaît pas
+> dans `list-timers` et ne déclenche **aucune** sauvegarde jusqu'au prochain
+> reboot. Sur un serveur qui ne redémarre pas, cela signifiait zéro sauvegarde
+> périodique, sans le moindre message. `update.sh` répare aussi cet état sur les
+> hôtes déjà installés : un timer `enabled` mais `inactive` est armé.
+>
+> Dans `install.sh`, l'armement suit délibérément l'**initialisation de la
+> base** (étape 9). Sur une installation neuve, ce premier `start` ne déclenche
+> aucune sauvegarde (sans stamp préexistant, systemd pose le stamp sans exécuter
+> le job) ; sur une réinstallation avec un stamp périmé, `Persistent=true` peut
+> en revanche rattraper l'occurrence manquée immédiatement — elle trouve alors
+> une base déjà initialisée.
 
 Vérifier / tester :
 
 ```bash
-systemctl list-timers llm-gateway-backup.timer
+systemctl is-active llm-gateway-backup.timer      # doit répondre « active »
+systemctl list-timers llm-gateway-backup.timer    # doit lister la prochaine échéance
 sudo systemctl start llm-gateway-backup.service   # test manuel immédiat
 journalctl -u llm-gateway-backup.service --no-pager -n 20
 ```
@@ -1743,17 +1947,24 @@ La `location /v1/` est scindée :
 
 - **`= /v1/models`** — route légère non-streamante : rate-limit souple, **pas de
   `limit_conn`** (un GET rapide ne doit pas consommer un slot de concurrence GPU) ;
-- **`~ ^/v1/(chat/completions|completions|embeddings)$`** — routes d'inférence :
-  `limit_req` + **`limit_conn api_conn 4`** qui borne les streams SSE concurrents
-  par IP (protection contre le DoS GPU) ;
+- **`~ ^(/v1/(chat/completions|completions|completion|embeddings)|/completion)$`**
+  — routes d'inférence : `limit_req` + **`limit_conn api_conn 4`** qui borne les
+  streams SSE concurrents par IP (protection contre le DoS GPU). `/completion`
+  sans préfixe `/v1/` y figure explicitement : c'est l'endpoint natif llama.cpp
+  documenté en `docs/api.md` §7, qui tombait sinon dans le repli `location /`
+  (404) ;
 - **`/v1/`** (fallback) — conserve par prudence le comportement streaming
-  d'origine, borné en concurrence.
+  d'origine, borné en concurrence ;
+- **`= /ready`** — sonde de readiness non authentifiée, également documentée
+  côté utilisateur ; rate-limitée, sans `limit_conn`, `access_log off`.
 
 > **Réglages SSE préservés à l'identique** sur les routes streamantes :
 > `proxy_buffering off`, `proxy_cache off`, `chunked_transfer_encoding on`,
-> `add_header X-Accel-Buffering no`, `proxy_read_timeout 600s`,
-> `proxy_send_timeout 600s`. Ne pas réduire ces timeouts : cela casserait les
-> générations longues.
+> `add_header X-Accel-Buffering no`, `proxy_read_timeout 900s`,
+> `proxy_send_timeout 900s`. Ne pas réduire ces timeouts : cela casserait les
+> générations longues et les premiers appels à froid (COR-009 — la valeur est
+> dérivée du `load_timeout_seconds` maximal du registre, voir l'en-tête de
+> `gateway/deploy/nginx.conf`).
 
 Recharger après modification :
 
