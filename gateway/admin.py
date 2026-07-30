@@ -536,9 +536,12 @@ async def create_key(
         expires_at=body.expires_at,
     )
 
+    # On journalise l'`id` technique, jamais le `username` : celui-ci est une
+    # donnée personnelle, et l'anonymisation RGPD (COR-002) serait vaine si le
+    # journal en gardait une copie. Le préfixe de clé n'est pas un secret.
     log.info(
-        "Nouvelle clé API créée pour '%s' (préfixe: %s)",
-        username, key_row["key_prefix"],
+        "Nouvelle clé API créée pour l'utilisateur id=%s (préfixe: %s)",
+        user["id"], key_row["key_prefix"],
     )
 
     return {

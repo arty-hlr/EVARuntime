@@ -243,6 +243,32 @@ app.include_router(metrics_router)
 
 # ── Middleware de logging des requêtes ────────────────────────────────────────
 
+# Routes dont le chemin porte un nom d'utilisateur : `/admin/users/<username>`
+# et `/admin/users/<username>/keys`. Le nom est une donnée personnelle, et
+# l'anonymisation RGPD (COR-002) serait vaine si le journal d'accès en gardait
+# une copie — c'est aussi une exigence explicite de la Definition of Done
+# (« aucune donnée sensible n'est journalisée »). Le segment est donc remplacé
+# avant écriture, sans masquer la route elle-même, qui reste exploitable.
+_USER_PATH_PREFIX = "/admin/users/"
+
+
+def _redact_path(path: str) -> str:
+    """
+    Remplace un nom d'utilisateur présent dans le chemin par `<redacted>`.
+
+    Conserve la forme de la route (méthode, ressource, sous-ressource) pour que
+    le journal reste utile au diagnostic, sans conserver l'identifiant.
+    """
+    if not path.startswith(_USER_PATH_PREFIX):
+        return path
+    remainder = path[len(_USER_PATH_PREFIX):]
+    if not remainder:
+        return path
+    # Seul le premier segment est un nom ; le reste (`/keys`) est structurel.
+    _, sep, tail = remainder.partition("/")
+    return f"{_USER_PATH_PREFIX}<redacted>{sep}{tail}"
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
@@ -254,7 +280,7 @@ async def log_requests(request: Request, call_next):
         log.info(
             "%s %s %d %dms",
             request.method,
-            request.url.path,
+            _redact_path(request.url.path),
             response.status_code,
             duration_ms,
         )
@@ -435,7 +461,9 @@ async def detokenize(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    log.exception("Erreur non gérée sur %s %s", request.method, request.url.path)
+    log.exception(
+        "Erreur non gérée sur %s %s", request.method, _redact_path(request.url.path)
+    )
     return JSONResponse(
         status_code=500,
         content={
