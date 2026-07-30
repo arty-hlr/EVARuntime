@@ -6,6 +6,7 @@ Usage :
   python cli.py create-key alice --name "these-2025"
   python cli.py revoke-key llmgw-abc12345
   python cli.py list-users
+  python cli.py anonymize-user alice --yes   # RGPD, irréversible
   python cli.py usage-report --month 2025-03
   python cli.py usage-report --from 2025-01-01 --to 2025-03-31
   python cli.py status
@@ -137,6 +138,60 @@ def enable_user(username: str = typer.Argument(...)):
             raise typer.Exit(1)
         await db.update_user(user["id"], is_active=True)
         console.print(f"[green]Utilisateur '{username}' réactivé.[/green]")
+
+    _run(_do())
+
+
+@app.command("anonymize-user")
+def anonymize_user(
+    username: str = typer.Argument(..., help="Nom d'utilisateur à anonymiser"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirmer sans demander"),
+):
+    """
+    Anonymise un utilisateur — IRRÉVERSIBLE. Droit à l'effacement RGPD.
+
+    Efface définitivement le nom d'utilisateur, l'e-mail, les notes et le nom
+    des clés API ; désactive le compte et révoque toutes ses clés.
+    CONSERVE la ligne utilisateur et tout l'historique usage_log, pour que la
+    facturation et l'audit restent exploitables (politique DEC-001).
+
+    Ce n'est PAS une suppression de ligne : l'historique d'usage reste agrégeable
+    sous un pseudonyme, la personne n'est plus ré-identifiable.
+    """
+    async def _do():
+        await _ensure_db()
+        user = await db.get_user_by_username(username)
+        if not user:
+            console.print(f"[red]Utilisateur '{username}' introuvable.[/red]")
+            raise typer.Exit(1)
+
+        if not yes:
+            console.print(
+                "[yellow]Anonymisation irréversible :[/yellow] nom, e-mail, notes et "
+                "noms de clés seront effacés définitivement ; les clés seront "
+                "révoquées. L'historique d'usage est conservé sous un pseudonyme."
+            )
+            if not typer.confirm(f"Anonymiser '{username}' ?", default=False):
+                console.print("Annulé.")
+                return
+
+        result = await db.anonymize_user(user["id"])
+        if result is None:
+            console.print(f"[red]Utilisateur '{username}' introuvable.[/red]")
+            raise typer.Exit(1)
+
+        if result["already_anonymized"]:
+            console.print(
+                f"[yellow]Déjà anonymisé le {result['anonymized_at']}[/yellow] — "
+                "horodatage initial conservé, clés revérifiées."
+            )
+        else:
+            console.print(f"[green]Utilisateur anonymisé.[/green]")
+        console.print(f"  Pseudonyme      : {result['username']}")
+        console.print(f"  Anonymisé le    : {result['anonymized_at']}")
+        console.print(f"  Clés révoquées  : {result['keys_revoked']} / {result['keys_total']}")
+        console.print("  Effacé          : username, email, notes, nom des clés")
+        console.print("  Conservé        : id, created_at, journal usage_log")
 
     _run(_do())
 

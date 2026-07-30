@@ -79,6 +79,7 @@ deployee.
 | `0` | base neuve, ou base deployee avant l'introduction du mecanisme |
 | `1` | baseline : tables `users`, `api_keys`, `usage_log` et index |
 | `2` | colonne `users.hourly_token_limit` garantie |
+| `3` | colonne `users.anonymized_at` garantie (politique d'anonymisation RGPD) |
 
 `SCHEMA_VERSION` est derive de la derniere entree du tuple `MIGRATIONS`.
 `init_db()` amene la base a cette version puis n'a plus aucun effet : il est
@@ -92,6 +93,13 @@ deja deployee peut donc porter la colonne tout en restant en `user_version = 0`.
 La migration 2 inspecte l'etat reel via `PRAGMA table_info(users)` et n'emet
 l'`ALTER TABLE` que si la colonne manque : les deux etats de depart convergent
 vers `user_version = 2` sans echec.
+
+La migration 3 applique le meme motif introspectif pour `users.anonymized_at` :
+la colonne fait partie de `SCHEMA`, donc une base neuve la recoit deja par la
+baseline, et l'`ALTER TABLE` n'est emis que si elle manque. Aucune table n'est
+recreee — la politique d'anonymisation conserve la ligne `users`, donc la cle
+etrangere `usage_log.user_id` n'est jamais violee et sa contrainte est inchangee.
+Voir `operations.md` pour la politique operateur.
 
 ### Structure d'une migration
 

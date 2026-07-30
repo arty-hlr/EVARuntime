@@ -115,14 +115,66 @@ python cli.py activate-student alice
 La suspension ne supprime pas les données. Elle permet de bloquer rapidement
 sans perte d'historique.
 
-### Supprimer un étudiant (RGPD)
+### Anonymiser un étudiant (droit à l'effacement RGPD)
+
+C'est le chemin d'exercice du **droit à l'effacement** (RGPD art. 17), à utiliser
+en fin de scolarité selon la politique DPO. L'opération est **irréversible** :
+aucune donnée effacée n'est récupérable.
 
 ```bash
-python cli.py delete-student alice --yes
+# Avec confirmation interactive
+python cli.py anonymize-student alice
+
+# Non interactif (traitement de liste en fin d'année)
+python cli.py anonymize-student alice --yes
 ```
 
-Supprime le compte, toutes ses clés API et tous ses logs d'usage (cascade FK).
-**Irréversible.** À utiliser en fin de scolarité selon la politique DPO.
+La politique retenue est l'**anonymisation**, pas la suppression de ligne : la
+ligne étudiante est conservée pour que les rapports d'usage agrégés restent
+exploitables, tandis que la personne cesse d'être ré-identifiable.
+
+| | Champ | Devient |
+|---|---|---|
+| **Effacé** | `users.username` | pseudonyme stable `anonymized-user:<id>` |
+| **Effacé** | `users.email` | `NULL` |
+| **Effacé** | `users.notes` | `NULL` |
+| **Effacé** | `api_keys.name` (champ libre) | `NULL` |
+| **Suspendu** | `users.is_active` | `0` — toutes les requêtes sont rejetées |
+| **Révoqué** | `api_keys.is_active` | `0` sur **toutes** les clés `llmstu-*` |
+| **Conservé** | `users.id`, `created_at`, les quotas | inchangés |
+| **Conservé** | toutes les lignes `usage_log` | inchangées |
+| **Ajouté** | `users.anonymized_at` | horodatage UTC de l'opération |
+
+**Pourquoi pas une suppression.** `usage_log.user_id` référence `users(id)` et
+`PRAGMA foreign_keys = ON` est appliqué à chaque connexion : l'ancienne commande
+`delete-student` échouait en `IntegrityError: FOREIGN KEY constraint failed` dès
+que l'étudiant avait servi une requête — c'est-à-dire pour tout étudiant réel.
+`ON DELETE CASCADE` ferait disparaître l'historique de facturation et
+`ON DELETE SET NULL` casserait les jointures des rapports.
+
+**Comportement à connaître :**
+
+- **Idempotent.** Une seconde anonymisation ne produit pas d'erreur et préserve
+  l'horodatage initial. L'ancien nom n'existe plus : reciblez le compte par son
+  pseudonyme.
+- **Étudiant inexistant** → message d'erreur explicite, code de sortie `1`.
+- **Nom réutilisable.** L'ancien nom est libéré : un étudiant qui revient peut
+  être recréé sous le même identifiant. Le nouveau compte a un `id` distinct et
+  ne récupère pas l'historique de l'ancien.
+- **Visibilité.** Le compte reste listé par `list-students`, comme un compte
+  suspendu, sans e-mail ni clé active. Il n'est jamais compté dans les étudiants
+  actifs de `stats`.
+- **Rapports.** `usage-report` continue d'inclure ses requêtes, sous le
+  pseudonyme et sans e-mail : les totaux sont inchangés.
+- **Journaux.** L'opération ne journalise aucune donnée personnelle.
+
+> **`delete-student` est un alias obsolète** de `anonymize-student`, conservé pour
+> les scripts existants. Il anonymise et signale sa dépréciation. Préférez
+> `anonymize-student`, dont le nom décrit l'effet réel.
+
+> **Suspendre ≠ anonymiser.** `deactivate-student` bloque l'accès en conservant
+> toutes les données et s'annule avec `activate-student`. `anonymize-student`
+> efface définitivement. Pour une mesure temporaire, utilisez la suspension.
 
 ---
 
@@ -264,13 +316,16 @@ python cli.py usage-report --days 120 2>&1 | tee rapport-S2-2026.txt
 python cli.py list-keys | grep -E "expir|révoquée"
 ```
 
-### 3. Supprimer les étudiants sortants (RGPD)
+### 3. Anonymiser les étudiants sortants (RGPD)
 
 Selon la politique DPO (liste fournie par la scolarité) :
 
 ```bash
-python cli.py delete-student nom.prenom --yes
+python cli.py anonymize-student nom.prenom --yes
 ```
+
+Données personnelles effacées définitivement et clés révoquées ; l'historique
+d'usage agrégé est conservé sous pseudonyme. **Irréversible.**
 
 ### 4. Créer les clés pour le nouveau semestre
 

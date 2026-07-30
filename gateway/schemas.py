@@ -38,6 +38,32 @@ class UserResponse(BaseModel):
     rpm_limit: int
     monthly_token_limit: int
     notes: Optional[str]
+    # Non NULL = compte anonymisé (RGPD, DEC-001) : permet de le distinguer d'un
+    # compte simplement désactivé. `username` est alors un pseudonyme, `email` et
+    # `notes` sont définitivement effacés.
+    anonymized_at: Optional[str] = None
+
+
+class UserAnonymizeResponse(BaseModel):
+    """
+    Réponse de `DELETE /admin/users/{username}`.
+
+    La route porte le verbe `DELETE` pour compatibilité, mais son effet est une
+    anonymisation irréversible : ce corps de réponse énumère explicitement ce qui
+    est effacé et ce qui est conservé, pour qu'aucun opérateur ne puisse croire à
+    une suppression de ligne.
+    """
+    status: Literal["anonymized", "already_anonymized"]
+    message: str
+    user_id: int
+    anonymized_username: str = Field(
+        ..., description="Pseudonyme stable qui remplace le nom d'utilisateur effacé."
+    )
+    anonymized_at: str
+    keys_revoked: int = Field(..., description="Clés encore actives révoquées par cet appel.")
+    keys_total: int = Field(..., description="Clés attachées au compte, toutes révoquées.")
+    erased_fields: list[str]
+    retained: list[str]
 
 
 # ── Clés API ──────────────────────────────────────────────────────────────────

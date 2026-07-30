@@ -10,6 +10,7 @@ Utilisation rapide :
   python cli.py expiring-keys --days 30
   python cli.py set-quota alice --rpm-limit 20
   python cli.py deactivate-student alice
+  python cli.py anonymize-student alice --yes   # RGPD, irréversible
 """
 
 from __future__ import annotations
@@ -231,12 +232,13 @@ def activate_student(
     _run(run())
 
 
-@app.command()
-def delete_student(
-    username: str = typer.Argument(..., help="Nom d'utilisateur à supprimer définitivement"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Confirmer sans demander"),
-) -> None:
-    """Supprime un étudiant et toutes ses données (RGPD — irréversible)."""
+def _anonymize_student(username: str, yes: bool) -> None:
+    """
+    Implémentation partagée par `anonymize-student` et son alias `delete-student`.
+
+    Politique DEC-001 : la ligne étudiante est conservée, ses données
+    personnelles sont effacées, le compte est suspendu et ses clés sont révoquées.
+    """
 
     async def run() -> None:
         await db.init_db()
@@ -245,18 +247,70 @@ def delete_student(
             _abort(f"Étudiant introuvable : {username}")
 
         if not yes:
-            confirm = typer.confirm(
-                f"Supprimer définitivement {username} (clés + logs) ? Cette opération est irréversible.",
-                default=False,
+            console.print(
+                "[yellow]Anonymisation irréversible :[/] nom, e-mail, notes et noms "
+                "de clés seront effacés définitivement ; les clés seront révoquées. "
+                "L'historique d'usage est CONSERVÉ sous un pseudonyme."
             )
+            confirm = typer.confirm(f"Anonymiser {username} ?", default=False)
             if not confirm:
                 console.print("[dim]Annulé.[/]")
                 return
 
-        await db.delete_user(user["id"])
-        console.print(f"[green]✓[/] [bold]{username}[/] supprimé (clés et logs inclus).")
+        result = await db.anonymize_user(user["id"])
+        if result is None:
+            _abort(f"Étudiant introuvable : {username}")
+
+        if result["already_anonymized"]:
+            console.print(
+                f"[yellow]⚠[/] Déjà anonymisé le {result['anonymized_at']} — "
+                "horodatage initial conservé."
+            )
+        else:
+            console.print("[green]✓[/] Étudiant anonymisé (droit à l'effacement RGPD).")
+        console.print(f"  Pseudonyme     : [cyan]{result['username']}[/]")
+        console.print(f"  Anonymisé le   : {result['anonymized_at']}")
+        console.print(f"  Clés révoquées : {result['keys_revoked']} / {result['keys_total']}")
+        console.print("  Effacé         : username, email, notes, nom des clés")
+        console.print("  Conservé       : id, created_at, journal usage_log")
 
     _run(run())
+
+
+@app.command()
+def anonymize_student(
+    username: str = typer.Argument(..., help="Nom d'utilisateur à anonymiser"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirmer sans demander"),
+) -> None:
+    """
+    Anonymise un étudiant — IRRÉVERSIBLE. Droit à l'effacement RGPD.
+
+    Efface définitivement le nom d'utilisateur, l'e-mail, les notes et le nom des
+    clés ; suspend le compte et révoque toutes ses clés. CONSERVE la ligne
+    étudiante et tout l'historique usage_log, pour que les rapports agrégés
+    restent exploitables (politique DEC-001).
+    """
+    _anonymize_student(username, yes)
+
+
+@app.command("delete-student")
+def delete_student(
+    username: str = typer.Argument(..., help="Nom d'utilisateur à anonymiser"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirmer sans demander"),
+) -> None:
+    """
+    [Obsolète] Alias de `anonymize-student`, conservé pour les scripts existants.
+
+    Cette commande n'a JAMAIS supprimé la ligne étudiante : le `DELETE` échouait
+    en violation de clé étrangère dès que l'étudiant avait servi une requête
+    (COR-002). Elle anonymise désormais, conformément à DEC-001 — utilisez
+    `anonymize-student`, dont le nom décrit l'effet réel.
+    """
+    console.print(
+        "[dim]Note : `delete-student` est un alias obsolète de "
+        "`anonymize-student` (aucune ligne n'est supprimée).[/]"
+    )
+    _anonymize_student(username, yes)
 
 
 @app.command()

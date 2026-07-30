@@ -177,6 +177,92 @@ curl -s -X PATCH "$GW/admin/users/carol" \
   -d '{"is_active": false}'
 ```
 
+### Anonymiser un utilisateur (droit à l'effacement RGPD)
+
+C'est le chemin d'exercice du **droit à l'effacement** (RGPD art. 17). L'opération
+est **irréversible** : aucune donnée effacée n'est récupérable.
+
+La politique retenue est l'**anonymisation**, pas la suppression de ligne. La
+ligne utilisateur est conservée pour que l'historique de facturation et d'audit
+reste exploitable, tandis que la personne cesse d'être ré-identifiable.
+
+| | Champ | Devient |
+|---|---|---|
+| **Effacé** | `users.username` | pseudonyme stable `anonymized-user:<id>` |
+| **Effacé** | `users.email` | `NULL` |
+| **Effacé** | `users.notes` | `NULL` |
+| **Effacé** | `api_keys.name` (champ libre) | `NULL` |
+| **Désactivé** | `users.is_active` | `0` — toutes les requêtes sont rejetées |
+| **Révoqué** | `api_keys.is_active` | `0` sur **toutes** les clés du compte |
+| **Conservé** | `users.id`, `users.created_at` | inchangés |
+| **Conservé** | toutes les lignes `usage_log` | inchangées |
+| **Ajouté** | `users.anonymized_at` | horodatage UTC de l'opération |
+
+**Pourquoi pas une suppression.** `usage_log.user_id` référence `users(id)` et
+`PRAGMA foreign_keys = ON` est appliqué à chaque connexion : un `DELETE FROM
+users` échouait en violation de clé étrangère dès que l'utilisateur avait servi
+une requête. Les deux alternatives ont été écartées — `ON DELETE CASCADE` fait
+disparaître l'historique de facturation, `ON DELETE SET NULL` casse les jointures
+des rapports.
+
+```bash
+# CLI — avec confirmation interactive
+llmgw anonymize-user alice
+
+# CLI — non interactif (scripts de fin d'année)
+llmgw anonymize-user alice --yes
+
+# API REST — le verbe DELETE est conservé pour les scripts existants,
+# mais son effet est une anonymisation, décrite dans la réponse.
+curl -s -X DELETE "$GW/admin/users/alice" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+```
+
+Réponse de l'API :
+
+```json
+{
+  "status": "anonymized",
+  "message": "Utilisateur anonymisé : données personnelles effacées définitivement, clés révoquées, historique d'usage conservé.",
+  "user_id": 1,
+  "anonymized_username": "anonymized-user:1",
+  "anonymized_at": "2025-03-20 14:05:11",
+  "keys_revoked": 2,
+  "keys_total": 2,
+  "erased_fields": ["username", "email", "notes", "api_keys.name"],
+  "retained": ["users.id", "users.created_at", "usage_log"]
+}
+```
+
+**Comportement à connaître :**
+
+- **Idempotent.** Une seconde anonymisation répond `200` avec
+  `"status": "already_anonymized"` et **préserve l'horodatage initial**. Notez
+  que l'ancien nom n'existe plus : reciblez le compte par son pseudonyme.
+- **Utilisateur inexistant** → `404`, et code de sortie `1` côté CLI.
+- **Nom réutilisable.** L'ancien nom d'utilisateur est libéré : recréer un compte
+  homonyme fonctionne (cas d'un étudiant qui revient). Le nouveau compte a un
+  `id` distinct et ne récupère pas l'historique de l'ancien.
+- **Visibilité.** Un compte anonymisé reste listé par `GET /admin/users` et
+  `llmgw list-users --all`, comme un compte désactivé, avec un `anonymized_at`
+  non nul qui le distingue d'une simple désactivation. Il n'est **jamais** compté
+  dans les utilisateurs actifs du dashboard.
+- **Rapports.** `GET /admin/usage` et `GET /admin/usage/summary` continuent
+  d'inclure ses requêtes, sous le pseudonyme : les totaux de facturation sont
+  inchangés. C'est l'objectif même de cette politique.
+- **Journaux.** L'opération ne journalise que l'`id` technique — ni le nom, ni
+  l'e-mail, ni les notes effacées ne réapparaissent dans les logs applicatifs.
+
+> **Désactiver ≠ anonymiser.** `disable-user` bloque l'accès en conservant toutes
+> les données et se réactive avec `enable-user`. `anonymize-user` efface les
+> données personnelles définitivement et ne s'annule pas. Pour une suspension
+> temporaire, utilisez `disable-user`.
+
+> **Purge de l'historique.** L'anonymisation conserve `usage_log` par conception.
+> Si une demande d'effacement impose de retirer aussi les lignes d'usage, la
+> purge par rétention (`purge-usage`, section 5) est l'outil approprié — elle
+> opère par ancienneté, pas par utilisateur.
+
 ---
 
 ## 3. Gestion des clés API
@@ -1004,7 +1090,7 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 | `GET` | `/admin/users` | Lister tous les utilisateurs |
 | `GET` | `/admin/users/{username}` | Détail d'un utilisateur |
 | `PATCH` | `/admin/users/{username}` | Modifier un utilisateur |
-| `DELETE` | `/admin/users/{username}` | Supprimer un utilisateur (**destructif / irréversible**) |
+| `DELETE` | `/admin/users/{username}` | **Anonymiser** un utilisateur — RGPD, **irréversible**. La ligne et l'historique `usage_log` sont conservés, les données personnelles effacées, les clés révoquées ([détail](#anonymiser-un-utilisateur-droit-à-leffacement-rgpd)) |
 
 ### Clés API
 

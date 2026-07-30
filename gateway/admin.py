@@ -35,6 +35,7 @@ from schemas import (
     ModelStatusResponse,
     UsageEntry,
     UsageSummaryEntry,
+    UserAnonymizeResponse,
     UserCreate,
     UserResponse,
     UserUpdate,
@@ -562,22 +563,64 @@ async def list_keys(
     return await db.list_keys_for_user(user["id"])
 
 
-@router.delete("/users/{username}", status_code=200)
-async def delete_user(
+@router.delete(
+    "/users/{username}",
+    status_code=200,
+    response_model=UserAnonymizeResponse,
+    summary="Anonymiser un utilisateur (droit à l'effacement RGPD)",
+)
+async def anonymize_user(
     username: str,
     _: None = Depends(require_admin),
 ) -> dict:
-    """Supprime un utilisateur et toutes ses clés API (action irréversible)."""
+    """
+    Anonymise un utilisateur — **irréversible**. Chemin du droit à l'effacement.
+
+    La route conserve le verbe `DELETE` et son chemin pour ne pas casser les
+    scripts opérateur existants, mais son effet est une ANONYMISATION, pas une
+    suppression de ligne (politique DEC-001) :
+
+    - effacé   : `username` (remplacé par un pseudonyme stable), `email`,
+      `notes`, et le champ libre `name` de chaque clé API ;
+    - conservé : la ligne `users` (`id`, `created_at`) et tout l'historique
+      `usage_log`, pour que la facturation et l'audit restent exploitables ;
+    - le compte est désactivé et **toutes** ses clés sont révoquées.
+
+    Un `DELETE` réel était impossible : `usage_log.user_id` n'a pas de
+    `ON DELETE CASCADE`, la route répondait donc 500 pour tout utilisateur ayant
+    servi au moins une requête (COR-002).
+
+    Idempotente : un second appel répond 200 sans réécrire l'horodatage initial.
+    """
     user = await db.get_user_by_username(username)
     if not user:
         raise HTTPException(status_code=404, detail=f"Utilisateur '{username}' introuvable.")
 
-    deleted = await db.delete_user(user["id"])
-    if not deleted:
-        raise HTTPException(status_code=500, detail="Échec de la suppression.")
+    result = await db.anonymize_user(user["id"])
+    if result is None:  # pragma: no cover — la ligne vient d'être lue
+        raise HTTPException(status_code=404, detail=f"Utilisateur '{username}' introuvable.")
 
-    log.info("Admin : utilisateur '%s' supprimé", username)
-    return {"message": f"Utilisateur '{username}' supprimé avec succès."}
+    # Journalisation volontairement sans donnée personnelle : ni le nom effacé,
+    # ni l'e-mail, ni les notes ne doivent réapparaître dans les logs (§14).
+    log.info(
+        "Admin : utilisateur id=%s anonymisé (RGPD) — %d clé(s) révoquée(s), "
+        "déjà anonymisé : %s",
+        result["user_id"], result["keys_revoked"], result["already_anonymized"],
+    )
+    return {
+        "status": "already_anonymized" if result["already_anonymized"] else "anonymized",
+        "message": (
+            "Utilisateur anonymisé : données personnelles effacées "
+            "définitivement, clés révoquées, historique d'usage conservé."
+        ),
+        "user_id": result["user_id"],
+        "anonymized_username": result["username"],
+        "anonymized_at": result["anonymized_at"],
+        "keys_revoked": result["keys_revoked"],
+        "keys_total": result["keys_total"],
+        "erased_fields": ["username", "email", "notes", "api_keys.name"],
+        "retained": ["users.id", "users.created_at", "usage_log"],
+    }
 
 
 @router.delete("/keys/{key_prefix}", status_code=200)

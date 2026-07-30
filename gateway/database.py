@@ -38,7 +38,14 @@ CREATE TABLE IF NOT EXISTS users (
     is_active             INTEGER NOT NULL DEFAULT 1,
     rpm_limit             INTEGER NOT NULL DEFAULT 20,
     monthly_token_limit   INTEGER NOT NULL DEFAULT 0,
-    notes                 TEXT
+    notes                 TEXT,
+    -- Horodatage d'anonymisation (COR-002 / DEC-001). NULL = utilisateur
+    -- ordinaire. Non NULL = données personnelles effacées définitivement.
+    -- Distingue un compte anonymisé d'un compte simplement désactivé, et rend
+    -- l'opération idempotente. Déclarée en dernière position, la place
+    -- qu'`ALTER TABLE ADD COLUMN` lui donne sur une base migrée, ce qui garde
+    -- une base neuve et une base migrée strictement identiques.
+    anonymized_at         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -180,16 +187,15 @@ def _split_statements(script: str) -> tuple[str, ...]:
 
     Le schéma de ce module ne contient ni trigger ni littéral comportant un
     « ; » : le découpage naïf est donc sûr. Les lignes de commentaire sont
-    retirées pour ne pas produire de fragment vide en fin de script.
+    retirées AVANT le découpage — un « ; » de ponctuation dans un commentaire
+    français tronquerait sinon l'instruction qui l'entoure.
     """
-    statements: list[str] = []
-    for chunk in script.split(";"):
-        body = "\n".join(
-            line for line in chunk.splitlines() if not line.strip().startswith("--")
-        ).strip()
-        if body:
-            statements.append(body)
-    return tuple(statements)
+    without_comments = "\n".join(
+        line for line in script.splitlines() if not line.strip().startswith("--")
+    )
+    return tuple(
+        chunk.strip() for chunk in without_comments.split(";") if chunk.strip()
+    )
 
 
 async def _rebuild_table(
@@ -230,6 +236,27 @@ async def _rebuild_table(
         await db.execute(statement)
 
 
+async def _ensure_anonymized_at(db: aiosqlite.Connection) -> None:
+    """
+    Garantit la présence de `users.anonymized_at` (COR-002).
+
+    La colonne fait partie de `_SCHEMA` : une base neuve la reçoit déjà par la
+    migration de baseline, tandis qu'une base déployée avant COR-002 ne l'a pas.
+    On inspecte donc l'état réel via `PRAGMA table_info` plutôt que de le
+    supposer, et l'`ALTER TABLE` n'est émis que si la colonne manque — sans quoi
+    SQLite rejetterait un « duplicate column name » sur base neuve.
+
+    Aucune recréation de table n'est nécessaire : la politique DEC-001 conserve
+    la ligne `users`, donc la clé étrangère `usage_log.user_id → users(id)`
+    n'est jamais violée et sa contrainte reste inchangée.
+    """
+    rows = await (await db.execute("PRAGMA table_info(users)")).fetchall()
+    if any(row["name"] == "anonymized_at" for row in rows):
+        logger.debug("Colonne users.anonymized_at déjà présente.")
+        return
+    await db.execute("ALTER TABLE users ADD COLUMN anonymized_at TEXT")
+
+
 # Liste ordonnée des migrations. Ajouter une entrée en fin de tuple, jamais
 # réécrire une entrée déjà livrée (une base en production l'a déjà appliquée).
 MIGRATIONS: tuple[Migration, ...] = (
@@ -240,6 +267,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         # préexistante (user_version = 0) cette migration ne fait qu'estampiller
         # la version, sans toucher aux données.
         statements=_split_statements(_SCHEMA),
+    ),
+    Migration(
+        version=2,
+        description="Colonne users.anonymized_at (politique d'anonymisation DEC-001)",
+        apply=_ensure_anonymized_at,
     ),
 )
 
@@ -456,6 +488,17 @@ def hash_key(raw_key: str) -> str:
 
 # ── Helpers utilisateurs ──────────────────────────────────────────────────────
 
+# Préfixe du pseudonyme attribué par `anonymize_user()`. Le « : » est refusé par
+# le motif de `UserCreate` (`^[a-zA-Z0-9_.-]+$`) : l'API admin ne peut donc pas
+# créer un nom entrant en collision avec un compte anonymisé.
+ANONYMIZED_USERNAME_PREFIX = "anonymized-user:"
+
+
+def is_anonymized(user: dict) -> bool:
+    """True si la ligne utilisateur porte un horodatage d'anonymisation."""
+    return bool(user.get("anonymized_at"))
+
+
 async def create_user(
     username: str,
     email: str | None = None,
@@ -617,12 +660,88 @@ async def list_keys_for_user(user_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-async def delete_user(user_id: int) -> bool:
-    """Supprime définitivement un utilisateur et toutes ses clés (CASCADE). Retourne True si supprimé."""
+async def anonymize_user(user_id: int) -> dict | None:
+    """
+    Anonymise un utilisateur — chemin du droit à l'effacement RGPD (COR-002).
+
+    Politique DEC-001 : la ligne `users` est CONSERVÉE, ses données personnelles
+    sont effacées, le compte est désactivé et toutes ses clés sont révoquées.
+
+    Pourquoi pas un `DELETE` : `usage_log.user_id` référence `users(id)` sans
+    `ON DELETE CASCADE`, et `PRAGMA foreign_keys = ON` est appliqué à chaque
+    connexion — un `DELETE FROM users` échouait donc en `IntegrityError` dès que
+    l'utilisateur avait servi une seule requête. `ON DELETE CASCADE` ferait
+    perdre la traçabilité de facturation et `SET NULL` casserait les jointures
+    des rapports : les deux ont été écartés.
+
+    Effacé      : `username` (remplacé par un pseudonyme stable), `email`,
+                  `notes`, et le champ libre `api_keys.name`.
+    Conservé    : `id`, `created_at`, les lignes `usage_log` et les métadonnées
+                  non identifiantes des clés (préfixe, dates, hash) — l'historique
+                  agrégé reste exploitable pour la facturation et l'audit.
+    Irréversible: aucune donnée effacée n'est récupérable.
+
+    Idempotent : un second appel ne réécrit pas `anonymized_at` et n'échoue pas.
+    Retourne None si l'utilisateur n'existe pas (le caller décide du 404).
+
+    Le pseudonyme dérive de l'`id` (clé primaire AUTOINCREMENT, jamais réattribuée)
+    et contient un « : », caractère refusé par le motif de `UserCreate` : deux
+    anonymisations ne peuvent pas entrer en collision sur la contrainte UNIQUE, et
+    l'ancien nom redevient disponible pour un utilisateur recréé plus tard.
+    """
     async with get_db() as db:
-        cursor = await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        row = await (await db.execute(
+            "SELECT id, anonymized_at FROM users WHERE id = ?", (user_id,)
+        )).fetchone()
+        if row is None:
+            return None
+
+        # `WHERE anonymized_at IS NULL` : le premier horodatage est préservé sans
+        # relecture préalable, donc sans fenêtre de course avec un second appel.
+        cursor = await db.execute(
+            """
+            UPDATE users
+               SET username      = ?,
+                   email         = NULL,
+                   notes         = NULL,
+                   is_active     = 0,
+                   anonymized_at = datetime('now')
+             WHERE id = ?
+               AND anonymized_at IS NULL
+            """,
+            (f"{ANONYMIZED_USERNAME_PREFIX}{user_id}", user_id),
+        )
+        already_anonymized = cursor.rowcount == 0
+
+        # Révocation des clés : inconditionnelle et idempotente. Une clé déjà
+        # révoquée le reste, et le champ libre `name` est effacé dans tous les cas
+        # (il peut porter un nom de personne ou de machine).
+        revoked = await db.execute(
+            "UPDATE api_keys SET is_active = 0 WHERE user_id = ? AND is_active = 1",
+            (user_id,),
+        )
+        revoked_now = revoked.rowcount
+        await db.execute(
+            "UPDATE api_keys SET name = NULL WHERE user_id = ? AND name IS NOT NULL",
+            (user_id,),
+        )
         await db.commit()
-        return cursor.rowcount > 0
+
+        final = await (await db.execute(
+            "SELECT username, anonymized_at FROM users WHERE id = ?", (user_id,)
+        )).fetchone()
+        keys_total = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM api_keys WHERE user_id = ?", (user_id,)
+        )).fetchone()
+
+    return {
+        "user_id": user_id,
+        "username": final["username"],
+        "anonymized_at": final["anonymized_at"],
+        "already_anonymized": already_anonymized,
+        "keys_revoked": revoked_now,
+        "keys_total": int(keys_total["n"] or 0),
+    }
 
 
 async def touch_key_last_used(key_id: int) -> None:
