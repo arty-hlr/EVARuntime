@@ -21,7 +21,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_NGINX_CONF = REPO_ROOT / "gateway" / "deploy" / "nginx.conf"
+SHIPPED_MODELS_YAML = REPO_ROOT / "gateway" / "models.yaml"
 DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
+API_DOC = REPO_ROOT / "docs" / "api.md"
+
+# Hôte public utilisé par tous les exemples de `docs/api.md`.
+PUBLIC_HOST = "https://llm.eva.univ-pau.fr"
 
 
 # ── Socle nginx supporté ──────────────────────────────────────────────────────
@@ -142,3 +147,231 @@ def test_http2_reste_disponible_en_une_ligne_a_decommenter(conf_text):
     doc = DEPLOYMENT_DOC.read_text(encoding="utf-8")
     assert "http2 on;" in doc
     assert "1.25.1" in doc
+
+
+# ── COR-009 : timeouts dérivés du registre ────────────────────────────────────
+
+def _https_server(text):
+    """Le bloc `server` qui porte le TLS — celui qui proxifie vers la gateway."""
+    import doctor  # noqa: PLC0415 - import tardif : conftest prépare l'environnement
+
+    servers = doctor.parse_nginx_servers(text)
+    return next(s for s in servers if s.directives.get("ssl_certificate"))
+
+
+def _required_timeout_seconds():
+    """
+    Attente maximale qu'un client peut subir sur un chargement, DÉRIVÉE du
+    registre livré et non d'une constante figée : le jour où quelqu'un ajoute un
+    modèle plus lent, cette valeur monte et le test échoue tant que nginx n'a pas
+    suivi.
+
+    Différence assumée avec `doctor`, qui ne regarde que les modèles ACTIVÉS :
+    ici on prend `list_all()`. Un modèle désactivé se réactive d'un
+    `enabled: true` (`minimax-m2.7`, 600 s), et la conf LIVRÉE doit couvrir ce
+    cas sans qu'on ait à retoucher nginx dans la foulée.
+    """
+    import doctor  # noqa: PLC0415
+    import model_registry  # noqa: PLC0415
+    from config import settings  # noqa: PLC0415
+
+    registry = model_registry.ModelRegistry(SHIPPED_MODELS_YAML)
+    models = registry.list_all()
+    return doctor.required_load_timeout_seconds(settings, models), models
+
+
+def test_le_registre_livre_est_lisible_et_dimensionnant():
+    """Contrôle positif du test suivant : sans registre lu, l'exigence est vide."""
+    required, models = _required_timeout_seconds()
+    assert len(models) >= 3, "registre livré vide ou illisible"
+    # Au moins un modèle surcharge le timeout par défaut : c'est ce qui rend
+    # l'exigence supérieure aux 190 s de MODEL_LOAD_TIMEOUT_SECONDS + 10.
+    assert any(getattr(m, "load_timeout_seconds", None) for m in models)
+    assert required >= 610, required
+
+
+@pytest.mark.parametrize("path", [
+    "/admin/models/llama-3.3-70b-instruct/load",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/completion",
+    "/completion",
+    "/v1/tokenize",
+])
+def test_les_timeouts_livres_couvrent_le_registre(conf_text, path):
+    """
+    COR-009 : chaque route capable de déclencher un chargement de modèle doit
+    laisser au proxy plus de temps que `load_timeout_seconds + 10` du pire modèle
+    du registre. Sinon le client reçoit 504 alors que le chargement RÉUSSIT.
+    """
+    import doctor  # noqa: PLC0415
+
+    required, _ = _required_timeout_seconds()
+    https = _https_server(conf_text)
+
+    location = doctor.match_location(https.locations, path)
+    assert location is not None, f"{path} ne matche aucun location"
+    assert "proxy_pass" in location.directives, (
+        f"{path} tombe dans un bloc non proxifiant (404) — route injoignable"
+    )
+
+    for directive in ("proxy_read_timeout", "proxy_send_timeout"):
+        raw = https.effective(location, directive)
+        assert raw is not None, f"{directive} absent pour {path}"
+        seconds = doctor.parse_nginx_time(raw)
+        assert seconds is not None, f"{directive} illisible : {raw!r}"
+        assert seconds >= required, (
+            f"{directive}={raw} sur « {location.pattern} » alors que le registre "
+            f"exige {required}s"
+        )
+
+
+def test_le_defaut_dorigine_du_timeout_admin_serait_detecte(conf_text):
+    """
+    Contrôle positif du test précédent : on réintroduit `proxy_read_timeout 30s`
+    sur `/admin/` et le contrôle doit rougir. Sans ça, une comparaison qui ne
+    compare rien passerait inaperçue.
+    """
+    import doctor  # noqa: PLC0415
+
+    regressed = conf_text.replace(
+        "        proxy_send_timeout     900s;\n        proxy_read_timeout     900s;\n    }\n\n"
+        "    # Bloquer tout le reste",
+        "        proxy_send_timeout     30s;\n        proxy_read_timeout     30s;\n    }\n\n"
+        "    # Bloquer tout le reste",
+    )
+    assert regressed != conf_text, "le bloc /admin/ n'a pas été retrouvé"
+
+    required, _ = _required_timeout_seconds()
+    https = _https_server(regressed)
+    admin = doctor.match_location(https.locations, "/admin/models/m1/load")
+    assert doctor.parse_nginx_time(admin.directives["proxy_read_timeout"]) < required
+
+    # Et doctor doit continuer à le signaler : son diagnostic reste juste.
+    from config import settings  # noqa: PLC0415
+    import model_registry  # noqa: PLC0415
+    models = model_registry.ModelRegistry(SHIPPED_MODELS_YAML).list_enabled()
+    result = doctor.check_nginx_timeouts(
+        doctor.parse_nginx_servers(regressed), settings, models
+    )
+    assert result.status == "warn"
+    assert result.code == "nginx_admin_timeout_too_short"
+
+
+def test_doctor_ne_signale_rien_sur_la_conf_livree(conf_text):
+    """Le correctif doit rendre le contrôle `nginx_timeouts` de doctor vert."""
+    import doctor  # noqa: PLC0415
+    import model_registry  # noqa: PLC0415
+    from config import settings  # noqa: PLC0415
+
+    models = model_registry.ModelRegistry(SHIPPED_MODELS_YAML).list_enabled()
+    assert models, "contrôle positif : aucun modèle activé, le contrôle serait vide"
+    result = doctor.check_nginx_timeouts(
+        doctor.parse_nginx_servers(conf_text), settings, models
+    )
+    assert result.status == "pass", result.message
+
+
+# ── COR-009 : alignement routes FastAPI ↔ nginx ↔ docs/api.md ─────────────────
+
+def _app_route_paths() -> set[str]:
+    """
+    Chemins exposés par l'application, `{param}` remplacés par une valeur
+    concrète pour pouvoir les confronter aux `location` nginx.
+
+    Réutilise le parcours récursif de `test_smoke_test_script` : depuis FastAPI
+    0.141, `include_router()` dépose un `_IncludedRouter` dans `app.routes` et
+    une lecture directe ne verrait AUCUNE route `/admin/*`.
+    """
+    import main  # noqa: PLC0415
+    from tests.test_smoke_test_script import _iter_app_routes  # noqa: PLC0415
+
+    return {
+        re.sub(r"\{[^}]+\}", "x", path) for _, path in _iter_app_routes(main.app)
+    }
+
+
+def _documented_public_paths() -> set[str]:
+    """
+    Chemins que `docs/api.md` annonce à l'utilisateur. Extraits du texte, deux
+    formes : les URL complètes des exemples `curl`/httpx, et les endpoints cités
+    en `` `MÉTHODE /chemin` `` (tableau récapitulatif §7, titres de section). Le
+    test suit donc automatiquement la doc au lieu de figer une liste.
+    """
+    text = API_DOC.read_text(encoding="utf-8")
+    paths = set()
+    for match in re.finditer(re.escape(PUBLIC_HOST) + r"(/[^\s\"'`),]*)", text):
+        paths.add(match.group(1).rstrip(".,"))
+    for match in re.finditer(r"`(?:GET|POST|PATCH|PUT|DELETE) (/[^`\s]*)`", text):
+        paths.add(match.group(1))
+    # `…/v1` est une base_url de client OpenAI, pas une route.
+    paths.discard("/v1")
+    return paths
+
+
+def test_les_routes_documentees_sont_proxifiees():
+    """
+    Critère COR-009 : « chaque route documentée est exposée ou supprimée de la
+    documentation ». Une route documentée qui retombe dans le `location /` de
+    repli renvoie 404 — c'était le cas de `/completion` et de `/ready`.
+    """
+    import doctor  # noqa: PLC0415
+
+    documented = _documented_public_paths()
+    # Contrôle positif : l'extraction doit voir la doc, pas un ensemble vide.
+    assert len(documented) >= 6, documented
+    assert "/v1/chat/completions" in documented
+
+    https = _https_server(SHIPPED_NGINX_CONF.read_text(encoding="utf-8"))
+    app_paths = _app_route_paths()
+    for path in sorted(documented):
+        assert path in app_paths, f"{path} est documenté mais n'existe pas côté FastAPI"
+        location = doctor.match_location(https.locations, path)
+        assert location is not None and "proxy_pass" in location.directives, (
+            f"{path} est documenté mais nginx renvoie 404 dessus"
+        )
+
+
+def test_toute_route_fastapi_est_joignable_a_travers_nginx():
+    """
+    Sens inverse : aucune route de l'application ne doit tomber dans le repli
+    404. `/admin/*` est joignable mais restreint au réseau campus — c'est le
+    contrôle d'accès qui protège, pas un 404 accidentel.
+    """
+    import doctor  # noqa: PLC0415
+
+    app_paths = _app_route_paths()
+    # Contrôle positif : le parcours doit voir les routeurs inclus.
+    assert "/admin/status" in app_paths, "parcours de routes aveugle aux routeurs inclus"
+    assert len(app_paths) >= 30, len(app_paths)
+
+    https = _https_server(SHIPPED_NGINX_CONF.read_text(encoding="utf-8"))
+    unreachable = []
+    for path in sorted(app_paths):
+        location = doctor.match_location(https.locations, path)
+        if location is None or "proxy_pass" not in location.directives:
+            unreachable.append(path)
+    assert unreachable == [], f"routes exposées par FastAPI mais 404 via nginx : {unreachable}"
+
+
+def test_admin_reste_restreint_au_reseau_campus(conf_text):
+    """Aucune protection relâchée par COR-009 : `/admin/` garde son filtrage IP."""
+    import doctor  # noqa: PLC0415
+
+    https = _https_server(conf_text)
+    admin = doctor.match_location(https.locations, "/admin/status")
+    assert admin is not None and admin.pattern == "/admin/"
+    assert admin.directives.get("deny") == "all"
+
+    allows = [
+        args[0] for name, args in parse_statements(conf_text)
+        if name == "allow" and args
+    ]
+    assert len(allows) >= 4, allows
+    assert "127.0.0.1" in allows
+
+    # Le repli reste un 404 sec : nginx ne devient pas un proxy ouvert.
+    fallback = doctor.match_location(https.locations, "/n-importe-quoi")
+    assert fallback is not None and fallback.pattern == "/"
+    assert fallback.directives.get("return") == "404"
+    assert "proxy_pass" not in fallback.directives

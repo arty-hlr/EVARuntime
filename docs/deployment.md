@@ -929,14 +929,14 @@ sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
 - `--base-url` sur la **gateway en direct** (défaut) ne couvre **rien** de tout
   cela : un premier token vert en direct peut rester invisible côté client
   derrière un nginx mal configuré.
-- `--admin-url` vise la gateway **en direct** par défaut, volontairement :
-  `/ready` n'est pas proxifiée par `deploy/nginx.conf` (`location /` renvoie
-  404), et `location /admin/` impose `proxy_read_timeout 30s` alors qu'un
-  `POST /admin/models/{id}/load` peut légitimement attendre jusqu'à ~310 s
-  (`MODEL_LOAD_TIMEOUT_SECONDS + 10`). À travers nginx, le chargement
-  renverrait 504 alors qu'il **réussit** côté serveur, et la recette conclurait
-  à tort à une régression. Ce défaut est suivi par l'item COR-009 et n'est pas
-  corrigé par la recette : elle le contourne.
+- `--admin-url` vise la gateway **en direct** par défaut, volontairement : les
+  routes `/admin/*` sont restreintes au réseau campus par nginx, et la recette
+  doit rester exécutable depuis l'hôte lui-même. Depuis COR-009, viser nginx
+  fonctionne aussi : `/ready` y est proxifiée et `location /admin/` laisse 900 s,
+  soit au-delà des ~310 s qu'un `POST /admin/models/{id}/load` peut légitimement
+  attendre (`load_timeout_seconds + 10`, pire modèle activé). Avant COR-009 ce
+  même appel renvoyait 504 à travers nginx (`proxy_read_timeout 30s`) alors qu'il
+  **réussissait** côté serveur, et la recette concluait à tort à une régression.
 
 ##### Sécurité de la recette
 
@@ -1031,7 +1031,7 @@ Cas particuliers :
 | Cause rapportée | Interprétation |
 |---|---|
 | `readiness_failed:model_file_missing` | Un GGUF d'un modèle `enabled: true` manque. Le télécharger, corriger son `path`, ou passer le modèle à `enabled: false`. |
-| `model_load_failed:504` | L'appel a traversé nginx : `proxy_read_timeout 30s` sur `/admin/` (COR-009). Viser `--admin-url` en direct. |
+| `model_load_failed:504` | Un reverse-proxy a coupé avant la fin du chargement. La conf livrée laisse 900 s sur `/admin/` depuis COR-009 : vérifier que l'hôte n'a pas gardé une conf antérieure (`doctor` le signale, contrôle `nginx_timeouts`), ou viser `--admin-url` en direct. |
 | `generation:no_content` | Le stream s'ouvre en 200 mais n'émet aucun token : régression du proxy d'inférence ou backend muet. |
 | `generation:no_done` | Le stream est tronqué : coupure réseau, timeout nginx trop court, ou `llama-server` tué (`MemoryMax`). |
 | `usage_log_missing` | La génération réussit mais n'est pas comptabilisée : la facturation serait fausse. |
@@ -1775,17 +1775,24 @@ La `location /v1/` est scindée :
 
 - **`= /v1/models`** — route légère non-streamante : rate-limit souple, **pas de
   `limit_conn`** (un GET rapide ne doit pas consommer un slot de concurrence GPU) ;
-- **`~ ^/v1/(chat/completions|completions|embeddings)$`** — routes d'inférence :
-  `limit_req` + **`limit_conn api_conn 4`** qui borne les streams SSE concurrents
-  par IP (protection contre le DoS GPU) ;
+- **`~ ^(/v1/(chat/completions|completions|completion|embeddings)|/completion)$`**
+  — routes d'inférence : `limit_req` + **`limit_conn api_conn 4`** qui borne les
+  streams SSE concurrents par IP (protection contre le DoS GPU). `/completion`
+  sans préfixe `/v1/` y figure explicitement : c'est l'endpoint natif llama.cpp
+  documenté en `docs/api.md` §7, qui tombait sinon dans le repli `location /`
+  (404) ;
 - **`/v1/`** (fallback) — conserve par prudence le comportement streaming
-  d'origine, borné en concurrence.
+  d'origine, borné en concurrence ;
+- **`= /ready`** — sonde de readiness non authentifiée, également documentée
+  côté utilisateur ; rate-limitée, sans `limit_conn`, `access_log off`.
 
 > **Réglages SSE préservés à l'identique** sur les routes streamantes :
 > `proxy_buffering off`, `proxy_cache off`, `chunked_transfer_encoding on`,
-> `add_header X-Accel-Buffering no`, `proxy_read_timeout 600s`,
-> `proxy_send_timeout 600s`. Ne pas réduire ces timeouts : cela casserait les
-> générations longues.
+> `add_header X-Accel-Buffering no`, `proxy_read_timeout 900s`,
+> `proxy_send_timeout 900s`. Ne pas réduire ces timeouts : cela casserait les
+> générations longues et les premiers appels à froid (COR-009 — la valeur est
+> dérivée du `load_timeout_seconds` maximal du registre, voir l'en-tête de
+> `gateway/deploy/nginx.conf`).
 
 Recharger après modification :
 
