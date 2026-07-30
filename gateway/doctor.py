@@ -1528,16 +1528,22 @@ def check_nginx_timeouts(
     """
     Cohérence des timeouts nginx avec les timeouts de chargement de modèle.
 
-    Défaut réel et documenté (EVA-004 / COR-009) : `location /admin/` impose
-    `proxy_read_timeout 30s`, alors que `POST /admin/models/{id}/load` attend
-    `MODEL_LOAD_TIMEOUT_SECONDS + 10` — 190 s par défaut, jusqu'à 610 s pour un
-    gros modèle. Le bouton « Load » du dashboard affiche donc un 504 alors que le
-    chargement RÉUSSIT côté serveur.
+    `POST /admin/models/{id}/load` attend `load_timeout_seconds + 10` du pire
+    modèle activé — 190 s avec les seuls défauts, 310 s avec le registre livré
+    (`gemma-4-26b-a4b` : 300 s), 610 s si `minimax-m2.7` est réactivé. Tout
+    reverse-proxy plus court renvoie 504 alors que le chargement RÉUSSIT côté
+    serveur : c'était le défaut EVA-004 / COR-009, `location /admin/` étant livré
+    à `proxy_read_timeout 30s` et le bouton « Load » du dashboard échouant.
 
-    doctor DÉTECTE et SIGNALE cet écart ; il ne corrige pas nginx (c'est le
-    périmètre de COR-009). Constat volontairement NON bloquant : le service sert
-    normalement le trafic d'inférence, et un `install.sh` refusant d'installer
-    pour cette raison serait plus nuisible que le défaut lui-même.
+    `deploy/nginx.conf` est corrigé (900 s sur `/admin/` et sur les blocs
+    d'inférence) ; ce contrôle reste le garde-fou pour les deux cas qu'un
+    correctif ne couvre pas : une conf nginx modifiée à la main sur l'hôte, et
+    l'ajout au registre d'un modèle plus lent que la marge retenue.
+
+    L'exigence est TOUJOURS recalculée depuis le registre — aucune valeur
+    attendue n'est codée en dur ici. Constat volontairement NON bloquant : le
+    service sert normalement le trafic d'inférence, et un `install.sh` refusant
+    d'installer pour cette raison serait plus nuisible que le défaut lui-même.
     """
     # Seuls les blocs qui PROXIFIENT vers la gateway sont concernés : un server
     # de redirection HTTP → HTTPS n'attend aucun upstream et n'a pas de timeout à

@@ -40,7 +40,7 @@ GPU local et pilote des node-agents installés séparément.
 | Python | 3.11+ | `python3 --version` |
 | CUDA toolkit | 12.x | Mode local et chaque node-agent; inutile sur l'orchestrateur cluster |
 | Pilotes NVIDIA | 535+ | `nvidia-smi` sur les hôtes d'inférence, pas sur l'orchestrateur |
-| nginx | 1.18+ | `apt install nginx` |
+| nginx | 1.18+ | `apt install nginx`. La conf livrée est valide de 1.18 à 1.29 ; **HTTP/2 est désactivé par défaut** et demande nginx ≥ 1.25.1 plus une ligne à décommenter — [§8](#8-configuration-nginx) |
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
@@ -527,6 +527,38 @@ sudo ln -sf /etc/nginx/sites-available/llm-gateway \
 sudo nginx -s reload
 ```
 
+### Activer HTTP/2 (optionnel, nginx ≥ 1.25.1)
+
+La configuration livrée n'active **pas** HTTP/2, et ce n'est pas un oubli : aucune
+écriture de la directive n'est acceptée par l'ensemble du socle supporté.
+
+| Version nginx | `listen … ssl http2` | `http2 on;` |
+|---------------|----------------------|-------------|
+| 1.18 (Ubuntu 22.04 LTS) | fonctionne | **`unknown directive` — nginx refuse de démarrer** |
+| 1.24 (Ubuntu 24.04 LTS) | fonctionne | **`unknown directive` — nginx refuse de démarrer** |
+| ≥ 1.25.1 (Debian 13, nginx.org) | **déprécié — warning à chaque `nginx -t` et à chaque reload** | forme recommandée |
+
+Le compromis retenu est donc un `listen` nu : valide et silencieux partout, au
+prix d'HTTP/1.1 par défaut. Le streaming SSE, `proxy_buffering off` et les
+timeouts longs fonctionnent à l'identique en HTTP/1.1 — HTTP/2 n'apporte ici que
+le multiplexage de plusieurs requêtes sur une connexion cliente.
+
+Sur un hôte en nginx ≥ 1.25.1, activer HTTP/2 en deux commandes :
+
+```bash
+# 1. Vérifier la version (HTTP/2 par directive à partir de 1.25.1)
+nginx -v
+
+# 2. Décommenter « http2 on; » dans le bloc server 443
+sudo sed -i 's/^\(\s*\)# http2 on;/\1http2 on;/' \
+          /etc/nginx/sites-available/llm-gateway
+
+sudo nginx -t && sudo nginx -s reload
+```
+
+`nginx -t` ne doit produire **aucun** avertissement, quelle que soit la version :
+un warning de dépréciation à chaque reload finit par masquer les vrais.
+
 ---
 
 ## 9. Démarrage et vérification
@@ -897,14 +929,14 @@ sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
 - `--base-url` sur la **gateway en direct** (défaut) ne couvre **rien** de tout
   cela : un premier token vert en direct peut rester invisible côté client
   derrière un nginx mal configuré.
-- `--admin-url` vise la gateway **en direct** par défaut, volontairement :
-  `/ready` n'est pas proxifiée par `deploy/nginx.conf` (`location /` renvoie
-  404), et `location /admin/` impose `proxy_read_timeout 30s` alors qu'un
-  `POST /admin/models/{id}/load` peut légitimement attendre jusqu'à ~310 s
-  (`MODEL_LOAD_TIMEOUT_SECONDS + 10`). À travers nginx, le chargement
-  renverrait 504 alors qu'il **réussit** côté serveur, et la recette conclurait
-  à tort à une régression. Ce défaut est suivi par l'item COR-009 et n'est pas
-  corrigé par la recette : elle le contourne.
+- `--admin-url` vise la gateway **en direct** par défaut, volontairement : les
+  routes `/admin/*` sont restreintes au réseau campus par nginx, et la recette
+  doit rester exécutable depuis l'hôte lui-même. Depuis COR-009, viser nginx
+  fonctionne aussi : `/ready` y est proxifiée et `location /admin/` laisse 900 s,
+  soit au-delà des ~310 s qu'un `POST /admin/models/{id}/load` peut légitimement
+  attendre (`load_timeout_seconds + 10`, pire modèle activé). Avant COR-009 ce
+  même appel renvoyait 504 à travers nginx (`proxy_read_timeout 30s`) alors qu'il
+  **réussissait** côté serveur, et la recette concluait à tort à une régression.
 
 ##### Sécurité de la recette
 
@@ -999,7 +1031,7 @@ Cas particuliers :
 | Cause rapportée | Interprétation |
 |---|---|
 | `readiness_failed:model_file_missing` | Un GGUF d'un modèle `enabled: true` manque. Le télécharger, corriger son `path`, ou passer le modèle à `enabled: false`. |
-| `model_load_failed:504` | L'appel a traversé nginx : `proxy_read_timeout 30s` sur `/admin/` (COR-009). Viser `--admin-url` en direct. |
+| `model_load_failed:504` | Un reverse-proxy a coupé avant la fin du chargement. La conf livrée laisse 900 s sur `/admin/` depuis COR-009 : vérifier que l'hôte n'a pas gardé une conf antérieure (`doctor` le signale, contrôle `nginx_timeouts`), ou viser `--admin-url` en direct. |
 | `generation:no_content` | Le stream s'ouvre en 200 mais n'émet aucun token : régression du proxy d'inférence ou backend muet. |
 | `generation:no_done` | Le stream est tronqué : coupure réseau, timeout nginx trop court, ou `llama-server` tué (`MemoryMax`). |
 | `usage_log_missing` | La génération réussit mais n'est pas comptabilisée : la facturation serait fausse. |
@@ -1848,17 +1880,24 @@ La `location /v1/` est scindée :
 
 - **`= /v1/models`** — route légère non-streamante : rate-limit souple, **pas de
   `limit_conn`** (un GET rapide ne doit pas consommer un slot de concurrence GPU) ;
-- **`~ ^/v1/(chat/completions|completions|embeddings)$`** — routes d'inférence :
-  `limit_req` + **`limit_conn api_conn 4`** qui borne les streams SSE concurrents
-  par IP (protection contre le DoS GPU) ;
+- **`~ ^(/v1/(chat/completions|completions|completion|embeddings)|/completion)$`**
+  — routes d'inférence : `limit_req` + **`limit_conn api_conn 4`** qui borne les
+  streams SSE concurrents par IP (protection contre le DoS GPU). `/completion`
+  sans préfixe `/v1/` y figure explicitement : c'est l'endpoint natif llama.cpp
+  documenté en `docs/api.md` §7, qui tombait sinon dans le repli `location /`
+  (404) ;
 - **`/v1/`** (fallback) — conserve par prudence le comportement streaming
-  d'origine, borné en concurrence.
+  d'origine, borné en concurrence ;
+- **`= /ready`** — sonde de readiness non authentifiée, également documentée
+  côté utilisateur ; rate-limitée, sans `limit_conn`, `access_log off`.
 
 > **Réglages SSE préservés à l'identique** sur les routes streamantes :
 > `proxy_buffering off`, `proxy_cache off`, `chunked_transfer_encoding on`,
-> `add_header X-Accel-Buffering no`, `proxy_read_timeout 600s`,
-> `proxy_send_timeout 600s`. Ne pas réduire ces timeouts : cela casserait les
-> générations longues.
+> `add_header X-Accel-Buffering no`, `proxy_read_timeout 900s`,
+> `proxy_send_timeout 900s`. Ne pas réduire ces timeouts : cela casserait les
+> générations longues et les premiers appels à froid (COR-009 — la valeur est
+> dérivée du `load_timeout_seconds` maximal du registre, voir l'en-tête de
+> `gateway/deploy/nginx.conf`).
 
 Recharger après modification :
 
