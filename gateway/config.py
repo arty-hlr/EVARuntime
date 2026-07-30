@@ -112,6 +112,15 @@ class Settings(BaseSettings):
     httpx_max_keepalive: int = 100
     httpx_keepalive_expiry: float = 30.0
 
+    # ── Readiness structurelle (/ready) ───────────────────────────────────────
+    # Durée de mémorisation des contrôles système de /ready (existence du binaire
+    # llama-server, présence des GGUF activés, inscriptibilité de la DB…).
+    # Ces contrôles ne font que des stat/access, mais /ready est sondée souvent
+    # par systemd, nginx et update.sh : le cache borne le coût sur un stockage
+    # lent (NFS). Le cache est de toute façon invalidé dès que la configuration
+    # ou la liste des modèles activés change. 0 = pas de cache (toujours frais).
+    readiness_cache_ttl_seconds: float = 15.0
+
     # ── Sécurité ───────────────────────────────────────────────────────────────
     # Clé interne entre la gateway et llama-server (jamais exposée aux users)
     internal_api_key: str = "CHANGE_ME_INTERNAL_KEY"
@@ -238,6 +247,7 @@ class Settings(BaseSettings):
         "vram_reconcile_interval_seconds",
         "vram_reconcile_probe_timeout_seconds",
         "vram_reconcile_drift_threshold",
+        "readiness_cache_ttl_seconds",
     )
     @classmethod
     def validate_robustness_non_negative(cls, v: float) -> float:
