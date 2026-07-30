@@ -936,7 +936,7 @@ def _build_manager():
 
     log.info(
         "Nœuds cluster configurés : %s",
-        ", ".join(f"{n.node_id}({n.base_url})" for n in cluster_cfg.nodes),
+        ", ".join(f"{n.id}({n.base_url})" for n in cluster_cfg.nodes),
     )
 
     return ClusterManager(

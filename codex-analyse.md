@@ -49,15 +49,17 @@ sont des lacunes d'outillage, à traiter avec EVA-044.
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Bloqué |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 14 | 7 | 0 | 7 | 0 |
+| A — bloqueurs et invariants | 17 | 7 | 2 | 8 | 0 |
 | B — bootstrap automatisé | 13 | 1 | 0 | 12 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
 | D — sécurité et supply-chain | 8 | 1 | 0 | 7 | 0 |
-| E — tests et exploitation | 12 | 1 | 0 | 11 | 0 |
-| **Total** | **55** | **10** | **0** | **45** | **0** |
+| E — tests et exploitation | 15 | 1 | 0 | 14 | 0 |
+| **Total** | **61** | **10** | **2** | **49** | **0** |
 
-Deux items ont été **ajoutés au backlog** pendant l'implémentation, d'où 55 au
-lieu de 53 : COR-014 (Lot A) et SEC-008 (Lot D). Voir §0.8.
+Huit items ont été **ajoutés au backlog** après coup, d'où 61 au lieu de 53 :
+COR-014 (Lot A) et SEC-008 (Lot D) pendant l'implémentation (§0.8), puis
+COR-015 à COR-017 (Lot A) et TST-006, OPS-008, OPS-009 (Lot E) lors du premier
+déploiement réel sur deux VMs (§0.10).
 
 Les **8 items du jalon M0 sont terminés et vérifiés.**
 
@@ -188,6 +190,60 @@ l'impossibilité. SEC-002 devient réalisable.
 | Le timeout nginx de `/admin/` est de **30 s contre 310 s réellement requis** — et non 190 s comme estimé par l'audit Claude : `gemma-4-26b-a4b`, activé, porte `load_timeout_seconds: 300`. Les blocs `/v1/*` (600 s) suffisent aujourd'hui mais deviendraient trop courts si `minimax-m2.7` était réactivé (610 s requis). | Le pré-chargement d'un modèle depuis le dashboard échoue en 504 alors que le chargement réussit côté serveur. | Détecté et signalé par `doctor` ; le correctif appartient à COR-009 |
 | `TOTAL_VRAM_GB=48.0` posé par `install.sh` contre **~45,0 Go réellement exposés** par une L40S : le nominal commercial n'est pas la VRAM utilisable. | Non bloquant — l'overhead de 2 Go et la marge de 5 % absorbent l'écart — mais la marge réelle est rognée d'environ 3 Go. | Avertissement `doctor` ; à reprendre dans AUT-002 (inventaire matériel) |
 | Il n'existe **aucun entrypoint `evaruntime`** dans le dépôt (pas de `console_scripts`) : la commande réelle est `python cli.py doctor`. | Le nom « `evaruntime doctor` » employé par ce document reste aspirationnel. | Un item de packaging pourra l'exposer sans changer `doctor` |
+
+### 0.10 Premier déploiement réel sur deux VMs (2026-07-30)
+
+Premier parcours complet joué de bout en bout hors CI, sur deux VM Debian 13
+(4 vCPU, 3 Go RAM, **sans GPU**) : `install.sh --mode local` sur EvR-A, puis
+`install-agent.sh` sur EvR-B, puis migration `update.sh --mode cluster
+--allow-mode-change`, avec un `llama-server` **réellement compilé** (CPU,
+`GGML_CUDA=OFF`) et deux **vrais GGUF** (Qwen2.5-0.5B-Instruct-Q4_K_M,
+Llama-3.2-1B-Instruct-Q4_K_M).
+
+Ce que ce run change par rapport au constat de §0.7.1 : le parcours physique
+jusqu'au premier token **a été exercé**, contre un vrai binaire et de vrais
+modèles, en local comme en cluster. Il reste vrai qu'**aucun test n'a été
+exécuté contre un GPU réel** : la VRAM est purement déclarative ici, et
+`install.sh --mode local` a exigé un stub `nvidia-smi` pour franchir son
+préflight. TST-004 est donc partiellement satisfait, AUT-009 démontré
+manuellement, TST-005 (E2E cluster) exercé à la main mais toujours non
+automatisé.
+
+**Défauts trouvés — aucun n'était visible en CI :**
+
+| Découverte | Preuve | Item |
+|---|---|---|
+| **Le mode cluster ne démarrait pas du tout.** `model_manager._build_manager()` construit sa ligne de log avec `n.node_id` alors que `NodeConfig` expose `id` : `AttributeError` à l'import, donc avant tout service. La ligne juste au-dessus utilise correctement `node.id`. `CLUSTER_MODE=cluster` était mort-né sur `dev`. | Reproduit : service `failed`, `journalctl` explicite 🔬 | **COR-015** |
+| **`update-agent.sh` ne pouvait jamais réussir.** Le venv est construit dans `mktemp -d .agent-update.XXXXXX` puis **déplacé** vers `venv-agent`. Un venv n'est pas relogeable : le shebang de `bin/uvicorn` continue de pointer vers le staging (mode 0700, root-only, puis supprimé) → `203/EXEC Permission denied`, 5 health-checks en échec, rollback. `ExecStartPre` passait, lui, car `bin/python` est un lien vers l'interpréteur système — le symptôme désignait donc le mauvais coupable. `gateway/deploy/update.sh` ne souffre pas du défaut : il construit son venv à son emplacement final et bascule par symlink. | Reproduit, puis cause isolée en construisant un venv de test et en relisant le shebang après `mv` 🔬 | **COR-016** |
+| **Le rollback de mode laisse le service à terre.** Après l'échec de bascule cluster, `update.sh` a bien restauré `CLUSTER_MODE=local` et l'unité locale, mais son `systemctl start` s'est heurté au start-limit systemd (`Start request repeated too quickly`) : service **`failed`**, gateway indisponible, intervention manuelle requise. Il n'existe **aucun `systemctl reset-failed`** dans le dépôt, alors que `update.sh` démarre le service à 5 endroits. | Reproduit : indisponibilité réelle, rétablie par `systemctl reset-failed` 🔬 | **COR-017** |
+| **Le timer de sauvegarde quotidienne n'est jamais armé.** `install.sh` et `update.sh` font `systemctl enable` sans `--now` : le timer est `enabled` mais `inactive`, absent de `list-timers`, et aucune sauvegarde ne tourne **jusqu'au prochain reboot**. Le commentaire du code craint qu'un `--now` déclenche un rattrapage `Persistent=true` immédiat ; vérifié faux : un premier `start` sans stamp pose le stamp sans exécuter le job. | Reproduit : `is-enabled=enabled`, `is-active=inactive`, aucune ligne dans `list-timers` 🔬 | **OPS-008** |
+| **`deploy/nginx.conf` utilise la directive dépréciée `listen … ssl http2`**, retirée au profit de `http2 on;` depuis nginx 1.25. Debian 13 émet deux warnings à chaque `nginx -t` et à chaque reload. | Reproduit sur nginx de Debian 13 🔬 | **OPS-009** |
+| **Aucun test ne construit le manager en mode cluster.** `_build_manager()` n'apparaît que dans `test_doctor.py`. Les 633 tests gateway passent avec COR-015 présent : c'est exactement la classe de régression que la CI doit fermer. | Constat sur la suite de tests 🔬 | **TST-006** |
+
+**Ce que le run a validé, lui, en conditions réelles** 🔬 : `doctor` (exit 3,
+diagnostics pertinents dont COR-009 correctement signalé), `--verify-hashes`,
+`/health` et `/ready` (structural puis serving), la recette du premier token à
+travers nginx + TLS en local **et** en cluster, le SSE réellement non
+bufferisé (~96 ms entre deltas), l'éviction LRU, l'invariant COR-004 (409 sur
+`unload` pendant un stream, 200 après), le déchargement pour inactivité sans
+processus orphelin, le rate limiting applicatif avec `Retry-After`, la
+réconciliation VRAM de COR-001, le **rollback de `update.sh` sur une régression
+volontairement injectée** (`generation:no_content` → restauration → code
+redéployé byte-identique au sain), et le comportement en panne de nœud (offline
+après 3 heartbeats, 503 explicite, retour en ligne et rechargement transparent).
+
+**Points d'exploitation relevés au passage** — constats sans item dédié, à
+arbitrer :
+
+| Sujet | Conséquence | Suite |
+|---|---|---|
+| `install.sh --mode local` **exige `nvidia-smi`** en préflight (`command -v`), sans échappatoire. | Aucun hôte CPU — banc de test, staging, CI sur VM — ne peut installer le mode local. Ce run a dû poser un stub. | À trancher : soit un `--allow-no-gpu` explicite, soit assumer le refus et le documenter comme tel |
+| La queue d'admission est **inerte en mode cluster** : `/v1/capacity` renvoie `enabled: false, status: unavailable` malgré `CAPACITY_QUEUE_ENABLED=true` dans l'environnement. | Divergence de comportement public entre local et cluster, contraire à l'invariant annoncé dans `AGENTS.md` (« le mode cluster garde le même comportement public que le mode local »). | À documenter comme limite assumée, ou à porter en cluster |
+| `update.sh` accepte `--smoke-base-url https://…` mais **n'a aucun passthrough `--ca-cert`/`--insecure-tls`** vers la recette. | Viser nginx impose que la PKI interne soit déjà dans le magasin système. Vrai pour la PKI UPPA, mais non documenté — un opérateur qui teste avec un certificat hors magasin conclura à tort à une régression. | Option à ajouter, ou prérequis à écrire dans `docs/deployment.md` §11 |
+| Les snapshots `code-pre-update-*` sont **étiquetés avec le commit entrant**, alors qu'ils contiennent l'**ancien** code. | Après un rollback, l'opérateur cherche le snapshot de la version saine et trouve un dossier portant le nom de la version fautive. | Renommage cosmétique, sans effet fonctionnel |
+| Pendant qu'un nœud est `offline`, `/admin/cluster` continue d'afficher ses `loaded_models` d'avant la panne. | Le drapeau `online: false` est bien présent, mais la liste de modèles induit en erreur dans un diagnostic d'incident. | À vider ou à marquer `unavailable`, conformément à `docs/deployment.md` §13 |
+| Le dashboard affiche `active_users_7d: 2` pour `total_users: 1`. | Conséquence directe et attendue de DEC-001 (usage conservé sous pseudonyme après anonymisation), mais l'affichage paraît incohérent. | Libellé à préciser côté dashboard |
+| Un `git clone --depth 1` de llama.cpp produit un binaire qui se déclare `version: 1`. | `LLAMA_SERVER_MIN_BUILD` deviendrait impossible à satisfaire sur un clone superficiel. Le garde-fou supply-chain suppose un clone complet, ce que `docs/deployment.md` §2 fait bien — mais sans dire pourquoi. | À mentionner dans la note de §2 quand SEC-005 sera traité |
 
 ---
 
@@ -1063,6 +1119,9 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-012 | `[ ]` | P1 | Définir une réservation de quota | Les requêtes concurrentes ne dépassent pas silencieusement le budget, ou le dépassement maximal accepté est borné et documenté. |
 | COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. |
 | COR-014 | `[x]` | P0 | Rendre chargeables les réglages de liste de l'environnement | `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `ALLOWED_MODELS` acceptent la syntaxe documentée sans faire échouer le démarrage ; les fichiers d'exemple livrés sont chargeables. **Item ajouté le 2026-07-30**, découvert par AUT-012 : ces trois réglages étaient inutilisables tels que documentés. |
+| COR-015 | `[~]` | P0 | Réparer le démarrage en mode cluster | `CLUSTER_MODE=cluster` démarre et sert ; la régression est verrouillée par TST-006. **Item ajouté le 2026-07-30** (§0.10). Correctif d'une ligne appliqué et vérifié sur VM (`n.node_id` → `n.id` dans `model_manager._build_manager()`), **mais sans test automatisé** : reste `[~]` tant que TST-006 n'est pas livré. |
+| COR-016 | `[~]` | P0 | Rendre `update-agent.sh` capable de réussir | Une mise à jour de node-agent aboutit sans rollback, et la stratégie de venv est la même que celle de `update.sh` (construction à l'emplacement final, bascule par symlink) plutôt qu'un déplacement de venv. **Item ajouté le 2026-07-30** (§0.10). Contournement appliqué et vérifié sur VM (`ExecStart` via `python -m uvicorn`, insensible au déplacement) ; le correctif structurel de `update-agent.sh` reste à faire, ainsi qu'un test de non-régression. |
+| COR-017 | `[ ]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10) : reproduit en indisponibilité réelle lors de la bascule cluster. |
 
 ### Lot B — bootstrap automatisé
 
@@ -1124,6 +1183,9 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-005 | `[–]` | — | ~~Automatiser la gateway étudiante~~ | Annulé : composant supprimé (DEC-009). |
 | OPS-006 | `[x]` | P0 | Versionner les migrations SQLite | `PRAGMA user_version` ou équivalent, migration transactionnelle, sauvegarde préalable et test depuis chaque version supportée. |
 | OPS-007 | `[–]` | — | ~~Définir la rétention d'audit student~~ | Annulé : composant supprimé (DEC-009). |
+| OPS-008 | `[ ]` | P1 | Armer réellement le timer de sauvegarde | Après `install.sh` puis après `update.sh`, `systemctl is-active llm-gateway-backup.timer` retourne `active` et le timer apparaît dans `list-timers`, sans reboot et sans déclencher de sauvegarde immédiate avant l'initialisation de la base. **Item ajouté le 2026-07-30** (§0.10) : `enable` sans `--now` laissait la sauvegarde quotidienne inerte jusqu'au prochain redémarrage. |
+| OPS-009 | `[ ]` | P2 | Moderniser les directives nginx livrées | `nginx -t` ne produit aucun avertissement de dépréciation sur les versions supportées (`http2 on;` au lieu de `listen … ssl http2`). **Item ajouté le 2026-07-30** (§0.10) : le bruit à chaque reload masque les avertissements utiles. |
+| TST-006 | `[ ]` | P0 | Couvrir la construction du manager en mode cluster | Un test construit `model_manager._build_manager()` avec `CLUSTER_MODE=cluster` et un `nodes.yaml` minimal ; il échoue sur le code d'avant COR-015 et passe après. **Item ajouté le 2026-07-30** (§0.10) : 633 tests passaient alors que le mode cluster ne démarrait pas. Complète TST-005, qui vise le parcours E2E et non la construction à l'import. |
 
 ## 13. Jalons
 
