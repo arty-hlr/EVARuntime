@@ -18,7 +18,7 @@
 | Champ | Valeur |
 |---|---|
 | Dernière mise à jour | 2026-07-30 |
-| Phase | **Implémentation en cours** — vague 1 du jalon M0 livrée |
+| Phase | **Implémentation en cours** — 7 des 8 items de M0 livrés |
 | Jalon visé | **M0 — socle fonctionnel fiable** (§13) |
 | Branche de travail | `feat/lot-a-m0-invariants` (créée depuis `dev` @ `49f8d59`) |
 | Base de référence | `dev` @ `49f8d59` |
@@ -29,28 +29,31 @@
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **411** 🔬 |
-| `gateway-student` | `cd gateway-student && .venv/bin/python -m pytest tests -q` | 79 | **95** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **587** 🔬 |
+| `gateway-student` | `cd gateway-student && .venv/bin/python -m pytest tests -q` | 79 | **138** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **45** 🔬 |
-| **Total** | — | **433** | **551** 🔬 |
+| **Total** | — | **433** | **770** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+118 tests** ajoutés par la vague 1, tous des régressions rouges avant
-correctif et vertes après.
+**+337 tests** ajoutés à ce stade, tous des régressions rouges avant correctif
+et vertes après.
 
 ### 0.3 Avancement par lot
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Bloqué |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 13 | 4 | 1 | 8 | 0 |
-| B — bootstrap automatisé | 13 | 0 | 1 | 12 | 0 |
+| A — bloqueurs et invariants | 14 | 6 | 1 | 7 | 0 |
+| B — bootstrap automatisé | 13 | 1 | 0 | 12 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
-| D — sécurité et supply-chain | 7 | 0 | 0 | 7 | 0 |
+| D — sécurité et supply-chain | 8 | 1 | 0 | 7 | 0 |
 | E — tests et exploitation | 12 | 1 | 0 | 11 | 0 |
-| **Total** | **53** | **5** | **2** | **46** | **0** |
+| **Total** | **55** | **9** | **1** | **45** | **0** |
 
-Sur les **7 P0 du jalon M0**, 5 sont terminés et vérifiés, 2 sont en cours.
+Deux items ont été **ajoutés au backlog** pendant l'implémentation, d'où 55 au
+lieu de 53 : COR-014 (Lot A) et SEC-008 (Lot D). Voir §0.8.
+
+Sur les **8 items du jalon M0**, 7 sont terminés et vérifiés, 1 est en cours.
 
 ### 0.4 Vague en cours — jalon M0
 
@@ -64,9 +67,15 @@ chantiers menés en parallèle ne se marchent jamais dessus.
 | 1 | COR-005 | `[x]` | `0f62556` | +39 |
 | 1 | COR-007 | `[x]` | `90fda1c` | +12 |
 | 1 | COR-004 | `[x]` | `fe76ea0` | +24 |
-| 2 | COR-002 | `[~]` | — | — |
-| 2 | AUT-012 | `[~]` | — | — |
-| 3 | COR-006 | `[ ]` | — | — |
+| 2 | COR-002 | `[x]` | `27e4c2c` | +35 / +30 |
+| 2 | COR-002 | `[x]` | `7a035ec` (dashboard) | — |
+| 2 | AUT-012 | `[x]` | `0efa5a7` | +103 |
+| — | SEC-008 | `[x]` | `04f4433` | +13 |
+| — | COR-014 | `[x]` | `06b50af` | +25 / +13 |
+| 3 | COR-006 | `[~]` | — | — |
+
+Les deux lignes sans numéro de vague sont les items **ajoutés en cours de
+route** : ils n'étaient pas planifiés, ils sont nés d'une découverte.
 
 Chaque chantier est mené dans un **worktree git isolé** et produit un commit
 atomique sur sa propre branche, ensuite fusionnée dans la branche de lot. Deux
@@ -107,7 +116,13 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-30 | COR-005 | `0f62556` | `pytest tests -q` (gateway) | 375 réussis, binaire ou GGUF absent → 503 🔬 |
 | 2026-07-30 | COR-007 | `90fda1c` | `pytest tests -q` (gateway) | 387 réussis, invariant profil ↔ limite systemd verrouillé 🔬 |
 | 2026-07-30 | COR-004 | `fe76ea0` | `pytest tests -q` (gateway) | 411 réussis, 5 routes admin protégées, 409 sur modèle occupé 🔬 |
-| 2026-07-30 | — | — | Les 3 suites sur la branche cumulée | **551 réussis** (411 / 95 / 45) 🔬 |
+| 2026-07-30 | — | — | Les 3 suites sur la branche cumulée, fin de vague 1 | **551 réussis** (411 / 95 / 45) 🔬 |
+| 2026-07-30 | COR-002 | `27e4c2c` | `pytest tests -q` (gateway + student) | 446 / 125 réussis, anonymisation avec clés et usage, sans changer la contrainte FK 🔬 |
+| 2026-07-30 | COR-002 | `7a035ec` | Relecture du dashboard | Le dashboard annonce une anonymisation, plus une suppression 📖 |
+| 2026-07-30 | SEC-008 | `04f4433` | `pytest tests -q` (gateway) | 459 réussis, aucun nom d'utilisateur dans les journaux 🔬 |
+| 2026-07-30 | AUT-012 | `0efa5a7` | `pytest tests -q` (gateway) | 562 réussis, diagnostic humain et JSON, exit codes stables 🔬 |
+| 2026-07-30 | COR-014 | `06b50af` | `pytest tests -q` (gateway + student) | 587 / 138 réussis, les fichiers d'exemple livrés sont chargeables 🔬 |
+| 2026-07-30 | — | — | Les 3 suites sur la branche cumulée | **770 réussis** (587 / 138 / 45) 🔬 |
 
 ### 0.8 Défauts découverts pendant l'implémentation, absents des deux audits
 
@@ -121,6 +136,14 @@ n'avaient relevés. Ils sont corrigés dans le commit de l'item qui les a trouv�
 | `node_agent/deploy/llm-gateway-agent.service` n'avait **aucune limite mémoire**, alors que c'est son cgroup qui héberge les `llama-server` en mode cluster. Le durcissement mémoire ne portait que sur la topologie locale. | COR-007 | Politique mémoire ajoutée 📖 |
 | `POST /admin/unload` présentait le même défaut que les routes de COR-004 en mode local : drain de 25 s **puis forçage**, donc requêtes actives tuées. La route n'était pas listée dans l'item. | COR-004 | Inclus dans le correctif 📖 |
 | Les tests `/ready` existants passaient alors que **ni le binaire `llama-server` ni les GGUF n'existaient** dans l'environnement de test : ils n'exerçaient que le contrat de capacité. La permissivité de la sonde était donc verrouillée par les tests. | COR-005 | Tests adossés à un environnement structurellement sain 🔬 |
+| `_split_statements()` du moteur de migration découpait sur `;` **avant** de retirer les commentaires : un point-virgule de ponctuation dans un commentaire français tronquait silencieusement l'instruction `CREATE TABLE` qui l'entourait. | COR-002, sur le code livré par OPS-006 | Commentaires retirés avant découpage, dans les deux composants 🔬 |
+| Les journaux conservaient une copie du nom d'utilisateur, ce qui **vide de son effet** l'anonymisation RGPD : le middleware d'accès journalisait `request.url.path` (donc `/admin/users/<username>`), et `admin.create_key` journalisait le nom en clair. Deux fuites distinctes — la seconde a été trouvée par le test écrit pour la première. | COR-002, puis le test de SEC-008 | Nouvel item **SEC-008**, corrigé 🔬 |
+| **Trois réglages de liste étaient inutilisables tels que documentés** : pydantic-settings décode un champ `list[str]` comme du JSON dans la source d'environnement, avant tout validateur. `ALLOWED_MODEL_DIRS` échouait au format CSV documenté **et** à la valeur vide livrée dans `.env.example` — copier ce fichier vers `/etc/llm-gateway/env` produisait un service mort. Le validateur `split_cors_origins` de `CORS_ALLOW_ORIGINS` ne s'exécutait jamais. Côté student, `deploy/env.example` livre `ALLOWED_MODELS` en CSV et il n'y a pas d'installateur : le déploiement documenté ne démarrait pas. Reproduit sur les deux sources, dont celle de la production. | AUT-012, reproduit puis élargi au student | Nouvel item **COR-014**, corrigé 🔬 |
+
+Conséquence de la dernière ligne pour SEC-002 : l'allowlist `ALLOWED_MODEL_DIRS`
+n'était pas seulement absente de l'environnement généré — elle était
+**impossible à activer**. Les deux audits avaient relevé l'absence, pas
+l'impossibilité. SEC-002 devient réalisable.
 
 ### 0.9 Points d'exploitation à connaître après la vague 1
 
@@ -132,6 +155,9 @@ n'avaient relevés. Ils sont corrigés dans le commit de l'item qui les a trouv�
 | Les sauvegardes `*.pre-migration.*.bak` produites par OPS-006 ne sont **pas purgées** et ne sont connues ni de `.gitignore` ni des scripts de sauvegarde. | Accumulation d'une copie par changement de version de schéma. | À traiter dans OPS-002 |
 | `ruff` n'est installé dans **aucun** des trois venv : aucun chantier ne peut exécuter le lint annoncé par la CI. | Le style est vérifié à la main. | À traiter avec EVA-044 (élargir `ruff`) |
 | `SystemCallFilter=~@resources` bloque `set_mempolicy`/`mbind`/`sched_setaffinity` : `--numa distribute`, utile aux MoE `cpu_moe` bi-socket, est inaccessible. | Aucun modèle bloqué aujourd'hui (`--numa` non utilisé), mais un `llama-server` récent qui appellerait `sched_setaffinity` serait tué par `SIGSYS`. | Filtre conservé, conflit documenté, à valider en staging |
+| Le timeout nginx de `/admin/` est de **30 s contre 310 s réellement requis** — et non 190 s comme estimé par l'audit Claude : `gemma-4-26b-a4b`, activé, porte `load_timeout_seconds: 300`. Les blocs `/v1/*` (600 s) suffisent aujourd'hui mais deviendraient trop courts si `minimax-m2.7` était réactivé (610 s requis). | Le pré-chargement d'un modèle depuis le dashboard échoue en 504 alors que le chargement réussit côté serveur. | Détecté et signalé par `doctor` ; le correctif appartient à COR-009 |
+| `TOTAL_VRAM_GB=48.0` posé par `install.sh` contre **~45,0 Go réellement exposés** par une L40S : le nominal commercial n'est pas la VRAM utilisable. | Non bloquant — l'overhead de 2 Go et la marge de 5 % absorbent l'écart — mais la marge réelle est rognée d'environ 3 Go. | Avertissement `doctor` ; à reprendre dans AUT-002 (inventaire matériel) |
+| Il n'existe **aucun entrypoint `evaruntime`** dans le dépôt (pas de `console_scripts`) : la commande réelle est `python cli.py doctor`. | Le nom « `evaruntime doctor` » employé par ce document reste aspirationnel. | Un item de packaging pourra l'exposer sans changer `doctor` |
 
 ---
 
@@ -997,11 +1023,11 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
 | COR-001 | `[x]` | P0 | Aligner le statut cluster sur `GatewayStatus` | `/admin/status` retourne 200 en local et cluster, avec validation du response model. |
-| COR-002 | `[~]` | P0 | Définir et migrer la politique de suppression utilisateur | Un utilisateur avec clés et usage peut être supprimé/anonymisé conformément à la politique, dans les deux gateways. |
+| COR-002 | `[x]` | P0 | Définir et migrer la politique de suppression utilisateur | Un utilisateur avec clés et usage peut être supprimé/anonymisé conformément à la politique, dans les deux gateways. |
 | COR-003 | `[ ]` | P2 | Formaliser admission + pin sous forme de lease | Hardening préventif : aucun futur `await` ou refactor ne peut ouvrir une fenêtre d'éviction. Ce n'est pas un bug reproduit dans le code actuel. |
 | COR-004 | `[x]` | P0 | Protéger unload/update/delete contre les requêtes actives | Drain borné, conflit explicite ou job différé ; aucun stream actif tué silencieusement. |
 | COR-005 | `[x]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
-| COR-006 | `[ ]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
+| COR-006 | `[~]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
 | COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
 | COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
 | COR-009 | `[ ]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. |
@@ -1009,6 +1035,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-011 | `[ ]` | P1 | Corriger le slot student abandonné | Un générateur jamais démarré ne bloque jamais durablement l'utilisateur. |
 | COR-012 | `[ ]` | P1 | Définir une réservation de quota | Les requêtes concurrentes ne dépassent pas silencieusement le budget, ou le dépassement maximal accepté est borné et documenté. |
 | COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. |
+| COR-014 | `[x]` | P0 | Rendre chargeables les réglages de liste de l'environnement | `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `ALLOWED_MODELS` acceptent la syntaxe documentée sans faire échouer le démarrage ; les fichiers d'exemple livrés sont chargeables. **Item ajouté le 2026-07-30**, découvert par AUT-012 : ces trois réglages étaient inutilisables tels que documentés. |
 
 ### Lot B — bootstrap automatisé
 
@@ -1025,7 +1052,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | AUT-009 | `[ ]` | P0 | Recette premier token | Appel public complet avec TTFT mesuré et rapport sans secrets. |
 | AUT-010 | `[ ]` | P1 | Pré-chauffer le modèle par défaut | Le premier utilisateur ne déclenche pas le chargement après un déploiement réussi. |
 | AUT-011 | `[ ]` | P1 | Produire le rapport d'installation | Versions, empreintes, licences, matériel, modèle, performances et contrôles. |
-| AUT-012 | `[~]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
+| AUT-012 | `[x]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
 | AUT-013 | `[ ]` | P1 | Inspecter les métadonnées GGUF | Architecture, tenseurs, contexte et KV alimentent une estimation conservatrice sans être présentés comme une mesure exacte. |
 
 ### Lot C — performance
@@ -1052,6 +1079,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | SEC-005 | `[ ]` | P1 | Imposer l'intégrité des modèles approuvés | Aucun modèle catalogue ne charge sans SHA/provenance. |
 | SEC-006 | `[ ]` | P1 | Sécuriser le data-plane cluster | Prompts chiffrés ou réseau isolé attesté et contrôlé. |
 | SEC-007 | `[ ]` | P1 | Produire SBOM et attestations runtime | Chaque release et binaire redistribué possède provenance et notices. |
+| SEC-008 | `[x]` | P1 | Ne pas journaliser les noms d'utilisateur | Aucun `log.*` de la gateway ne porte de nom d'utilisateur ; le chemin de requête est rédigé. **Item ajouté le 2026-07-30**, découvert en livrant COR-002 : anonymiser en base est sans effet si le journal garde une copie du nom. |
 
 ### Lot E — tests, exploitation et standardisation
 
