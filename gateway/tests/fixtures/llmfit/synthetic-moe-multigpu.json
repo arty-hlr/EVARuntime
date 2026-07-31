@@ -1,0 +1,24 @@
+{
+  "version": "0.6.1",
+  "hardware": {
+    "gpus": [
+      {"name": "NVIDIA RTX 4090", "vram_mb": 24564},
+      {"name": "NVIDIA RTX 4090", "vram_mb": 24564}
+    ],
+    "backend": "cuda"
+  },
+  "notes": ["mixture-of-experts detected", "tensor split across 2 devices"],
+  "recommendations": [
+    {
+      "model": "mixtral-8x7b-instruct",
+      "quantization": "Q3_K_M",
+      "estimated_vram_mb": 22400,
+      "estimated_ram_mb": 4096,
+      "gpu_layers": 33,
+      "context_length": 32768,
+      "fit": "cpu_offload",
+      "score": 0.62,
+      "expert_offload": true
+    }
+  ]
+}
