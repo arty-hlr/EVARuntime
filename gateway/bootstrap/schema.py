@@ -179,13 +179,23 @@ class Finding:
 
 @dataclass(frozen=True)
 class PlanSection:
-    """Contribution d'un producteur au plan."""
+    """
+    Contribution d'un producteur au plan.
+
+    `notes` porte le texte qui doit être VU par l'opérateur sans être un constat :
+    les limites d'un conseiller, ce qu'une estimation ignore, la raison d'une
+    hypothèse. Sans ce champ, ces éléments ne vivaient que dans `data`, que le
+    rendu humain n'imprime pas — ils n'existaient donc qu'en JSON. Besoin
+    remonté par le chantier AUT-004, dont les huit limites de LLMfit sont
+    précisément le cas d'usage.
+    """
     name: str
     version: int
     status: SectionStatus
     summary: str
     data: dict[str, Any] = field(default_factory=dict)
     findings: tuple[Finding, ...] = ()
+    notes: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +205,7 @@ class PlanSection:
             "summary": self.summary,
             "data": self.data,
             "findings": [f.to_dict() for f in self.findings],
+            "notes": list(self.notes),
         }
 
 
@@ -275,19 +286,27 @@ class BootstrapPlan:
 
     @property
     def blockers(self) -> tuple[Finding, ...]:
-        """Constats qui interdisent l'application, quelle que soit la section."""
+        """
+        Constats qui interdisent l'application, quelle que soit la section.
+
+        Un constat de niveau `fail` bloque **indépendamment du statut de sa
+        section**. La première écriture ne les collectait que dans les sections
+        déjà `fail` : un producteur qui aurait émis un `fail` dans une section
+        `warn` — par distraction ou parce que son propre calcul de statut
+        diverge — aurait vu son bloqueur disparaître en silence, et le plan
+        serait sorti applicable. Piège signalé par le chantier AUT-003.
+        """
         out: list[Finding] = []
         for section in self.sections:
-            if section.status == "fail":
-                out.extend(f for f in section.findings if f.level == "fail")
-                if not any(f.level == "fail" for f in section.findings):
-                    # Une section en échec sans constat `fail` explicite reste un
-                    # bloqueur : on le matérialise plutôt que de le perdre.
-                    out.append(Finding(
-                        code=f"{section.name}_failed",
-                        level="fail",
-                        message=section.summary or f"Section « {section.name} » en échec.",
-                    ))
+            out.extend(f for f in section.findings if f.level == "fail")
+            if section.status == "fail" and not any(f.level == "fail" for f in section.findings):
+                # Une section en échec sans constat `fail` explicite reste un
+                # bloqueur : on le matérialise plutôt que de le perdre.
+                out.append(Finding(
+                    code=f"{section.name}_failed",
+                    level="fail",
+                    message=section.summary or f"Section « {section.name} » en échec.",
+                ))
         return tuple(out)
 
     @property
@@ -421,6 +440,10 @@ def _validate_sections(sections: Any) -> list[str]:
 
         if not isinstance(section.get("data"), dict):
             errors.append(f"{path}.data doit être un objet")
+
+        notes = section.get("notes")
+        if not isinstance(notes, list) or any(not isinstance(n, str) or not n for n in notes):
+            errors.append(f"{path}.notes doit être une liste de chaînes non vides")
 
         errors.extend(_validate_findings(section.get("findings"), path))
 
@@ -602,6 +625,9 @@ def render_human(plan: BootstrapPlan, *, strict: bool = False) -> str:
         for finding in section.findings:
             if finding.level != "info":
                 lines.append(f"       · {finding.level} [{finding.code}] {finding.message}")
+        for note in section.notes:
+            for note_line in note.splitlines():
+                lines.append(f"       {note_line}" if note_line else "")
 
     lines.extend(["", "DÉCISIONS"])
     if not plan.decisions:
@@ -665,6 +691,28 @@ def merge_findings(*groups: Iterable[Finding]) -> tuple[Finding, ...]:
             seen.add(finding.code)
             out.append(finding)
     return tuple(out)
+
+
+def status_from_findings(findings: Iterable[Finding], *, default: SectionStatus = "ok") -> SectionStatus:
+    """
+    Dérive le statut d'une section de ses constats. `fail` l'emporte sur `warn`.
+
+    Sans cette fonction, chaque producteur redupliquait la table
+    `{"info": "ok", "warn": "warn", "fail": "fail"}` dans son coin — trois
+    l'avaient déjà fait. Or `worst_status()` combine des *statuts* de section,
+    pas des *niveaux* de constat : les deux notions se ressemblent assez pour
+    qu'on les confonde, et diffèrent assez pour que la confusion coûte cher.
+
+    `default` permet à un producteur de partir de `skip` quand la section n'est
+    pas applicable : un constat `info` ne doit pas transformer un `skip` en `ok`.
+    """
+    status: SectionStatus = default
+    for finding in findings:
+        if finding.level == "fail":
+            return "fail"
+        if finding.level == "warn":
+            status = "warn"
+    return status
 
 
 def worst_status(*statuses: str) -> SectionStatus:

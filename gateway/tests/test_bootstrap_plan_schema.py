@@ -228,6 +228,31 @@ def test_echec_sans_constat_explicite_produit_quand_meme_un_bloqueur():
     assert [f.code for f in plan.blockers] == ["hardware_failed"]
 
 
+def test_un_constat_fail_bloque_meme_dans_une_section_warn():
+    """
+    Piège signalé indépendamment par les chantiers AUT-003 et AUT-005 : la
+    première écriture ne collectait les `fail` que dans les sections déjà
+    `fail`. Un producteur dont le calcul de statut diverge un peu de ses propres
+    constats voyait son bloqueur disparaître, et le plan sortait applicable.
+    """
+    plan = _plan(sections=(
+        _section(status="warn", findings=(
+            sc.Finding("catalog_unpinned", "fail", "SHA-256 absent sur une entrée."),
+        )),
+    ))
+    assert [f.code for f in plan.blockers] == ["catalog_unpinned"]
+    assert plan.applicable is False
+    assert plan.exit_code() == sc.EXIT_BLOCKED
+
+
+def test_un_constat_fail_bloque_meme_dans_une_section_ok():
+    """Même piège, cas extrême : le statut de section ne peut pas absoudre un `fail`."""
+    plan = _plan(sections=(
+        _section(status="ok", findings=(sc.Finding("x", "fail", "défaut dur"),)),
+    ))
+    assert plan.applicable is False
+
+
 def test_section_ignoree_ne_degrade_pas_le_plan():
     """`skip` est un cas légitime — LLMfit absent n'est pas une panne."""
     plan = _plan(sections=(_section(sc.SECTION_RECOMMENDATION, status="skip"),))
@@ -377,6 +402,50 @@ def test_chaque_section_declaree_porte_un_libelle_humain():
 
 
 # ── Utilitaires du contrat ────────────────────────────────────────────────────
+
+def test_les_notes_de_section_apparaissent_en_rendu_humain():
+    """
+    Besoin remonté par AUT-004 : les huit limites de LLMfit ne vivaient que dans
+    `data`, que le rendu humain n'imprime pas — elles n'existaient donc qu'en
+    JSON, invisibles de l'opérateur qui relit le plan.
+    """
+    plan = _plan(sections=(
+        sc.PlanSection(
+            name=sc.SECTION_RECOMMENDATION, version=1, status="ok",
+            summary="conseil consultatif",
+            notes=("Ce que LLMfit ignore :", "  · le coût de ctx_size × parallel",),
+        ),
+    ))
+    texte = sc.render_human(plan)
+    assert "Ce que LLMfit ignore" in texte
+    assert "ctx_size × parallel" in texte
+
+
+def test_une_note_vide_est_refusee():
+    document = _plan().to_dict()
+    document["sections"][0]["notes"] = [""]
+    assert any("notes" in e for e in sc.validate_plan_dict(document))
+
+
+@pytest.mark.parametrize("niveaux,attendu", [
+    ((), "ok"),
+    (("info",), "ok"),
+    (("info", "warn"), "warn"),
+    (("warn", "fail"), "fail"),
+    (("fail", "warn"), "fail"),
+])
+def test_statut_derive_des_constats(niveaux, attendu):
+    findings = tuple(sc.Finding(f"c{i}", n, "m") for i, n in enumerate(niveaux))  # type: ignore[arg-type]
+    assert sc.status_from_findings(findings) == attendu
+
+
+def test_un_constat_info_ne_transforme_pas_un_skip_en_ok():
+    """Une section non applicable qui émet un `info` reste non applicable."""
+    findings = (sc.Finding("llmfit_absent", "info", "LLMfit n'est pas installé."),)
+    assert sc.status_from_findings(findings, default="skip") == "skip"
+    # Contrôle positif : la même fonction sait bien produire `ok` par défaut.
+    assert sc.status_from_findings(findings) == "ok"
+
 
 def test_fusion_de_constats_dedoublonne_par_code_et_preserve_l_ordre():
     a = (sc.Finding("x", "warn", "premier"), sc.Finding("y", "info", "second"))
