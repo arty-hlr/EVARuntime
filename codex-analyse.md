@@ -21,7 +21,7 @@
 |---|---|
 | **Où en est-on** | Jalon **M1 atteint** (§0.12). Le système sait désormais **expliquer ce qu'il installerait et pourquoi**, sans rien appliquer : `python cli.py bootstrap-plan` rend un plan versionné, validé, sans secret et lisible avant application. M0 était atteint, le premier déploiement réel sur deux VMs avait révélé 6 défauts invisibles en CI (§0.10), tous fermés (§0.11) |
 | **Ce qui vient ensuite** | Jalon **M2 — installation jusqu'au premier token** (§13) : c'est l'exécution du plan que M1 sait maintenant écrire. Lot D sécurité reste l'alternative selon arbitrage. **Plus aucun P0 ouvert dans les Lots A et B** |
-| **Santé des tests** | **1203 tests verts** (1140 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
+| **Santé des tests** | **1223 tests verts** (1160 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
 | **Reste à faire** | 36 items sur 63 (§0.3). Aucun P0 ouvert hors Lots C, D et E |
 | **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU. Le plan de bootstrap n'a **jamais été appliqué** — c'est M2, pas M1 |
 
@@ -48,13 +48,13 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir.
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1140** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1160** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **1203** 🔬 |
+| **Total** | — | **354** | **1223** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+445 par
+**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+465 par
 la vague 5**, tous des régressions rouges avant correctif et vertes après. Les
 scripts de déploiement passent `bash -n`.
 
@@ -183,7 +183,8 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-31 | AUT-001 | `976894d` | `pytest tests -q` (gateway) + CLI exercée sur 5 codes de sortie | **1139 réussis** ; plan assemblé de bout en bout, `bootstrap-plan` en JSON et en français 🔬 |
 | 2026-07-31 | AUT-001 | `ca0871f` | `pytest tests -q` (gateway) + 5 codes de sortie rejoués | 1140 réussis ; faute de saisie (2) séparée de panne du planificateur (4) 🔬 |
 | 2026-07-31 | — | `898088a` | Relecture de la documentation contre le code | `README`, `docs/admin.md` §9, `docs/architecture.md`, `docs/deployment.md` 📖 |
-| 2026-07-31 | **M1** | `ca0871f` | Les 2 suites + `ruff` sur les deux composants | **1203 réussis** (1140 / 63), jalon atteint 🔬 |
+| 2026-07-31 | AUT-001, AUT-002, AUT-004 | `055eeea` | `pytest tests -q` (gateway) + 4 mutations rejouées | 1160 réussis ; cinq défauts de revue fermés, dont un plan bloqué qui décrivait 8 actions 🔬 |
+| 2026-07-31 | **M1** | `055eeea` | Les 2 suites + `ruff` sur les deux composants | **1223 réussis** (1160 / 63), jalon atteint 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -404,8 +405,9 @@ et seulement si l'opérateur fournit `--llama-bin`.
 | C4 | AUT-004 | P1 | `bootstrap/llmfit.py` | `f5788c2` | +98 | `[x]` |
 | — | AUT-001 (correctifs de contrat) | P0 | `bootstrap/schema.py` | `1b77763` | +10 | `[x]` |
 | — | AUT-001 (assemblage et CLI) | P0 | `bootstrap/planner.py`, `cli.py` | `976894d`, `ca0871f` | +40 | `[x]` |
+| — | AUT-001/002/004 (revue) | P1 | `bootstrap/schema.py`, `planner.py`, `cli.py` | `055eeea` | +20 | `[x]` |
 
-**Total : +445 tests.** Chaque chantier a été mené dans un worktree git isolé,
+**Total : +465 tests.** Chaque chantier a été mené dans un worktree git isolé,
 avec propriété exclusive de ses fichiers, et a dû prouver la rougeur de ses
 tests en cassant réellement son code — 27 mutations appliquées et rejouées au
 total, pas seulement affirmées. La documentation, écrite en dernier contre le
@@ -490,6 +492,26 @@ l'introduit demain.
 | **Un `--model` inconnu sortait en code 4**, c'est-à-dire « le planificateur lui-même a échoué » : la `CatalogError` remontait jusqu'au `except Exception` de la CLI. Un script d'exploitation qui lit 4 conclut à une panne de l'outil sur une faute de frappe. Même défaut pour un `--hardware-profile` introuvable. | Le chantier **documentation**, en rédigeant la grille des codes de sortie | Corrigé (`ca0871f`) — `PlannerUsageError` sépare les conséquences : 2 la commande est mal formée, 1 l'hôte est bloqué, 4 l'outil a cassé 🔬 |
 | **`schema.merge_findings()` déduplique par `code` globalement.** Sûr à l'intérieur d'un producteur ; deux producteurs qui choisiraient le même code s'effaceraient mutuellement si le planificateur l'employait entre sections. | AUT-002, confirmé par AUT-003 | Constat `📖` — le planificateur ne l'emploie pas entre sections ; à documenter dans le contrat des producteurs |
 
+#### Revue de la vague — cinq défauts fermés
+
+Une relecture ciblée du code livré a trouvé cinq défauts que ni les chantiers ni
+l'assemblage n'avaient vus. Tous ont été **reproduits** avant correction, aucun
+n'a été corrigé sur description.
+
+| Découverte | Preuve | Traitement |
+|---|---|---|
+| **Un plan bloqué proposait quand même des actions.** L'invariant n'était tenu que pour l'absence de politique de release. Un résolveur rendant `resolved=False` laissait passer téléchargement, écriture de registre, activation et recette — **sans la moindre étape d'installation**. | Reproduit : plateforme sans variante d'artefact → `applicable=False` et 8 étapes 🔬 | Invariant ré-adossé aux **bloqueurs** dans `build_plan`, donc valable pour toutes leurs causes ; et vérifié une seconde fois au niveau du document par `_validate_verdict()` |
+| **`CUDA_VISIBLE_DEVICES` était ignoré avec `--hardware-profile`** : l'environnement n'était pas transmis au chargeur, qui retombait sur `{}`. | Reproduit : deux GPU déclarés, `CUDA_VISIBLE_DEVICES=1` → 2 GPU comptés, **90 Go au lieu de 45** 🔬 | Corrigé. À noter : la documentation décrivait déjà le bon comportement — c'est le code qui était en tort, pas elle |
+| **`--mode cluster` était accepté sans aucun comportement cluster** : l'option n'était que recopiée dans le document final, et aucun test ne couvrait ce cas. | Constat de lecture, confirmé : aucune occurrence de « cluster » dans le planificateur 📖 | **Refusé explicitement** au jalon M1, avec la conduite à tenir dans le message. L'accepter produisait un plan cohérent et entièrement faux — inventaire de l'hôte gateway, runtime local, modèles sous son propre volume — ce qui est pire qu'une absence de plan |
+| **L'épinglage LLMfit était inatteignable depuis la CLI** : l'adaptateur refusait correctement d'exécuter un binaire non épinglé, mais aucune option ne permettait de fournir version, empreinte, binaire ou profil manuel. AUT-004 existait comme bibliothèque, pas dans le parcours opérateur. | Constat : aucune occurrence de « llmfit » dans `cli.py` 📖 | Six options ajoutées (`--llmfit-bin/-version/-sha256/-timeout/-profile`, `--no-llmfit`), épinglage incohérent refusé en code 2 |
+| **La validation ne recoupait aucun champ dérivé** : un document portant une section `fail` mais retouché en `status: ok` / `applicable: true` / `exit_code: 0` / `blockers: []` passait sans une seule erreur. | Reproduit : document falsifié à la main, validation vide 🔬 | `_validate_verdict()` recalcule status, applicable, exit_code, blockers, warnings, counts et volume depuis les sections. L'enjeu est **M2**, qui appliquera des plans relus depuis un fichier : un applicateur ne doit jamais pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe |
+
+Ce que cette revue enseigne sur la vague elle-même : les tests écrits par chaque
+chantier vérifiaient bien **leur** module, et l'assemblage vérifiait bien ses
+raccords — mais l'invariant transverse « un plan bloqué ne propose aucune
+action » n'appartenait à personne. Il est désormais porté par le contrat, au
+seul endroit où aucun producteur ne peut le contourner.
+
 #### Ce que la vague 5 ne prétend pas avoir démontré
 
 - **Le plan n'a jamais été appliqué.** C'est M2, et c'est le point important :
@@ -505,6 +527,9 @@ l'introduit demain.
   l'archive macOS Metal et la faisabilité des builds ROCm/Vulkan/arm64 sont des
   **hypothèses non vérifiées**, faute d'accès à la matrice de release amont.
 - **Toujours aucun test contre un GPU réel** : la VRAM reste déclarative.
+- **Le mode cluster n'est pas planifiable.** Il est refusé explicitement plutôt
+  que silencieusement faux, mais la planification des nœuds — interroger chaque
+  node-agent pour son inventaire et son runtime — reste entièrement à faire.
 
 #### 0.12.1 Sortie du jalon M1
 
@@ -1404,10 +1429,10 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
-| AUT-001 | `[x]` | P0 | Définir le schéma du plan de bootstrap | Schéma versionné, validé, sans secret, lisible avant application. **Livré le 2026-07-31** : `bootstrap/schema.py` porte le contrat (`PLAN_SCHEMA_VERSION`, `validate_plan_dict()` avec chemins de champs fautifs, `find_secret_leaks()` à deux filets — par nom de champ ET par forme de valeur —, `render_human()`/`render_json()` refusant tous deux de publier un document qui fuit), `bootstrap/planner.py` l'assemble et `python cli.py bootstrap-plan` l'expose. Aucune écriture, aucun téléchargement. |
+| AUT-001 | `[x]` | P0 | Définir le schéma du plan de bootstrap | Schéma versionné, validé, sans secret, lisible avant application. **Livré le 2026-07-31** : `bootstrap/schema.py` porte le contrat (`PLAN_SCHEMA_VERSION`, `validate_plan_dict()` avec chemins de champs fautifs, `find_secret_leaks()` à deux filets — par nom de champ ET par forme de valeur —, `render_human()`/`render_json()` refusant tous deux de publier un document qui fuit), `bootstrap/planner.py` l'assemble et `python cli.py bootstrap-plan` l'expose. Aucune écriture, aucun téléchargement. Un plan **bloqué ne décrit aucune étape**, quelle qu'en soit la cause, et la validation rejette tout document qui porterait les deux. `--mode cluster` est refusé explicitement au jalon M1 : la planification des nœuds reste à faire, et un plan local présenté comme cluster serait cohérent et faux. |
 | AUT-002 | `[x]` | P0 | Inventaire matériel automatique | CPU/RAM/disque/GPU/VRAM/driver/backend détectés et testés sur la matrice supportée. **Livré le 2026-07-31** : document §5 littéral, toutes les sondes injectables, `CUDA_VISIBLE_DEVICES` respecté y compris sa troncature, `--hardware-profile` validé à la frontière. Quatre issues GPU distinctes au lieu de deux — un `nvidia-smi` qui **échoue** rend une liste de backends **vide**, jamais `cpu` : c'est le refus du repli silencieux. |
 | AUT-003 | `[x]` | P0 | Résolveur `llama-server` | Sélection versionnée, SHA vérifié, aucun fallback CPU silencieux. **Livré le 2026-07-31** : ordre de §6 testé étape par étape jusqu'au refus explicite, recherche backend-d'abord pour qu'une archive CPU officielle ne l'emporte jamais sur une image CUDA officielle, variante non épinglée inéligible, manifeste de provenance qui ne peut pas être incohérent par construction, `LLAMA_SERVER_MIN_BUILD` généré par `derive_min_build()` et fail-closed. Le clone superficiel de §0.10 est reconnu et nommé pour ce qu'il est. |
-| AUT-004 | `[x]` | P1 | Adapter LLMfit JSON | Version figée, schéma validé, timeout, fallback manuel et tests avec sorties enregistrées. **Livré le 2026-07-31** : binaire refusé si son empreinte ne correspond pas à l'épinglage, validation stricte et bornée de la sortie JSON, timeout borné, profil manuel passant par la MÊME validation, absent = `skip` et non échec. Trois barrières structurelles empêchent une recommandation d'activer un modèle seule, testées sur l'AST du module. **Réserve** : les fixtures sont synthétiques, le dépôt amont ne publiant aucun exemple de sortie — à remplacer par de vraies captures avant production (§0.12). |
+| AUT-004 | `[x]` | P1 | Adapter LLMfit JSON | Version figée, schéma validé, timeout, fallback manuel et tests avec sorties enregistrées. **Livré le 2026-07-31** : binaire refusé si son empreinte ne correspond pas à l'épinglage, validation stricte et bornée de la sortie JSON, timeout borné, profil manuel passant par la MÊME validation, absent = `skip` et non échec. Trois barrières structurelles empêchent une recommandation d'activer un modèle seule, testées sur l'AST du module. Intégré au parcours opérateur le même jour, après revue : `--llmfit-bin`, `--llmfit-version`, `--llmfit-sha256`, `--llmfit-timeout`, `--llmfit-profile` et `--no-llmfit` — l'adaptateur était auparavant inatteignable depuis la CLI. **Réserve** : les fixtures sont synthétiques, le dépôt amont ne publiant aucun exemple de sortie — à remplacer par de vraies captures avant production (§0.12). |
 | AUT-005 | `[x]` | P0 | Créer le catalogue approuvé | Révision, fichiers, SHA, licence, paramètres et ressources pour chaque modèle proposé. **Livré le 2026-07-31** : `bootstrap/catalog.yaml`, deux entrées apache-2.0 des deux côtés de la chaîne de licence, révisions et SHA-256 **réels** (relevés sur l'API publique Hugging Face, recoupés par `X-Linked-Etag`, revérifiés à la fusion). Entrée non épinglée = **fail-closed** : listée, mais exclue de toute planification de téléchargement. L'ensemble split/`mmproj` est indivisible par construction, pas par consigne. |
 | AUT-006 | `[ ]` | P0 | Télécharger les modèles de façon sûre | Reprise, espace disque, fichier temporaire, SHA, renommage atomique et provenance. |
 | AUT-007 | `[ ]` | P1 | Générer `models.yaml` | Entrée désactivée tant que la calibration et le smoke test n'ont pas réussi. |
