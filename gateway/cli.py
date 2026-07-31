@@ -615,6 +615,10 @@ def bootstrap_plan(
             _schema.render_json(plan, strict=strict) if json_output
             else _schema.render_human(plan, strict=strict)
         )
+    except planner_module.PlannerUsageError as exc:
+        # Faute de saisie de l'opérateur — pas une panne du planificateur.
+        console.print(f"[red]Demande impossible à honorer :[/red] {exc}")
+        raise typer.Exit(_schema.EXIT_USAGE)
     except _schema.PlanError as exc:
         console.print(f"[red]Plan refusé :[/red] {exc}")
         raise typer.Exit(_schema.EXIT_ERROR)

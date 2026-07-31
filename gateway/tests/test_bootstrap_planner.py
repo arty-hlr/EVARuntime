@@ -163,7 +163,7 @@ def test_un_profil_materiel_illisible_est_une_erreur_d_entree(tmp_path):
     dégrader en silence : c'est une consigne qu'on ne peut pas honorer.
     """
     options = _options(tmp_path, hardware_profile_path=tmp_path / "nulle-part.json")
-    with pytest.raises(planner.PlannerError) as exc:
+    with pytest.raises(planner.PlannerUsageError) as exc:
         _plan(options)
     assert "hardware-profile" in str(exc.value)
 
@@ -171,7 +171,7 @@ def test_un_profil_materiel_illisible_est_une_erreur_d_entree(tmp_path):
 def test_un_profil_materiel_invalide_est_refuse(tmp_path):
     mauvais = tmp_path / "mauvais.json"
     mauvais.write_text(json.dumps(_profile_document(ram_available_bytes=999 * GIB)), encoding="utf-8")
-    with pytest.raises(planner.PlannerError):
+    with pytest.raises(planner.PlannerUsageError):
         _plan(_options(tmp_path, hardware_profile_path=mauvais))
 
 
@@ -398,8 +398,14 @@ def test_le_nombre_de_modeles_retenus_est_borne(tmp_path):
     assert any("max-models" in r["reason"] for r in section.data["rejected"])
 
 
-def test_selectionner_un_identifiant_inconnu_est_refuse(tmp_path):
-    with pytest.raises(catalog_mod.CatalogError):
+def test_selectionner_un_identifiant_inconnu_est_une_faute_de_saisie(tmp_path):
+    """
+    Défaut trouvé en rédigeant la documentation : l'erreur remontait jusqu'au
+    `except Exception` de la CLI et sortait en 4 — « le planificateur est
+    cassé » — alors qu'une faute de frappe dans `--model` relève de l'usage.
+    Un script qui lit 4 conclurait à une panne de l'outil.
+    """
+    with pytest.raises(planner.PlannerUsageError):
         _plan(_options(tmp_path, selected_ids=("modele-imaginaire",)))
 
 
@@ -468,6 +474,7 @@ def test_cli_strict_promeut_les_avertissements(tmp_path):
     ("--mode", "bizarre"),
     ("--pin-version", "b6800"),                      # sans son commit
     ("--pin-version", "pas-une-version", "--pin-commit", "a" * 40),
+    ("--model", "modele-imaginaire"),
 ])
 def test_cli_refuse_un_usage_incoherent(tmp_path, args):
     """
@@ -478,6 +485,10 @@ def test_cli_refuse_un_usage_incoherent(tmp_path, args):
 
 
 def test_cli_signale_un_profil_illisible_sans_pretendre_bloquer_l_hote(tmp_path):
+    """
+    Un chemin qui n'existe pas est une faute de saisie (2), pas un hôte bloqué
+    (1) ni une panne du planificateur (4). Les trois se lisent dans un script.
+    """
     from typer.testing import CliRunner
 
     import cli
@@ -485,7 +496,7 @@ def test_cli_signale_un_profil_illisible_sans_pretendre_bloquer_l_hote(tmp_path)
     result = CliRunner().invoke(cli.app, [
         "bootstrap-plan", "--hardware-profile", str(tmp_path / "nulle-part.json"),
     ])
-    assert result.exit_code == sc.EXIT_ERROR
+    assert result.exit_code == sc.EXIT_USAGE
 
 
 def test_cli_n_expose_aucun_secret(tmp_path, monkeypatch):

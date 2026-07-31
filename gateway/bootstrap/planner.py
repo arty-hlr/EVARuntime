@@ -77,6 +77,19 @@ class PlannerError(schema.PlanError):
     """Le plan ne peut pas être assemblé du tout (entrée invalide, pas un échec métier)."""
 
 
+class PlannerUsageError(PlannerError):
+    """
+    L'appelant a mal formé sa demande : identifiant inconnu, fichier introuvable.
+
+    Distincte de `PlannerError` parce que la CONSÉQUENCE diffère, et qu'un script
+    la lit : « votre commande désigne quelque chose qui n'existe pas » sort en
+    code 2, alors que « le planificateur lui-même a échoué » sort en 4. Les
+    confondre ferait conclure à une panne de l'outil sur une simple faute de
+    frappe dans un `--model` — et inversement, ferait passer une vraie panne
+    pour une erreur de l'opérateur.
+    """
+
+
 @dataclass(frozen=True)
 class PlannerOptions:
     """
@@ -171,11 +184,11 @@ def _collect_hardware(options: PlannerOptions) -> inventory_mod.HardwareProfile:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise PlannerError(f"--hardware-profile {path} : lecture impossible ({exc}).") from exc
+        raise PlannerUsageError(f"--hardware-profile {path} : lecture impossible ({exc}).") from exc
     try:
         return inventory_mod.load_hardware_profile(text, origin=f"--hardware-profile {path}")
     except inventory_mod.InventoryError as exc:
-        raise PlannerError(str(exc)) from exc
+        raise PlannerUsageError(str(exc)) from exc
 
 
 # ── Étape 2 : runtime ─────────────────────────────────────────────────────────
@@ -285,7 +298,14 @@ def _load_catalog(options: PlannerOptions) -> tuple[catalog_mod.Catalog | None, 
                 ),
             ),),
         )
-    return catalog, catalog_mod.to_plan_section(catalog, selected_ids=options.selected_ids)
+    try:
+        section = catalog_mod.to_plan_section(catalog, selected_ids=options.selected_ids)
+    except catalog_mod.CatalogError as exc:
+        # `--model` désigne un identifiant absent du catalogue : faute de saisie,
+        # pas panne de l'outil. Sans ce raccord, l'erreur remontait jusqu'au
+        # `except Exception` de la CLI et sortait en 4.
+        raise PlannerUsageError(str(exc)) from exc
+    return catalog, section
 
 
 # ── Étape 5 : sélection ───────────────────────────────────────────────────────
