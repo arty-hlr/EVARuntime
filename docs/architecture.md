@@ -147,6 +147,211 @@ binaire `llama-server` de chaque node doit supporter `--spec-type` (vérifier av
 
 ---
 
+## Planificateur d'amorçage (`bootstrap`)
+
+Le registre décrit ce que **cette** installation sert. Le paquet
+`gateway/bootstrap/` répond à la question d'avant : sur un hôte encore nu, que
+faudrait-il installer pour atteindre le premier token, et pourquoi ? Il produit
+un **plan** — un document — et n'applique rien.
+
+### Deux couches, et pourquoi elles sont séparées
+
+| Couche | Artefact | Privilèges | Écrit sur l'hôte |
+|---|---|---|---|
+| Installation | `gateway/deploy/install.sh` | `root` | oui — utilisateur système, venv, systemd, nginx, secrets |
+| Planification | `python cli.py bootstrap-plan` | aucun | **non** |
+
+`install.sh` reste la couche privilégiée et la seule voie d'installation
+supportée : c'est un artefact de production, idempotent, qui ne remplace ni `env`
+ni `models.yaml` (cf. [guide de déploiement](deployment.md#4-installation-du-gateway)).
+
+`bootstrap-plan` est la couche non privilégiée. Elle inventorie, calcule, explique
+— et s'arrête là. Aucun téléchargement, aucune compilation, aucune écriture de
+registre, aucun `systemctl`. Le seul sous-processus que la chaîne puisse lancer
+est `llama-server --version`, et seulement si l'opérateur fournit `--llama-bin`.
+
+La séparation existe parce que les deux couches n'ont ni le même risque ni le
+même public. Un plan se lit, se discute, se colle dans un ticket et se rejoue à
+l'identique sans conséquence ; une installation modifie un hôte. Les confondre
+reviendrait à demander `root` pour obtenir un avis, et à faire d'une lecture de
+diagnostic une modification du système.
+
+### Pipeline
+
+```text
+inventaire matériel  (bootstrap/inventory.py, AUT-002)
+      ↓
+résolution runtime   (bootstrap/runtime_resolver.py, AUT-003)
+      ↓
+recommandation       (bootstrap/llmfit.py, AUT-004 — optionnelle)
+      ↓
+catalogue approuvé   (bootstrap/catalog.py + catalog.yaml, AUT-005)
+      ↓
+sélection + budget   (bootstrap/planner.py, AUT-001)
+      ↓
+séquence d'étapes    → schema.BootstrapPlan (bootstrap/schema.py)
+```
+
+Les producteurs ne se connaissent pas : ils se projettent vers `schema`, jamais
+l'inverse. C'est ce qui permet à l'un d'échouer sans entraîner les autres — un
+`nvidia-smi` cassé dégrade la section `hardware` sans empêcher le catalogue
+d'être lu, ni le plan d'exister pour dire où est le trou. `planner.py` est le
+seul module qui importe tous les autres, et le seul à connaître l'ordre global.
+
+Un GGUF déjà présent dans le volume des modèles est inspecté par
+`bootstrap/gguf_meta.py` (AUT-013) : lecture bornée de l'en-tête, sans
+matérialiser les tenseurs ni le vocabulaire, pour affiner l'estimation à partir
+du fichier réel plutôt que de la valeur déclarée.
+
+### Contrat du plan
+
+`schema.BootstrapPlan` tient quatre promesses, chacune vérifiable dans le module :
+
+| Promesse | Mécanisme |
+|---|---|
+| versionné | `schema_version` (entier stable), comme le `SCHEMA_VERSION` de `doctor` |
+| validé | `validate_plan_dict()` — un plan mal formé n'est jamais « appliqué au mieux » |
+| sans secret | `find_secret_leaks()` sur le document rendu, noms de champs **et** valeurs |
+| lisible | `render_human()` produit la même information que le JSON, en français |
+
+Chaque section porte un statut (`ok`, `warn`, `fail`, `skip`) et des constats.
+Un constat de niveau `fail` bloque **quel que soit le statut de sa section** :
+la première écriture ne collectait les bloqueurs que dans les sections déjà en
+`fail`, et un producteur émettant un `fail` dans une section `warn` aurait vu son
+bloqueur disparaître en silence.
+
+### Non-divulgation
+
+Le plan est conçu pour être copié dans un ticket. `render_json()` comme
+`render_human()` passent par `assert_no_secrets()` : si le document contient une
+valeur ressemblant à un secret, **rien n'est rendu** — la commande échoue.
+
+Deux filets indépendants, parce qu'aucun ne suffit seul :
+
+- **par nom de champ** — `token`, `secret`, `api_key`, `password`… Un tel champ
+  n'a le droit de porter qu'un booléen ou `null` ; un booléen de présence
+  (`"token_present": true`) est la façon recommandée de signaler un secret sans
+  le dire ;
+- **par forme de valeur** — un `hf_…`, un `sk-…`, une clé `llmgw-…`, un en-tête
+  `Bearer`, un bloc PEM ou une URL `user:password@` rangés sous un nom anodin.
+
+Le message de refus cite le **chemin** et le motif, jamais la valeur : un rapport
+de fuite qui recopie le secret est lui-même une fuite.
+
+### Ordre des étapes
+
+```text
+accept_license → download_model → verify_artifact → write_registry (désactivé)
+  → calibrate_model → enable_model → warmup_model → smoke_test
+```
+
+Trois inversions seraient des défauts, pas des goûts :
+
+- **vérifier après avoir posé l'artefact** ne protège de rien — le contrôle
+  SHA-256 précède la mise en service, jamais l'inverse ;
+- **activer avant d'avoir calibré** publie une capacité supposée : `write_registry`
+  écrit délibérément `enabled: false`, et `enable_model` est la seule étape qui
+  rend le modèle servable ;
+- **préchauffer avant d'activer** réchauffe un modèle que personne ne peut servir.
+
+`smoke_test` est unique et finale : elle traverse le chemin public réel
+(nginx → gateway → `llama-server`) et valide la chaîne, pas un modèle en
+particulier — elle ne se réplique donc pas par modèle. Elle désigne la recette du
+premier token déjà outillée par
+[`smoke_test.sh`](deployment.md#recette-du-premier-token-smoke_testsh) : TTFT
+mesuré, rapport sans secret.
+
+### Estimé contre mesuré
+
+Les ressources du catalogue et l'estimation tirée de l'en-tête GGUF sont des
+**estimations conservatrices**, jamais des mesures. La hiérarchie est explicite :
+
+```text
+en-tête GGUF + paramètres  →  ESTIMATION conservatrice
+                           →  chargement réel (étape calibrate_model)
+                           →  mesure des pics
+                           →  valeur de capacité approuvée
+```
+
+Aucune valeur estimée ne doit être recopiée telle quelle dans le `vram_gb` du
+registre. `calibrate_model` est l'étape qui remplace l'estimation par des pics
+observés et **propose** un `vram_gb` sans l'appliquer silencieusement ; tant
+qu'elle n'a pas eu lieu, l'entrée reste `enabled: false`.
+
+### LLMfit : conseiller, jamais autorité
+
+La règle d'activation, littéralement :
+
+```text
+recommandation LLMfit                        ← simple ordonnancement
+  + modèle approuvé par le catalogue         ← filtre dur
+  + estimation conservatrice                 ← filtre dur
+  + chargement réel de calibration           ← étape du plan, pas une évaluation
+  = modèle activable
+```
+
+Absent, LLMfit fait sortir la section `recommendation` en `skip` et le plan reste
+valide : c'est le cas par défaut sur une machine nue comme en CI. Présent, il ne
+peut qu'**ordonner** des candidats déjà approuvés par le catalogue et déjà
+retenus par le budget de l'hôte. Il ne peut ni ajouter un modèle absent du
+catalogue, ni ressusciter une entrée non épinglée, ni relever un budget.
+
+La subordination est structurelle et pas seulement déclarative :
+
+- `llmfit.py` ne construit ni n'importe `schema.PlanStep` et ne nomme aucune
+  constante `ACTION_*` : il lui est impossible d'émettre `enable_model` ;
+- les identifiants qui en sortent sont publiés sous la clé `candidate`, jamais
+  `model` ou `model_id` : rien de ce qu'il écrit n'a la forme d'une entrée de
+  registre ;
+- chaque entrée porte `catalog_approved: null` — « non statué ici » ;
+- le rapprochement avec le catalogue exige une correspondance exacte
+  (identifiant d'entrée ou `repo_id`) : un rapprochement flou ferait entrer par
+  la petite porte le pouvoir refusé par la grande.
+
+Deux asymétries volontaires dans les statuts émis. **Absence n'est pas échec** :
+un conseiller optionnel manquant ne doit jamais empêcher un plan d'exister. Mais
+**ce que l'opérateur a déclaré doit tenir** : une empreinte épinglée qui ne
+correspond plus, ou un profil manuel désigné et illisible, sont des `fail` — non
+parce que le conseil manque, mais parce que la machine n'est pas dans l'état
+déclaré.
+
+### Limites connues, écrites noir sur blanc
+
+Trois zones où le code est en avance sur la preuve. Elles sont énoncées ici
+plutôt que découvertes en production :
+
+- **Les fixtures de test LLMfit sont synthétiques.** Le dépôt amont ne publie ni
+  les noms de champs ni un exemple de sortie de `recommend --json` ; la forme
+  validée par l'adaptateur est dérivée de la spécification. Tous les fichiers de
+  `gateway/tests/fixtures/llmfit/` sont préfixés `synthetic-`, et un test échoue
+  si ce préfixe disparaît. À remplacer par de vraies captures avant de s'appuyer
+  sur LLMfit en production.
+- **La matrice d'artefacts `llama-server` mélange constats et hypothèses.**
+  Chaque variante de `DEFAULT_VARIANTS` porte un champ `evidence` :
+  `constat-§6` pour ce que la spécification affirme, `hypothèse-à-confirmer` pour
+  ce qui est plausible mais non vérifié (le résolveur n'a pas d'accès réseau et
+  ne consulte aucune page de release). Sont des **constats** : les images GHCR
+  officielles `server-cuda` et `server-cuda13` sur `linux-x86_64`, les builds
+  locaux CUDA 12/13 sur `linux-x86_64`, et le build local CPU `linux-x86_64`
+  (réellement exercé lors du déploiement du 2026-07-30). Tout le reste — archives
+  natives de release, image CPU GHCR, builds ROCm, Vulkan, arm64 et Metal — est
+  une hypothèse. Une variante retenue sur hypothèse déclenche un `warn` : le plan
+  ne présente jamais une supposition comme un fait.
+- **Aucun test n'a été exécuté contre un GPU réel.** Les chemins GPU sont
+  couverts par des sondes injectées ; la VRAM reste déclarative tant qu'une
+  calibration n'a pas eu lieu sur la machine cible.
+
+Par ailleurs, `DEFAULT_VARIANTS` ne porte **aucun digest** : rien n'est épinglé
+dans ce dépôt à ce jour, et inventer une empreinte serait pire que de ne pas en
+avoir. Avec la politique par défaut, seules les variantes `local-build` sont donc
+éligibles ; les autres apparaissent dans les motifs de rejet avec la mention
+« non épinglé », qui est l'information utile.
+
+Usage opérationnel de la commande : [guide administrateur](admin.md#9-planificateur-damorçage--bootstrap-plan).
+Catalogue de modèles approuvés : [guide de déploiement](deployment.md#catalogue-de-modèles-approuvés-amorçage).
+
+---
+
 ## Budget VRAM et éviction LRU
 
 ### Calcul du budget

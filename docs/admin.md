@@ -20,6 +20,7 @@ Trois interfaces sont disponibles :
 6. [Contrôle des modèles](#6-contrôle-des-modèles)
 7. [Référence API REST admin](#7-référence-api-rest-admin)
 8. [Diagnostic préflight — `doctor`](#8-diagnostic-préflight--doctor)
+9. [Planificateur d'amorçage — `bootstrap-plan`](#9-planificateur-damorçage--bootstrap-plan)
 
 ---
 
@@ -1521,6 +1522,336 @@ c'est sur eux qu'un script doit s'appuyer, jamais sur le texte du `message`.
 
 Toute évolution non rétro-compatible de ce document incrémente
 `schema_version`.
+
+---
+
+## 9. Planificateur d'amorçage — `bootstrap-plan`
+
+`bootstrap-plan` calcule ce qu'il faudrait installer sur un hôte pour atteindre
+le premier token — et **n'applique rien**. Aucun téléchargement, aucune
+compilation, aucune écriture de registre, aucun `systemctl`. Le seul
+sous-processus que la chaîne puisse lancer est `llama-server --version`, et
+seulement si `--llama-bin` est fourni. La commande ne demande donc **aucun
+privilège**.
+
+À situer parmi les autres outils hors-service :
+
+| Outil | Question à laquelle il répond | Hôte déjà installé |
+|---|---|---|
+| `bootstrap-plan` | Que faudrait-il installer ici, et pourquoi ? | **non** |
+| `doctor` | L'hôte et la configuration sont-ils corrects ? | oui |
+| `smoke_test.sh` | La chaîne publique sert-elle réellement un token ? | oui, et démarré |
+
+L'installation elle-même reste le domaine de `install.sh` : la séparation entre
+la couche privilégiée qui écrit et la couche non privilégiée qui explique est
+détaillée dans l'[architecture](architecture.md#deux-couches-et-pourquoi-elles-sont-séparées).
+
+### Usage
+
+```bash
+# Depuis le répertoire de la gateway, avec le venv du service
+cd /opt/llm-gateway
+
+# Plan complet, sortie humaine — aucun privilège requis
+./venv/bin/python cli.py bootstrap-plan
+
+# Plan JSON (schéma versionné) pour un script de déploiement
+./venv/bin/python cli.py bootstrap-plan --json
+
+# Cas nominal : runtime épinglé, plancher de sécurité, volume des modèles explicite
+./venv/bin/python cli.py bootstrap-plan \
+    --pin-version b6210 \
+    --pin-commit <sha_git_du_tag_b6210> \
+    --min-build 6120 \
+    --models-dir /models
+
+# Évaluer un llama-server déjà en place (`--version` sera exécuté sur ce binaire)
+./venv/bin/python cli.py bootstrap-plan --llama-bin /usr/local/bin/llama-server
+
+# Restreindre le plan à une entrée du catalogue
+./venv/bin/python cli.py bootstrap-plan --model qwen2.5-0.5b-instruct-q4_k_m
+
+# Traiter les avertissements comme bloquants (recette de mise en production)
+./venv/bin/python cli.py bootstrap-plan --strict
+```
+
+| Option | Effet | Défaut |
+|---|---|---|
+| `--json` | Document JSON (schéma versionné) au lieu du rapport texte | texte |
+| `--mode` | Topologie visée : `local` ou `cluster` | `local` |
+| `--catalog` | Catalogue de modèles approuvés à lire | `gateway/bootstrap/catalog.yaml` |
+| `--hardware-profile` | Profil matériel **déclaré** (JSON) au lieu de sonder l'hôte | sonde |
+| `--models-dir` | Volume où atterriraient les GGUF | `/models` |
+| `--model` | Restreindre à ces identifiants de catalogue (option répétable) | toutes les entrées |
+| `--max-models` | Nombre maximal de modèles retenus | `1` |
+| `--llama-bin` | Binaire `llama-server` déjà en place, à évaluer | aucun |
+| `--pin-version` | Version llama.cpp épinglée, au format « bNNNNN » | aucune |
+| `--pin-commit` | Commit git correspondant à `--pin-version` | aucun |
+| `--min-build` | Premier build patché connu — plancher de sécurité | `0` |
+| `--strict` | Les avertissements deviennent bloquants | désactivé |
+
+`--pin-version` et `--pin-commit` vont ensemble : l'un sans l'autre n'épingle
+rien et la commande refuse (code `2`). `--min-build` est la valeur d'où
+`LLAMA_SERVER_MIN_BUILD` est dérivé — c'est le **plancher de sécurité**, pas le
+build épinglé, pour que la gateway accepte tout binaire au moins aussi patché
+que le premier build corrigé connu (cf.
+[section 11 du guide de déploiement](deployment.md#11-mise-à-jour)). Une politique
+qui épinglerait un build inférieur à son propre plancher est refusée à la
+construction.
+
+### Grille des exit codes
+
+Mêmes conventions que `doctor`, volontairement.
+
+| Code | Signification | Conduite à tenir |
+|---|---|---|
+| `0` | Plan complet et applicable | appliquer |
+| `1` | Au moins un bloqueur | **ne rien appliquer**, même partiellement ; corriger d'abord |
+| `2` | *Réservé* : erreur d'usage de la CLI | corriger la ligne de commande |
+| `3` | Avertissements seulement — applicable | applicable, dette à traiter |
+| `4` | Erreur d'exécution du planificateur | signaler ; ne pas conclure sur l'état de l'hôte |
+
+`4` couvre aussi les entrées que le planificateur refuse : un `--hardware-profile`
+illisible ou invalide, un `--model` absent du catalogue.
+
+### Sans épinglage, le plan sort bloqué — et c'est voulu
+
+Lancée sans `--pin-version`/`--pin-commit`, la commande ne propose **aucune
+étape** et sort en code `1`. Ce n'est pas un défaut d'ergonomie :
+
+- le planificateur refuse d'inventer un numéro de build. Un numéro inventé se
+  propagerait dans tous les manifestes de provenance produits, où il aurait
+  l'apparence d'un fait vérifié ;
+- une séquence de téléchargements sans binaire capable de servir les modèles
+  inviterait à n'exécuter que la moitié du plan — et cette moitié-là est
+  justement celle qui consomme du disque et du réseau.
+
+Ce qui *serait* retenu reste visible dans la section « Modèles retenus » : rien
+n'est caché, seule la séquence est retenue. Pour débloquer, fournir la version
+épinglée, le commit correspondant et le plancher de sécurité :
+
+```bash
+./venv/bin/python cli.py bootstrap-plan \
+    --pin-version b6210 --pin-commit <sha_git> --min-build 6120
+```
+
+### Exemple de sortie humaine
+
+Exécution **sans aucune option**, sur un poste de développement macOS sans GPU
+et sans `/models` — ce n'est donc pas le cas nominal, mais c'est exactement la
+sortie qu'un opérateur obtient quand rien n'est encore en place, et elle montre
+les quatre familles de constats. Sortie tronquée après les sections :
+
+```text
+PLAN DE BOOTSTRAP EVARUNTIME
+  Généré le    : 2026-07-31T09:11:48+00:00
+  Mode         : local
+  Schéma       : v1
+  Verdict      : BLOQUÉ
+
+Ce document décrit ce qui SERAIT fait. Rien n'a été installé, téléchargé
+ni modifié pour le produire.
+
+SECTIONS
+  [XX] Inventaire matériel — macos 25.5.0 arm64 (mesuré) — 24.0 Go de RAM, 0.0 Go libres sur /models, aucun GPU ; backends : metal, cpu
+       · warn [cpu_model_unknown] Modèle de CPU non lisible (`/proc/cpuinfo` absent). Le profil reste exploitable, mais aucune variante CPU optimisée ne pourra être justifiée.
+       · warn [cpu_flags_unavailable] Jeux d'instructions du CPU non détectables : impossible de confirmer AVX2/AVX-512. La liste vide signifie « non mesuré », pas « absent » — ne l'interprétez pas comme un CPU sans SIMD.
+       · warn [ram_available_unknown] RAM disponible non mesurable ; seule la RAM totale sera utilisée pour dimensionner, ce qui surestime la marge réelle.
+       · fail [disk_unreadable] Espace libre illisible sur « /models » (FileNotFoundError sur /models). Aucun téléchargement ne peut être planifié sans connaître la place disponible : créez le répertoire ou pointez --models-dir sur le bon volume.
+       · warn [gpu_probe_unavailable] Sonde GPU impossible : nvidia-smi introuvable dans le PATH. L'hôte est traité comme dépourvu de GPU NVIDIA — légitime sur un poste de développement ou un orchestrateur de cluster, anormal sur un nœud d'inférence, où seul un backend CPU pourra être proposé.
+  [XX] Runtime llama-server — aucune politique de release fournie
+       · fail [politique_de_release_absente] Aucune politique de release n'a été fournie : le planificateur ne peut pas décider quel llama-server installer, et il refuse d'en inventer une. Fournissez une version épinglée (« bNNNNN »), le commit correspondant et le premier build patché connu (plancher de sécurité, cf. GHSA-8947-pfff-2f3c) — c'est de là que LLAMA_SERVER_MIN_BUILD est généré (§6).
+       Un numéro de build inventé se propagerait dans tous les manifestes de
+       provenance produits, où il aurait l'apparence d'un fait vérifié.
+       Tant que le runtime n'est pas résolu, AUCUNE étape n'est proposée : ce qui
+       serait retenu reste visible dans la section « Modèles retenus », mais une
+       séquence de téléchargements sans binaire capable de servir les modèles
+       inviterait à n'exécuter que la moitié du plan.
+  [--] Recommandation — conseil consultatif — LLMfit absent, aucune recommandation
+       LLMfit est un conseiller, pas une autorité. Ses estimations ignorent :
+         · tous les paramètres EVARuntime
+         · le coût exact de ctx_size × parallel
+         · les caches K/V sélectionnés
+         · le comportement exact de cpu_moe
+         · l'empreinte des projecteurs multimodaux
+         · la fragmentation VRAM
+         · les autres modèles chargés simultanément
+         · les contraintes systemd de l'hôte
+
+       Règle d'activation : recommandation LLMfit + modèle approuvé par le catalogue EVARuntime + estimation conservatrice + chargement réel de calibration = modèle activable.
+  [ok] Catalogue approuvé — 2 modèle(s) approuvé(s), épinglé(s) et sous licence identifiée (apache-2.0).
+  [XX] Modèles retenus — aucun modèle retenu
+       · fail [aucun_modele_retenu] Aucun modèle du catalogue ne peut être retenu sur cet hôte : qwen2.5-0.5b-instruct-q4_k_m → disque insuffisant sur le volume des modèles : 0.0 Go libres pour 0.6 Go requis (marge ×1.25); smollm2-360m-instruct-q8_0 → disque insuffisant sur le volume des modèles : 0.0 Go libres pour 0.4 Go requis (marge ×1.25). Sans modèle, le parcours jusqu'au premier token n'a pas d'objet.
+       Les valeurs de ressources sont des ESTIMATIONS conservatrices, jamais des
+       mesures. L'étape `calibrate_model` du plan est ce qui les remplace par des
+       pics observés ; tant qu'elle n'a pas eu lieu, l'entrée de registre reste
+       désactivée (AUT-007).
+
+DÉCISIONS
+  · runtime llama-server → aucun
+      parce que aucune politique de release n'a été fournie au planificateur
+  · modèle par défaut → aucun
+      parce que aucune entrée approuvée du catalogue ne tient dans les ressources de cet hôte
+      écarté : qwen2.5-0.5b-instruct-q4_k_m (disque insuffisant sur le volume des modèles : 0.0 Go libres pour 0.6 Go requis (marge ×1.25)), smollm2-360m-instruct-q8_0 (disque insuffisant sur le volume des modèles : 0.0 Go libres pour 0.4 Go requis (marge ×1.25))
+
+ÉTAPES QUE L'APPLICATION EXÉCUTERAIT
+  (aucune)
+```
+
+Le rapport se poursuit par les blocs `BLOQUEURS`, `AVERTISSEMENTS` et la ligne
+`Sortie : 1`, tronqués ici.
+
+Quatre marques de statut se lisent en tête de section : `[ok]` complète, `[!!]`
+dégradée mais utilisable, `[XX]` inexploitable — bloquante — et `[--]` non
+applicable ici, qui n'est **jamais** un échec (LLMfit absent est un `[--]`).
+
+### Séquence d'étapes proposée
+
+Extrait d'une exécution où une politique de release est fournie et où le volume
+des modèles est lisible. Le plan de cette exécution portait par ailleurs d'autres
+constats ; seule la séquence est reproduite ici, et le chemin du volume de test a
+été remplacé par `/models` :
+
+```text
+ÉTAPES QUE L'APPLICATION EXÉCUTERAIT
+   1. [accept_license] qwen2.5-0.5b-instruct-q4_k_m — apache-2.0
+      Acceptation explicite par l'opérateur avant tout téléchargement. Modèle de base : apache-2.0 ; fine-tune : apache-2.0 ; redistribution du GGUF autorisée.
+   2. [download_model] Qwen/Qwen2.5-0.5B-Instruct-GGUF@9217f5db79a29953eb74d5343926648285ec7e67  (root, 468.6 Mio)
+      Télécharger l'ensemble indivisible (qwen2.5-0.5b-instruct-q4_k_m.gguf) vers /models, à révision figée, par fichier temporaire puis renommage atomique.
+   3. [verify_artifact] qwen2.5-0.5b-instruct-q4_k_m
+      Vérifier le SHA-256 de chaque fichier de l'ensemble contre le catalogue, avant toute mise en service. Un écart annule l'installation du modèle.
+   4. [write_registry] models.yaml → qwen2.5-0.5b-instruct-q4_k_m  (root)
+      Écrire l'entrée de registre avec `enabled: false` et les paramètres du catalogue. Elle reste désactivée tant que la calibration et la recette n'ont pas réussi (AUT-007).
+   5. [calibrate_model] qwen2.5-0.5b-instruct-q4_k_m
+      Chargement réel de calibration : relever les pics RAM/VRAM, la durée de chargement et le TTFT, puis PROPOSER un `vram_gb` — sans l'appliquer silencieusement (§9).
+   6. [enable_model] qwen2.5-0.5b-instruct-q4_k_m  (root)
+      Basculer l'entrée en `enabled: true` avec la capacité issue de la calibration. C'est ici, et pas avant, que le modèle devient servable.
+   7. [warmup_model] qwen2.5-0.5b-instruct-q4_k_m
+      Préchauffer le modèle pour que le premier utilisateur ne paie pas le chargement après un déploiement réussi (AUT-010).
+   8. [smoke_test] nginx → gateway → llama-server
+      Recette du premier token à travers le chemin public réel (§10) : TTFT mesuré, rapport sans secret. Unique et finale — elle valide la chaîne, pas un modèle en particulier.
+```
+
+Chaque étape annonce si elle exige `root` et si elle est réversible : ce sont les
+deux questions que se pose l'opérateur avant de valider, et les cacher
+reviendrait à lui demander une signature à l'aveugle. L'ordre n'est pas
+négociable — le
+[détail des trois inversions interdites](architecture.md#ordre-des-étapes) est
+dans le document d'architecture.
+
+> **Aucune de ces étapes n'est exécutée par `bootstrap-plan`.** Le document
+> décrit ce qui *serait* fait ; l'application appartient à `install.sh` et aux
+> procédures de ce guide.
+
+### Sortie JSON
+
+```bash
+./venv/bin/python cli.py bootstrap-plan --json > /tmp/plan.json
+```
+
+```json
+{
+  "tool": "eva-bootstrap-plan",
+  "schema_version": 1,
+  "generated_at": "2026-07-31T09:14:38+00:00",
+  "mode": "local",
+  "strict": false,
+  "status": "blocked",
+  "applicable": false,
+  "exit_code": 1,
+  "counts": {
+    "ok": 1,
+    "warn": 0,
+    "fail": 3,
+    "skip": 1,
+    "steps": 0,
+    "decisions": 2
+  },
+  "estimated_download_bytes": 0,
+  "sections": [ ... ],
+  "steps": [ ... ],
+  "decisions": [ ... ],
+  "blockers": [ ... ],
+  "warnings": [ ... ]
+}
+```
+
+Les `code` des constats (`disk_unreadable`, `politique_de_release_absente`,
+`catalogue_entree_non_epinglee`…) sont des identifiants machine stables : c'est
+sur eux qu'un script doit s'appuyer, jamais sur le texte du `message`. Toute
+évolution non rétro-compatible du document incrémente `schema_version` ; un plan
+dont le `schema_version` dépasse celui de l'outil est signalé comme tel par le
+validateur du schéma, plutôt que lu de travers.
+
+Le plan est destiné à être collé dans un ticket : le rendu — JSON **comme**
+texte — refuse de publier un document contenant une valeur ressemblant à un
+secret, et la commande échoue alors en code `4` plutôt que d'émettre le
+document. Détail des deux filets :
+[non-divulgation](architecture.md#non-divulgation).
+
+### Profil matériel déclaré (`--hardware-profile`)
+
+Sur une VM, en passthrough, ou sur un hôte où les outils constructeur échouent,
+sonder rend une réponse *fausse* plutôt qu'aucune réponse. `--hardware-profile`
+remplace alors intégralement la sonde par un document JSON décrivant l'hôte :
+
+```json
+{
+  "os": "linux",
+  "os_version": "22.04",
+  "arch": "x86_64",
+  "cpu_model": "Intel(R) Xeon(R) Gold 6338",
+  "cpu_flags": ["avx2", "avx512f"],
+  "ram_total_bytes": 137438953472,
+  "ram_available_bytes": 128849018880,
+  "disk_available_bytes": 2199023255552,
+  "disk_path": "/models",
+  "gpus": [
+    {
+      "index": 0,
+      "uuid": "GPU-00000000-0000-0000-0000-000000000000",
+      "vendor": "nvidia",
+      "model": "NVIDIA L40S",
+      "vram_total_bytes": 48305504256,
+      "driver_version": "535.183.01",
+      "compute_capability": "8.9"
+    }
+  ],
+  "backend_candidates": ["cuda12", "vulkan", "cpu"]
+}
+```
+
+Le document est traité comme une **entrée non fiable**, au même titre qu'un corps
+de requête. Sont refusés, avec le chemin du champ fautif : un champ obligatoire
+absent ou vide, une taille qui n'est pas un entier d'octets, `ram_total_bytes`
+à zéro, une `ram_available_bytes` supérieure au total, un `uuid` de GPU en double
+(qui doublerait le budget VRAM), une `vram_total_bytes` nulle ou négative, un
+backend inconnu, un backend GPU annoncé alors que `gpus` est vide, et toute
+valeur ressemblant à un secret. `CUDA_VISIBLE_DEVICES` s'applique au profil
+déclaré comme à un profil sondé.
+
+Un profil déclaré porte **toujours** un avertissement
+`hardware_profile_declared` : les capacités n'ont été confrontées à aucune sonde,
+et un chiffre trop généreux ne se verra qu'au chargement du premier modèle. Le
+silence serait ici le vrai défaut — un plan bâti sur des chiffres affirmés par un
+humain n'a pas la même valeur de preuve qu'un plan bâti sur une mesure.
+
+### Lecture depuis un script
+
+```bash
+set +e
+./venv/bin/python cli.py bootstrap-plan --json > /tmp/plan.json
+status=$?
+set -e
+case "$status" in
+    0) echo "Plan applicable." ;;
+    3) echo "Avertissements — voir /tmp/plan.json." ;;
+    *) echo "Plan bloqué ou en erreur (code $status) — arrêt." >&2; exit 1 ;;
+esac
+```
+
+Un plan bloqué ne doit être appliqué par personne, **jamais partiellement** : le
+champ `applicable` du document le dit aussi explicitement que l'exit code.
 
 ---
 

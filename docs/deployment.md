@@ -67,6 +67,42 @@ python3 --version   # doit afficher 3.11 ou supérieur
 sudo apt install python3.11 python3.11-venv python3.11-dev
 ```
 
+### Planifier avant d'installer
+
+Deux couches, volontairement séparées, et une seule écrit sur l'hôte :
+
+| Couche | Commande | Privilèges | Effet sur l'hôte |
+|---|---|---|---|
+| Planification | `python cli.py bootstrap-plan` | aucun | **aucun** — produit un document |
+| Installation | `bash gateway/deploy/install.sh` | `root` | utilisateur système, venv, systemd, nginx, secrets |
+
+`install.sh` reste la couche privilégiée et la seule voie d'installation
+supportée. `bootstrap-plan` inventorie l'hôte, résout quel `llama-server`
+conviendrait, filtre le catalogue de modèles approuvés et rend la séquence
+d'étapes qu'une installation exécuterait — **sans rien télécharger, compiler ni
+écrire**. Le seul sous-processus qu'il puisse lancer est `llama-server --version`,
+et seulement si on lui fournit `--llama-bin`.
+
+L'intérêt pratique : le plan se lit, se discute et se colle dans un ticket avant
+qu'une machine ne soit touchée, et il dit *pourquoi* chaque choix a été fait —
+là où un installeur ne dit que ce qu'il a fait.
+
+```bash
+# Sur l'hôte cible, sans privilège, depuis un clone du dépôt
+cd EVARuntime/gateway
+python3 -m venv .venv && ./.venv/bin/python -m pip install -r requirements.txt
+./.venv/bin/python cli.py bootstrap-plan --models-dir /models
+```
+
+Sans `--pin-version`/`--pin-commit`, le plan sort **bloqué** et ne propose aucune
+étape : le planificateur refuse d'inventer un numéro de build. Référence complète
+des options et des exit codes :
+[guide administrateur, section 9](admin.md#9-planificateur-damorçage--bootstrap-plan).
+
+Les sections 2 et 3 qui suivent décrivent la procédure manuelle éprouvée
+(compilation de llama.cpp, téléchargement des GGUF). Le plan de bootstrap ne la
+remplace pas : il la documente pour un hôte donné.
+
 ---
 
 ## 2. Installation de llama.cpp
@@ -195,6 +231,81 @@ Le `mmproj_path` est déclaré dans `models.yaml` — voir section 6 pour la str
 > systemd du service. Avant d'activer un modèle, consulter la table
 > « modèle → RAM hôte requise → VRAM requise » de
 > [§15](#15-durcissement-systemd-et-profils-mémoire).
+
+### Catalogue de modèles approuvés (amorçage)
+
+Les téléchargements ci-dessus sont manuels et libres. Le planificateur
+d'amorçage, lui, ne propose que ce qui figure dans un **catalogue de modèles
+approuvés** : `gateway/bootstrap/catalog.yaml`.
+
+Ce fichier **n'est pas le registre opérationnel**. `models.yaml` décrit ce que
+*cette* installation sert, avec des chemins locaux et des `vram_gb` calibrés ; le
+catalogue décrit ce que le bootstrap a le **droit** de proposer au téléchargement.
+Les deux ne se recouvrent jamais et n'ont pas le même cycle de vie : le registre
+est une conséquence du catalogue, jamais l'inverse.
+
+Chaque entrée distingue explicitement :
+
+| Champ | Ce qu'il fixe |
+|---|---|
+| `license.base_model` | licence du **modèle de base** (dépôt d'origine) |
+| `license.fine_tune` | licence du **fine-tune / de la quantisation GGUF** publiée |
+| `license.redistribution_allowed` | droit de recopier le GGUF vers un miroir interne |
+| `license.gated` | dépôt exigeant une acceptation nominative et un jeton |
+| `license.operator_acceptance_required` | acceptation explicite avant tout téléchargement |
+| `source.revision` | SHA de commit **de 40 caractères** — une branche n'est pas une révision, elle bouge |
+| `source.files[].sha256` | empreinte de chaque fichier de l'ensemble |
+| `resources` | **estimations** conservatrices, jamais des mesures |
+
+La licence du **logiciel de téléchargement** (`huggingface_hub`, Apache-2.0) est
+commune à toutes les entrées et vit au niveau du catalogue. Une licence dont
+l'identifiant n'est pas connu du chargeur fait **échouer le chargement** : on ne
+devine pas une licence.
+
+**Règle fail-closed.** Une entrée dont la révision ou l'un des SHA-256 vaut `null`
+est chargée, listée et visible — mais marquée `pending` et **écartée de toute
+planification de téléchargement**, avec un constat bloquant qui dit comment
+l'épingler. L'entrée reste dans le catalogue à dessein : la faire disparaître
+priverait l'opérateur de l'information qui lui permet de la corriger. Une entrée
+bloquée est un désagrément ; un SHA inventé transforme la vérification
+d'intégrité en théâtre.
+
+Deux entrées sont livrées, toutes deux Apache-2.0 de bout en bout, non gated, et
+destinées à la recette du premier token — **pas à la production** :
+
+| Identifiant | Dépôt | Quantisation | Taille |
+|---|---|---|---|
+| `qwen2.5-0.5b-instruct-q4_k_m` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | Q4_K_M | ~0,46 Go |
+| `smollm2-360m-instruct-q8_0` | `HuggingFaceTB/SmolLM2-360M-Instruct-GGUF` | Q8_0 | ~0,36 Go |
+
+La seconde vient d'un éditeur distinct pour que la recette du premier token ne
+dépende pas de la disponibilité d'un unique dépôt.
+
+Leurs révisions et empreintes sont **réelles** : relevées le 2026-07-31 sur l'API
+publique Hugging Face et recoupées avec l'en-tête `X-Linked-Etag`. Pour les
+revérifier — lecture publique, aucun jeton requis :
+
+```bash
+# Révision (champ `sha`) et empreinte de chaque fichier (`siblings[].lfs.sha256`)
+curl -s "https://huggingface.co/api/models/<repo_id>?blobs=true" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); \
+      print(d["sha"]); \
+      [print(s["rfilename"], s.get("lfs",{}).get("sha256"), s.get("size")) \
+       for s in d["siblings"]]'
+
+# Recoupement : les deux endpoints doivent donner le même SHA-256
+curl -sI "https://huggingface.co/<repo_id>/resolve/<revision>/<fichier>" | grep -i x-linked-etag
+```
+
+Les fichiers d'une entrée forment un **ensemble indivisible** : shards GGUF et
+projecteur `mmproj` se téléchargent ensemble ou pas du tout. Le chargeur refuse
+une série de shards incomplète ou non contiguë, et un `mmproj` manquant quand le
+runtime le déclare nécessaire.
+
+Enfin, les valeurs de `resources` ne doivent jamais être recopiées telles quelles
+dans le `vram_gb` du registre : ce sont des estimations, que seule une
+calibration par chargement réel remplace par des pics observés — voir
+[Estimé contre mesuré](architecture.md#estimé-contre-mesuré).
 
 ---
 
@@ -1160,6 +1271,14 @@ Au démarrage, la gateway (et chaque node-agent) sonde `llama-server --version` 
 
 > Le durcissement inclut aussi l'absence délibérée du flag `--context-shift`
 > (vecteur de la CVE `n_discard`) dans la commande de lancement.
+
+Cette valeur est le **plancher de sécurité** — le premier build corrigé connu —
+et non le build effectivement installé : exiger le build épinglé reviendrait à
+refuser de démarrer après toute mise à jour manuelle vers un build plus récent.
+C'est la même grandeur que l'option `--min-build` de
+[`bootstrap-plan`](admin.md#9-planificateur-damorçage--bootstrap-plan), qui la
+dérive de la politique de release et refuse une politique épinglant un build
+inférieur à son propre plancher.
 
 ### Ajouter ou modifier des modèles
 
