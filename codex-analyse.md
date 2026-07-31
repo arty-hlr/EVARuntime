@@ -21,7 +21,7 @@
 |---|---|
 | **Où en est-on** | Jalon **M1 atteint** (§0.12). Le système sait désormais **expliquer ce qu'il installerait et pourquoi**, sans rien appliquer : `python cli.py bootstrap-plan` rend un plan versionné, validé, sans secret et lisible avant application. M0 était atteint, le premier déploiement réel sur deux VMs avait révélé 6 défauts invisibles en CI (§0.10), tous fermés (§0.11) |
 | **Ce qui vient ensuite** | Jalon **M2 — installation jusqu'au premier token** (§13) : c'est l'exécution du plan que M1 sait maintenant écrire. Lot D sécurité reste l'alternative selon arbitrage. **Plus aucun P0 ouvert dans les Lots A et B** |
-| **Santé des tests** | **1223 tests verts** (1160 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
+| **Santé des tests** | **1243 tests verts** (1180 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
 | **Reste à faire** | 36 items sur 63 (§0.3). Aucun P0 ouvert hors Lots C, D et E |
 | **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU. Le plan de bootstrap n'a **jamais été appliqué** — c'est M2, pas M1 |
 
@@ -48,13 +48,13 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir.
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1160** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1180** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **1223** 🔬 |
+| **Total** | — | **354** | **1243** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+465 par
+**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+485 par
 la vague 5**, tous des régressions rouges avant correctif et vertes après. Les
 scripts de déploiement passent `bash -n`.
 
@@ -184,7 +184,8 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-31 | AUT-001 | `ca0871f` | `pytest tests -q` (gateway) + 5 codes de sortie rejoués | 1140 réussis ; faute de saisie (2) séparée de panne du planificateur (4) 🔬 |
 | 2026-07-31 | — | `898088a` | Relecture de la documentation contre le code | `README`, `docs/admin.md` §9, `docs/architecture.md`, `docs/deployment.md` 📖 |
 | 2026-07-31 | AUT-001, AUT-002, AUT-004 | `055eeea` | `pytest tests -q` (gateway) + 4 mutations rejouées | 1160 réussis ; cinq défauts de revue fermés, dont un plan bloqué qui décrivait 8 actions 🔬 |
-| 2026-07-31 | **M1** | `055eeea` | Les 2 suites + `ruff` sur les deux composants | **1223 réussis** (1160 / 63), jalon atteint 🔬 |
+| 2026-07-31 | AUT-001 | `8e25616` | `pytest tests -q` (gateway) + 2 mutations rejouées | 1180 réussis ; `--strict` bloque réellement, champs récapitulatifs typés et comparés 🔬 |
+| 2026-07-31 | **M1** | `8e25616` | Les 2 suites + `ruff` sur les deux composants | **1243 réussis** (1180 / 63), jalon atteint 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -406,8 +407,9 @@ et seulement si l'opérateur fournit `--llama-bin`.
 | — | AUT-001 (correctifs de contrat) | P0 | `bootstrap/schema.py` | `1b77763` | +10 | `[x]` |
 | — | AUT-001 (assemblage et CLI) | P0 | `bootstrap/planner.py`, `cli.py` | `976894d`, `ca0871f` | +40 | `[x]` |
 | — | AUT-001/002/004 (revue) | P1 | `bootstrap/schema.py`, `planner.py`, `cli.py` | `055eeea` | +20 | `[x]` |
+| — | AUT-001 (revue, 2ᵉ passe) | P1 | `bootstrap/schema.py` | `8e25616` | +20 | `[x]` |
 
-**Total : +465 tests.** Chaque chantier a été mené dans un worktree git isolé,
+**Total : +485 tests.** Chaque chantier a été mené dans un worktree git isolé,
 avec propriété exclusive de ses fichiers, et a dû prouver la rougeur de ses
 tests en cassant réellement son code — 27 mutations appliquées et rejouées au
 total, pas seulement affirmées. La documentation, écrite en dernier contre le
@@ -506,11 +508,24 @@ n'a été corrigé sur description.
 | **L'épinglage LLMfit était inatteignable depuis la CLI** : l'adaptateur refusait correctement d'exécuter un binaire non épinglé, mais aucune option ne permettait de fournir version, empreinte, binaire ou profil manuel. AUT-004 existait comme bibliothèque, pas dans le parcours opérateur. | Constat : aucune occurrence de « llmfit » dans `cli.py` 📖 | Six options ajoutées (`--llmfit-bin/-version/-sha256/-timeout/-profile`, `--no-llmfit`), épinglage incohérent refusé en code 2 |
 | **La validation ne recoupait aucun champ dérivé** : un document portant une section `fail` mais retouché en `status: ok` / `applicable: true` / `exit_code: 0` / `blockers: []` passait sans une seule erreur. | Reproduit : document falsifié à la main, validation vide 🔬 | `_validate_verdict()` recalcule status, applicable, exit_code, blockers, warnings, counts et volume depuis les sections. L'enjeu est **M2**, qui appliquera des plans relus depuis un fichier : un applicateur ne doit jamais pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe |
 
-Ce que cette revue enseigne sur la vague elle-même : les tests écrits par chaque
-chantier vérifiaient bien **leur** module, et l'assemblage vérifiait bien ses
-raccords — mais l'invariant transverse « un plan bloqué ne propose aucune
-action » n'appartenait à personne. Il est désormais porté par le contrat, au
-seul endroit où aucun producteur ne peut le contourner.
+#### Seconde passe de revue — l'invariant tenait encore mal
+
+Une relecture du correctif a montré que l'invariant n'était pas encore bien posé.
+
+| Découverte | Preuve | Traitement |
+|---|---|---|
+| **`--strict` produisait un plan bloqué qui proposait des actions.** La promotion des avertissements en blocage ne valait que pour le code de sortie : `status: fail`, `exit_code: 1`, et pourtant `applicable: true` avec **9 étapes** — validateur muet. | Reproduit 🔬 | `is_blocked()` devient le seul lieu de décision ; `applicable`, `steps`, `counts` et le volume en dérivent, dans le JSON comme dans le rendu. Le validateur rejette tout statut `fail`/`blocked` portant des étapes. `--strict` change donc le **document**, pas seulement son affichage |
+| **Les champs récapitulatifs étaient mal contrôlés** : une liste `warnings` entièrement inventée passait si sa longueur était juste ; `warnings: 7` faisait lever un `TypeError` ; `strict: "false"` était converti en VRAI par `bool(...)`, donc le verdict était recalculé à contresens. | Reproduit sur les trois 🔬 | Les sept champs sont obligatoires et typés strictement ; `blockers` et `warnings` sont comparés **élément par élément** aux constats recalculés |
+
+Ce que ces deux passes enseignent sur la vague elle-même : les tests écrits par
+chaque chantier vérifiaient bien **leur** module, et l'assemblage vérifiait bien
+ses raccords — mais l'invariant transverse « un plan non applicable ne propose
+aucune action » n'appartenait à personne. Il a fallu deux corrections pour le
+poser correctement, et la seconde a montré que la première le tenait encore par
+la mauvaise grandeur : les bloqueurs, et non le **statut**. Il est désormais
+vérifié à deux niveaux indépendants — au calcul par le planificateur, à la
+publication par le contrat — et ni un producteur, ni un assembleur, ni un mode
+d'affichage ne peut le contourner seul.
 
 #### Ce que la vague 5 ne prétend pas avoir démontré
 
