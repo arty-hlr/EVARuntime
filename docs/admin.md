@@ -1832,6 +1832,10 @@ sur eux qu'un script doit s'appuyer, jamais sur le texte du `message`. Toute
 dont le `schema_version` dépasse celui de l'outil est signalé comme tel par le
 validateur du schéma, plutôt que lu de travers.
 
+Les six valeurs de `counts` sont des entiers positifs ou nuls. Les booléens et
+les flottants sont refusés, même lorsqu'ils sont numériquement égaux à l'entier
+attendu (`true == 1`, par exemple), ainsi que toute clé absente ou inconnue.
+
 Le plan est destiné à être collé dans un ticket : le rendu — JSON **comme**
 texte — refuse de publier un document contenant une valeur ressemblant à un
 secret, et la commande échoue alors en code `4` plutôt que d'émettre le

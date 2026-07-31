@@ -343,6 +343,32 @@ def test_un_champ_recapitulatif_absent_est_refuse(champ):
     assert any(champ in e and "obligatoire" in e for e in sc.validate_plan_dict(document))
 
 
+@pytest.mark.parametrize("champ", ["ok", "warn", "fail", "skip", "steps", "decisions"])
+@pytest.mark.parametrize(
+    "conversion",
+    [pytest.param(bool, id="booleen"), pytest.param(float, id="flottant")],
+)
+def test_chaque_compteur_exige_un_entier_exact(champ, conversion):
+    """
+    Régression : l'égalité Python assimile `True` à `1`, `False` à `0` et `1.0`
+    à `1`. Comparer seulement le dictionnaire recalculé laissait donc passer un
+    document JSON dont les compteurs violaient le contrat.
+    """
+    document = _plan().to_dict()
+    document["counts"][champ] = conversion(document["counts"][champ])
+    errors = sc.validate_plan_dict(document)
+    assert any(f"counts.{champ}" in e and "entier" in e for e in errors), errors
+
+
+def test_counts_refuse_les_cles_manquantes_et_inconnues():
+    document = _plan().to_dict()
+    del document["counts"]["steps"]
+    document["counts"]["telechargements"] = 1
+    errors = sc.validate_plan_dict(document)
+    assert any("counts.steps" in e and "obligatoire" in e for e in errors), errors
+    assert any("clé inconnue" in e and "telechargements" in e for e in errors), errors
+
+
 def test_le_verdict_n_est_recoupe_que_si_la_structure_tient():
     """
     Recalculer un verdict depuis des sections mal formées produirait du bruit et

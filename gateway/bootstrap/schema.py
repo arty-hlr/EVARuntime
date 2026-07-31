@@ -438,6 +438,33 @@ def validate_plan_dict(document: Any) -> tuple[str, ...]:
 
 
 _ABSENT = object()
+_COUNT_KEYS = ("ok", "warn", "fail", "skip", "steps", "decisions")
+
+
+def _validate_counts(counts: dict) -> list[str]:
+    """
+    Valide le sous-contrat `counts`, clé par clé et sans coercition numérique.
+
+    Une simple comparaison au dictionnaire recalculé ne suffit pas en Python :
+    `True == 1`, `False == 0` et `1.0 == 1`. Un document JSON rempli de
+    booléens ou de flottants pouvait donc respecter l'égalité tout en violant le
+    schéma. Les compteurs sont des entiers positifs ou nuls, jamais des valeurs
+    seulement « numériquement équivalentes ».
+    """
+    errors: list[str] = []
+    for key in _COUNT_KEYS:
+        value = counts.get(key, _ABSENT)
+        if value is _ABSENT:
+            errors.append(f"counts.{key} est obligatoire")
+        elif not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            errors.append(
+                f"counts.{key} doit être un entier >= 0, reçu {type(value).__name__}"
+            )
+
+    for key in counts:
+        if key not in _COUNT_KEYS:
+            errors.append(f"counts contient une clé inconnue : {key!r}")
+    return errors
 
 
 def _compare_findings(declares: list, attendus: list, champ: str) -> list[str]:
@@ -499,6 +526,8 @@ def _validate_verdict(document: dict) -> list[str]:
             # `strict: "false"` était converti en vrai par `bool(...)` : une chaîne
             # non vide est toujours vraie. Le type est donc exigé, pas déduit.
             errors.append(f"{champ} doit être {libelle}, reçu {type(valeur).__name__}")
+    if isinstance(document.get("counts"), dict):
+        errors.extend(_validate_counts(document["counts"]))
     if errors:
         return errors
 
