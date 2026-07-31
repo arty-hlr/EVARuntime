@@ -38,6 +38,7 @@ The project is intentionally pragmatic: FastAPI, SQLite WAL, systemd, nginx and 
 - Multi-model VRAM budgeting with LRU eviction and best-effort VRAM reconciliation via `nvidia-smi`.
 - Optional multi-node mode with lightweight GPU agents, state reconciliation on startup and fast failover.
 - Supply-chain hardening: optional GGUF `sha256` integrity checks and `llama-server` build pinning.
+- Unprivileged bootstrap planner (`bootstrap-plan`): inventories the host and explains what it would install to reach a first token, without downloading, compiling or writing anything.
 - Observability: Prometheus text exposition (`/admin/metrics/prometheus`) and a `/ready` readiness probe.
 - Admin CLI and REST API for users, keys, models and reports.
 - Deployment assets for systemd, nginx, journald and scheduled SQLite backups.
@@ -67,6 +68,7 @@ Each model backend is managed as a gateway-owned subprocess instead of a permane
 
 ```text
 gateway/                 Main OpenAI-compatible gateway
+gateway/bootstrap/       Unprivileged bootstrap planner and approved-model catalog
 gateway/cluster/         Multi-node scheduling and remote node client
 gateway/deploy/          systemd, nginx and install scripts
 gateway/static/          Admin dashboard
@@ -99,6 +101,19 @@ git clone https://github.com/Tutanka01/EVARuntime.git
 cd EVARuntime
 sudo bash gateway/deploy/install.sh --mode local
 ```
+
+Installation is the privileged layer. A separate, unprivileged layer answers the
+question that comes before it — what would be installed on this host, and why:
+
+```bash
+cd gateway && python cli.py bootstrap-plan
+```
+
+`bootstrap-plan` produces a versioned, secret-free document meant to be reviewed
+or pasted into a ticket. It writes nothing and installs nothing; without a pinned
+`llama.cpp` version and commit it deliberately reports a blocked plan rather than
+inventing a build number. See the
+[admin guide](docs/admin.md#9-planificateur-damorçage--bootstrap-plan).
 
 Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
 multi-node orchestrator, inspect the plan first, then install explicitly:
