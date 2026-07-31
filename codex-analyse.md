@@ -19,44 +19,44 @@
 
 | | |
 |---|---|
-| **Où en est-on** | Jalon **M0 atteint**, puis **premier déploiement réel sur deux VMs** joué de bout en bout — il a révélé 6 défauts invisibles en CI (§0.10). **Ces 6 défauts sont fermés** (vague 4, §0.11), avec COR-009 en prime |
-| **Ce qui vient ensuite** | Jalon **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage. **Plus aucun P0 ouvert dans le Lot A** |
-| **Santé des tests** | **758 tests verts** (695 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
-| **Reste à faire** | 41 items sur 62 (§0.3). Les 5 items ouverts du Lot A sont tous en P1/P2 |
-| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU |
+| **Où en est-on** | Jalon **M1 atteint** (§0.12). Le système sait désormais **expliquer ce qu'il installerait et pourquoi**, sans rien appliquer : `python cli.py bootstrap-plan` rend un plan versionné, validé, sans secret et lisible avant application. M0 était atteint, le premier déploiement réel sur deux VMs avait révélé 6 défauts invisibles en CI (§0.10), tous fermés (§0.11) |
+| **Ce qui vient ensuite** | Jalon **M2 — installation jusqu'au premier token** (§13) : c'est l'exécution du plan que M1 sait maintenant écrire. Lot D sécurité reste l'alternative selon arbitrage. **Plus aucun P0 ouvert dans les Lots A et B** |
+| **Santé des tests** | **1202 tests verts** (1139 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
+| **Reste à faire** | 36 items sur 63 (§0.3). Aucun P0 ouvert hors Lots C, D et E |
+| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU. Le plan de bootstrap n'a **jamais été appliqué** — c'est M2, pas M1 |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
-décisions tranchées, §0.7 le journal des livraisons, §0.8 et §0.10 les défauts
-trouvés en implémentant et en déployant — ceux qu'aucun des deux audits n'avait
-vus —, §0.9 ce que l'exploitation doit savoir.
+décisions tranchées, §0.7 le journal des livraisons, §0.8, §0.10 et §0.12 les
+défauts trouvés en implémentant et en déployant — ceux qu'aucun des deux audits
+n'avait vus —, §0.9 ce que l'exploitation doit savoir.
 
 ### 0.1 Situation
 
 | Champ | Valeur |
 |---|---|
-| Dernière mise à jour | 2026-07-30 |
-| Phase | **Vague 4 livrée** — les retours du premier déploiement réel sont fermés (§0.11) |
-| Jalon atteint | **M0 — socle fonctionnel fiable** (§13), sortie prononcée (§0.7.1) |
-| Jalon visé | **M1 — planificateur de bootstrap** (§13) |
-| Branche de travail | `feat/lot-a-vague4-retours-deploiement` (créée depuis `dev` @ `3a60f19`) |
-| Base de référence | `dev` @ `3a60f19` — 678 tests verts, `ruff` propre |
-| Périmètre livré à ce jour | COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, AUT-012, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
-| Périmètre de la vague 4 | COR-009, COR-015 → COR-017, TST-006, OPS-008, OPS-009 — **7 items, tous `[x]`** — plus OPS-010, né de la vague (§0.11) |
-| Prochain jalon | **M1 — planificateur de bootstrap** (§13), ou Lot D sécurité selon arbitrage |
+| Dernière mise à jour | 2026-07-31 |
+| Phase | **Vague 5 livrée** — le planificateur de bootstrap existe et est verrouillé par ses régressions (§0.12) |
+| Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
+| Jalon visé | **M2 — installation jusqu'au premier token** (§13) |
+| Branche de travail | `feat/lot-b-vague5-planificateur-bootstrap` (créée depuis `feat/lot-a-vague4-retours-deploiement` @ `9af8172`) |
+| Base de référence | `9af8172` — 758 tests verts, `ruff` propre |
+| Périmètre livré à ce jour | AUT-001 → AUT-005, AUT-012, AUT-013, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
+| Périmètre de la vague 5 | AUT-001 → AUT-005 et AUT-013 — **6 items, tous `[x]`** — plus SEC-009, né de la vague (§0.12) |
+| Prochain jalon | **M2 — installation jusqu'au premier token** (§13), ou Lot D sécurité selon arbitrage |
 
 ### 0.2 Base de référence des tests et état courant
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **695** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1139** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **758** 🔬 |
+| **Total** | — | **354** | **1202** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+324 tests** ajoutés par le jalon M0, puis **+80 par la vague 4**, tous des
-régressions rouges avant correctif et vertes après. Les scripts de déploiement
-passent `bash -n`.
+**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+444 par
+la vague 5**, tous des régressions rouges avant correctif et vertes après. Les
+scripts de déploiement passent `bash -n`.
 
 > **Retrait du composant `gateway-student` (DEC-009, 30 juillet 2026).** Les
 > totaux ci-dessus perdent mécaniquement les 79 tests de référence et 138 tests
@@ -73,28 +73,29 @@ vérifiée par `bash -n`, à compléter avec EVA-044.
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[–]` Annulé |
 |---|---:|---:|---:|---:|---:|
 | A — bloqueurs et invariants | 17 | 11 | 0 | 5 | 1 |
-| B — bootstrap automatisé | 13 | 1 | 0 | 12 | 0 |
+| B — bootstrap automatisé | 13 | 7 | 0 | 6 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
-| D — sécurité et supply-chain | 8 | 1 | 0 | 7 | 0 |
+| D — sécurité et supply-chain | 9 | 1 | 0 | 8 | 0 |
 | E — tests et exploitation | 16 | 4 | 1 | 9 | 2 |
-| **Total** | **62** | **17** | **1** | **41** | **3** |
+| **Total** | **63** | **23** | **1** | **36** | **3** |
 
-Neuf items ont été **ajoutés au backlog** après coup, d'où 62 au lieu de 53 :
+Dix items ont été **ajoutés au backlog** après coup, d'où 63 au lieu de 53 :
 COR-014 (Lot A) et SEC-008 (Lot D) pendant l'implémentation (§0.8), puis
 COR-015 à COR-017 (Lot A) et TST-006, OPS-008, OPS-009 (Lot E) lors du premier
-déploiement réel sur deux VMs (§0.10), enfin **OPS-010** (Lot E) né de la
-vague 4 elle-même.
+déploiement réel sur deux VMs (§0.10), **OPS-010** (Lot E) né de la vague 4,
+enfin **SEC-009** (Lot D) né de la vague 5 (§0.12).
 
-Les **8 items du jalon M0 sont terminés et vérifiés**, ainsi que les **7 items
-de la vague 4**. Les deux items qui étaient `[~]` faute de test (COR-015,
-COR-016) portent désormais le leur. Le seul `[~]` restant est **OPS-010**, dont
-la part venvs est livrée et testée mais dont la borne sur les sauvegardes
+Les **8 items du jalon M0**, les **7 de la vague 4** et les **6 de la vague 5**
+sont terminés et vérifiés. Le seul `[~]` restant est **OPS-010**, dont la part
+venvs est livrée et testée mais dont la borne sur les sauvegardes
 `*.pre-migration.*.bak` reste à poser, sous OPS-002.
 
-**Il ne reste aucun P0 ouvert dans le Lot A.** Les 5 items restants
-(COR-003, COR-008, COR-010, COR-012, COR-013) sont en P1/P2.
+**Il ne reste aucun P0 ouvert dans les Lots A et B.** Les 5 items restants du
+Lot A (COR-003, COR-008, COR-010, COR-012, COR-013) sont en P1/P2 ; les 6 du
+Lot B (AUT-006 → AUT-011) relèvent du jalon M2, c'est-à-dire de l'**exécution**
+du plan que la vague 5 sait désormais écrire.
 
-### 0.4 Vague en cours — jalon M0
+### 0.4 Vagues 1 à 3 — jalon M0 (historique)
 
 Les items sont regroupés par propriété de fichiers, de façon à ce que deux
 chantiers menés en parallèle ne se marchent jamais dessus.
@@ -173,6 +174,14 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-30 | OPS-009 | `28acf1c`, `66140b1` | `pytest tests -q` (gateway) + rougeur rejouée | 685 réussis ; HTTP/2 rendu selon `nginx -v`, seuil inversé → 4 échecs 🔬 |
 | 2026-07-30 | OPS-010 | `d58b365` | `pytest tests -q` (gateway + node_agent) | Rétention bornée des venvs, cible du symlink protégée ; rouge en retirant cette protection 🔬 |
 | 2026-07-30 | **Vague 4** | `532a5da` | Les 2 suites + `bash -n` sur les 12 scripts de déploiement | **758 réussis** (695 / 63), 6 défauts terrain fermés + OPS-010 🔬 |
+| 2026-07-31 | AUT-001 | `5a8271e`, `380feff` | `pytest tests -q` (gateway) + 3 mutations rejouées | 750 réussis ; contrat du plan, 55 régressions, détecteur de secrets neutralisé → 8 échecs 🔬 |
+| 2026-07-31 | AUT-002 | `e3516ee` | `pytest tests -q` (gateway) + 11 mutations rejouées | 798 réussis ; 11 mutants sur 11 tués, dont le filtrage `CUDA_VISIBLE_DEVICES` (7 échecs) 🔬 |
+| 2026-07-31 | AUT-004 | `f5788c2` | `pytest tests -q` (gateway) + parité CI Python 3.11 | 896 réussis ; LLMfit absent → `skip`, épinglage version+SHA vérifié, timeout borné 🔬 |
+| 2026-07-31 | AUT-003 | `54f61f6` | `pytest tests -q` (gateway) + 7 mutations rejouées | 964 réussis ; repli CPU marqué dégradé, manifeste incohérent refusé, clone superficiel reconnu 🔬 |
+| 2026-07-31 | AUT-013, AUT-005 | `c349470`, `07534cd` | `pytest tests -q` (gateway) + empreintes recoupées | 1100 réussis ; header GGUF borné contre fichier hostile, catalogue fail-closed 🔬 |
+| 2026-07-31 | AUT-001 | `1b77763` | `pytest tests -q` (gateway) + 3 mutations rejouées | Un constat `fail` bloque quelle que soit sa section ; `notes` rendues, `status_from_findings()` 🔬 |
+| 2026-07-31 | AUT-001 | `976894d` | `pytest tests -q` (gateway) + CLI exercée sur 5 codes de sortie | **1139 réussis** ; plan assemblé de bout en bout, `bootstrap-plan` en JSON et en français 🔬 |
+| 2026-07-31 | **M1** | `976894d` | Les 2 suites + `ruff` sur les deux composants | **1202 réussis** (1139 / 63), jalon atteint 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -374,6 +383,139 @@ L'item reste `[~]` : les venvs sont bornés, les sauvegardes
 Les six défauts du premier déploiement réel sont fermés, chacun par un test qui
 échoue sans son correctif. **Le Lot A n'a plus de P0 ouvert** : le travail de
 bootstrap (Lot B / jalon M1) peut démarrer sans dette bloquante.
+
+### 0.12 Vague 5 — le planificateur de bootstrap (jalon M1)
+
+Cette vague livre la couche **non privilégiée** de §5 : un paquet
+`gateway/bootstrap/` et une commande `python cli.py bootstrap-plan` qui
+calculent ce qu'il faudrait installer sur un hôte pour aller jusqu'au premier
+token — **sans rien appliquer**. Aucun téléchargement, aucune compilation,
+aucune écriture. Le seul sous-processus possible est `llama-server --version`,
+et seulement si l'opérateur fournit `--llama-bin`.
+
+| Chantier | Items | Priorité | Fichiers possédés | Commits | Tests | État |
+|---|---|---|---|---|---:|---|
+| — | AUT-001 (contrat) | P0 | `bootstrap/schema.py` | `5a8271e`, `380feff` | +55 | `[x]` |
+| C1 | AUT-002 | P0 | `bootstrap/inventory.py` | `e3516ee` | +48 | `[x]` |
+| C2 | AUT-013, AUT-005 | P1 / P0 | `bootstrap/catalog.*`, `bootstrap/gguf_meta.py` | `c349470`, `07534cd` | +126 | `[x]` |
+| C3 | AUT-003 | P0 | `bootstrap/runtime_resolver.py` | `54f61f6` | +68 | `[x]` |
+| C4 | AUT-004 | P1 | `bootstrap/llmfit.py` | `f5788c2` | +98 | `[x]` |
+| — | AUT-001 (correctifs de contrat) | P0 | `bootstrap/schema.py` | `1b77763` | +10 | `[x]` |
+| — | AUT-001 (assemblage et CLI) | P0 | `bootstrap/planner.py`, `cli.py` | `976894d` | +39 | `[x]` |
+
+**Total : +444 tests.** Chaque chantier a été mené dans un worktree git isolé,
+avec propriété exclusive de ses fichiers, et a dû prouver la rougeur de ses
+tests en cassant réellement son code — 27 mutations appliquées et rejouées au
+total, pas seulement affirmées.
+
+#### L'architecture qui a rendu la parallélisation possible
+
+Les producteurs (`inventory`, `runtime_resolver`, `llmfit`, `catalog`,
+`gguf_meta`) **ne s'importent jamais entre eux**. Ils se projettent vers un
+contrat commun — `schema.PlanSection` — et seul `planner` les connaît tous.
+Cette règle a deux effets, et le second n'était pas recherché :
+
+1. un producteur peut échouer sans entraîner les autres : un `nvidia-smi` cassé
+   dégrade la section matériel, il n'empêche ni le catalogue d'être lu, ni le
+   plan d'exister pour dire où est le trou ;
+2. quatre chantiers ont pu être menés **en parallèle** sans jamais se croiser,
+   parce que le seul fichier partagé — le contrat — était figé avant leur
+   démarrage.
+
+#### Les arbitrages qui méritent d'être connus
+
+- **Le planificateur refuse d'inventer un numéro de build.** Sans
+  `--pin-version`/`--pin-commit`, `ReleasePolicy` ne peut pas être construite et
+  le plan sort **bloqué**, avec un message qui dit quoi fournir. Un `bNNNNN`
+  inventé se propagerait dans tous les manifestes de provenance produits, où il
+  aurait l'apparence d'un fait vérifié. Même logique côté catalogue : une entrée
+  sans SHA-256 ni révision est listée mais **fail-closed**, exclue de toute
+  planification de téléchargement.
+- **Un plan bloqué ne propose aucune étape.** Décrire des téléchargements sans
+  binaire capable de servir les modèles inviterait à n'exécuter que la moitié du
+  plan — celle qui consomme du disque et du réseau. Ce qui *serait* retenu reste
+  visible dans la section « modèles » : rien n'est caché, seule la séquence
+  actionnable est retenue.
+- **LLMfit ne peut qu'ordonner.** La règle de §7 est appliquée dans son ordre
+  littéral : le catalogue et le budget sont des **filtres durs**, la
+  recommandation n'intervient qu'ensuite et seulement pour faire passer un
+  candidat approuvé devant un autre candidat approuvé. Trois barrières
+  structurelles l'empêchent d'activer un modèle seul — le module ne référence
+  aucune constante `ACTION_*`, ses identifiants sortent sous la clé `candidate`
+  et jamais `model_id`, et chaque entrée porte `catalog_approved: null`. Les
+  trois sont testées **sur l'AST du module**, pas par `grep`.
+- **L'heuristique « VRAM nominale contre VRAM exposée » a été refusée**, pas
+  oubliée : elle échoue sur son cas fondateur (`NVIDIA L40S` ne contient aucun
+  chiffre) et produit un faux positif sur `RTX 4090`. La valeur exposée devient
+  la seule vérité ; la confrontation au `TOTAL_VRAM_GB` configuré reste chez
+  `doctor`, seul endroit qui tient les deux grandeurs.
+- **Le paquet `gguf` officiel a été évalué puis écarté** pour cette vague : il
+  tire `numpy` dans le chemin d'un planificateur censé tourner sur une machine
+  vierge, et son `GGUFReader` matérialise exactement ce qu'on ne veut pas lire
+  (tous les tenseurs, le vocabulaire du tokenizer). Le parseur maison tient en
+  ~200 lignes bornées, testables avec des fichiers fabriqués.
+
+#### Les deux modèles du catalogue initial
+
+| | Modèle 1 | Modèle 2 |
+|---|---|---|
+| Dépôt | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | `HuggingFaceTB/SmolLM2-360M-Instruct-GGUF` |
+| Licence base **et** fine-tune | apache-2.0 | apache-2.0 |
+| Gated | non | non |
+| Révision et SHA-256 | épinglés | épinglés |
+
+Les empreintes sont **réelles** : relevées sur l'API publique de Hugging Face,
+recoupées indépendamment par l'en-tête `X-Linked-Etag` du point de
+téléchargement, puis **revérifiées par l'orchestrateur** avant fusion — c'était
+la revendication la plus risquée de la vague, elle tient. `Llama-3.2-1B`, utilisé
+lors du déploiement réel de §0.10, a été **écarté** : la « Llama 3.2 Community
+License » impose des conditions d'usage, une clause de nommage et un seuil
+d'utilisateurs — elle n'est pas permissive, et un test échoue si quelqu'un
+l'introduit demain.
+
+#### Défauts découverts pendant la vague 5
+
+| Découverte | Trouvé par | Traitement |
+|---|---|---|
+| **Un constat `fail` pouvait disparaître silencieusement.** `BootstrapPlan.blockers` ne collectait les constats bloquants que dans les sections dont le statut valait lui-même `fail`. Un producteur dont le calcul de statut diverge un peu de ses propres constats voyait son bloqueur s'évaporer : absent du verdict, absent du rendu, sans effet sur le code de sortie. Le contrat se lisait comme s'il bloquait. | AUT-003 **et** AUT-005, indépendamment | Corrigé (`1b77763`) 🔬 |
+| **`enforce_llama_min_build()` n'est pas fail-closed**, alors que §6 l'exige : version illisible avec `min_build > 0` → `log.warning` et démarrage autorisé. La politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed, `main._validate_inference_runtime` et `llama_version` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable. La divergence est **documentée et délibérée** dans `doctor.py`, mais le risque résiduel est réel. | AUT-003 | Nouvel item **SEC-009** 📖 |
+| **`llama_version._VERSION_RE` prend le PREMIER `version\|build : <digits>`** de la sortie combinée stdout+stderr. Sur un build CUDA qui émet des lignes d'initialisation de backend avant la ligne de build, un motif parasite donnerait un numéro absurdement bas. Même classe que le défaut du clone superficiel de §0.10. | AUT-003 | Hypothèse `🧭` non vérifiée faute de binaire GPU — à confirmer, suivi sous SEC-009 |
+| **`doctor.visible_devices()` confond « `CUDA_VISIBLE_DEVICES` non définie » et « définie et vide »**, et n'implémente pas la troncature que son propre message décrit. | AUT-002 | Constat `📖` — **non bloquant, vérifié** : `cuda_visible_devices` a pour défaut `"0"`, `install.sh` l'écrit et `ServerManager` la propage toujours explicitement, donc une valeur vide signifie réellement « aucun device ». Le helper reste ambigu pour tout futur appelant |
+| **`doctor.parse_nvidia_smi_csv()` accepte `memory.total <= 0`** : un GPU en erreur entre dans l'inventaire et contribue 0 au budget sans un mot. | AUT-002 | Constat `📖` — l'inventaire de la vague 5 l'écarte, `doctor` reste à aligner |
+| **Un trou de couverture dans le planificateur lui-même** : remplacer `plannable_entries()` par `entries` ne faisait tomber aucun test, toutes les entrées livrées étant épinglées. Le filtre fail-closed était libre de disparaître. | Protocole de mutation, à l'assemblage | Corrigé — un test fabrique un catalogue partiellement épinglé 🔬 |
+| **`schema.merge_findings()` déduplique par `code` globalement.** Sûr à l'intérieur d'un producteur ; deux producteurs qui choisiraient le même code s'effaceraient mutuellement si le planificateur l'employait entre sections. | AUT-002, confirmé par AUT-003 | Constat `📖` — le planificateur ne l'emploie pas entre sections ; à documenter dans le contrat des producteurs |
+
+#### Ce que la vague 5 ne prétend pas avoir démontré
+
+- **Le plan n'a jamais été appliqué.** C'est M2, et c'est le point important :
+  savoir décrire une installation n'est pas savoir l'exécuter.
+- **Les fixtures de test LLMfit sont synthétiques.** Le dépôt amont ne publie ni
+  les noms de champs ni un exemple de la sortie `recommend --json` ; la forme est
+  dérivée de §7. Le coût d'une hypothèse fausse est borné par construction : une
+  sortie non conforme donne `llmfit_schema_invalid` en `warn` et le plan continue
+  **sans** recommandation. À remplacer par de vraies captures avant production.
+- **La matrice d'artefacts `llama-server` mélange constats et hypothèses.** Chaque
+  variante porte un champ `evidence`, et une variante retenue sur hypothèse
+  déclenche un avertissement. L'existence des archives officielles CPU, de
+  l'archive macOS Metal et la faisabilité des builds ROCm/Vulkan/arm64 sont des
+  **hypothèses non vérifiées**, faute d'accès à la matrice de release amont.
+- **Toujours aucun test contre un GPU réel** : la VRAM reste déclarative.
+
+#### 0.12.1 Sortie du jalon M1
+
+Conditions de §13 et leur état :
+
+| Condition M1 | État |
+|---|---|
+| Inventaire matériel | `[x]` — AUT-002, sondes injectables, `CUDA_VISIBLE_DEVICES` respecté |
+| Résolution runtime en mode dry-run | `[x]` — AUT-003, ordre de §6 testé étape par étape, refus explicite inclus |
+| LLMfit intégré par JSON | `[x]` — AUT-004, validé à la frontière, absent = `skip` |
+| Catalogue initial de deux petits modèles permissifs | `[x]` — AUT-005, apache-2.0 des deux côtés, empreintes réelles |
+| Plan inspectable sans écriture | `[x]` — AUT-001, `bootstrap-plan` en JSON et en français, aucune écriture |
+
+**Décision de sortie prononcée** : le système sait expliquer ce qu'il
+installerait et pourquoi. Le travail d'exécution (M2 : AUT-006 → AUT-011) peut
+démarrer sur une base qui décrit correctement son intention.
 
 ---
 
@@ -1257,11 +1399,11 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
-| AUT-001 | `[ ]` | P0 | Définir le schéma du plan de bootstrap | Schéma versionné, validé, sans secret, lisible avant application. |
-| AUT-002 | `[ ]` | P0 | Inventaire matériel automatique | CPU/RAM/disque/GPU/VRAM/driver/backend détectés et testés sur la matrice supportée. |
-| AUT-003 | `[ ]` | P0 | Résolveur `llama-server` | Sélection versionnée, SHA vérifié, aucun fallback CPU silencieux. |
-| AUT-004 | `[ ]` | P1 | Adapter LLMfit JSON | Version figée, schéma validé, timeout, fallback manuel et tests avec sorties enregistrées. |
-| AUT-005 | `[ ]` | P0 | Créer le catalogue approuvé | Révision, fichiers, SHA, licence, paramètres et ressources pour chaque modèle proposé. |
+| AUT-001 | `[x]` | P0 | Définir le schéma du plan de bootstrap | Schéma versionné, validé, sans secret, lisible avant application. **Livré le 2026-07-31** : `bootstrap/schema.py` porte le contrat (`PLAN_SCHEMA_VERSION`, `validate_plan_dict()` avec chemins de champs fautifs, `find_secret_leaks()` à deux filets — par nom de champ ET par forme de valeur —, `render_human()`/`render_json()` refusant tous deux de publier un document qui fuit), `bootstrap/planner.py` l'assemble et `python cli.py bootstrap-plan` l'expose. Aucune écriture, aucun téléchargement. |
+| AUT-002 | `[x]` | P0 | Inventaire matériel automatique | CPU/RAM/disque/GPU/VRAM/driver/backend détectés et testés sur la matrice supportée. **Livré le 2026-07-31** : document §5 littéral, toutes les sondes injectables, `CUDA_VISIBLE_DEVICES` respecté y compris sa troncature, `--hardware-profile` validé à la frontière. Quatre issues GPU distinctes au lieu de deux — un `nvidia-smi` qui **échoue** rend une liste de backends **vide**, jamais `cpu` : c'est le refus du repli silencieux. |
+| AUT-003 | `[x]` | P0 | Résolveur `llama-server` | Sélection versionnée, SHA vérifié, aucun fallback CPU silencieux. **Livré le 2026-07-31** : ordre de §6 testé étape par étape jusqu'au refus explicite, recherche backend-d'abord pour qu'une archive CPU officielle ne l'emporte jamais sur une image CUDA officielle, variante non épinglée inéligible, manifeste de provenance qui ne peut pas être incohérent par construction, `LLAMA_SERVER_MIN_BUILD` généré par `derive_min_build()` et fail-closed. Le clone superficiel de §0.10 est reconnu et nommé pour ce qu'il est. |
+| AUT-004 | `[x]` | P1 | Adapter LLMfit JSON | Version figée, schéma validé, timeout, fallback manuel et tests avec sorties enregistrées. **Livré le 2026-07-31** : binaire refusé si son empreinte ne correspond pas à l'épinglage, validation stricte et bornée de la sortie JSON, timeout borné, profil manuel passant par la MÊME validation, absent = `skip` et non échec. Trois barrières structurelles empêchent une recommandation d'activer un modèle seule, testées sur l'AST du module. **Réserve** : les fixtures sont synthétiques, le dépôt amont ne publiant aucun exemple de sortie — à remplacer par de vraies captures avant production (§0.12). |
+| AUT-005 | `[x]` | P0 | Créer le catalogue approuvé | Révision, fichiers, SHA, licence, paramètres et ressources pour chaque modèle proposé. **Livré le 2026-07-31** : `bootstrap/catalog.yaml`, deux entrées apache-2.0 des deux côtés de la chaîne de licence, révisions et SHA-256 **réels** (relevés sur l'API publique Hugging Face, recoupés par `X-Linked-Etag`, revérifiés à la fusion). Entrée non épinglée = **fail-closed** : listée, mais exclue de toute planification de téléchargement. L'ensemble split/`mmproj` est indivisible par construction, pas par consigne. |
 | AUT-006 | `[ ]` | P0 | Télécharger les modèles de façon sûre | Reprise, espace disque, fichier temporaire, SHA, renommage atomique et provenance. |
 | AUT-007 | `[ ]` | P1 | Générer `models.yaml` | Entrée désactivée tant que la calibration et le smoke test n'ont pas réussi. |
 | AUT-008 | `[ ]` | P1 | Calibrer RAM/VRAM | Mesures avant/après, pics et marge enregistrés par fingerprint. |
@@ -1269,7 +1411,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | AUT-010 | `[ ]` | P1 | Pré-chauffer le modèle par défaut | Le premier utilisateur ne déclenche pas le chargement après un déploiement réussi. |
 | AUT-011 | `[ ]` | P1 | Produire le rapport d'installation | Versions, empreintes, licences, matériel, modèle, performances et contrôles. |
 | AUT-012 | `[x]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
-| AUT-013 | `[ ]` | P1 | Inspecter les métadonnées GGUF | Architecture, tenseurs, contexte et KV alimentent une estimation conservatrice sans être présentés comme une mesure exacte. |
+| AUT-013 | `[x]` | P1 | Inspecter les métadonnées GGUF | Architecture, tenseurs, contexte et KV alimentent une estimation conservatrice sans être présentés comme une mesure exacte. **Livré le 2026-07-31** : parseur maison en bibliothèque standard, bornes explicites sur chaque champ de longueur venu du fichier (un GGUF est une entrée non fiable), validé contre deux vrais headers récupérés par requête `Range`. Le mot « estimation » figure dans le nom des types, dans le rendu et dans la liste des facteurs ignorés. Paquet `gguf` officiel évalué puis écarté (`numpy` sur une machine vierge), conclusion écrite dans le docstring. |
 
 ### Lot C — performance
 
@@ -1295,6 +1437,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | SEC-005 | `[ ]` | P1 | Imposer l'intégrité des modèles approuvés | Aucun modèle catalogue ne charge sans SHA/provenance. |
 | SEC-006 | `[ ]` | P1 | Sécuriser le data-plane cluster | Prompts chiffrés ou réseau isolé attesté et contrôlé. |
 | SEC-007 | `[ ]` | P1 | Produire SBOM et attestations runtime | Chaque release et binaire redistribué possède provenance et notices. |
+| SEC-009 | `[ ]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. |
 | SEC-008 | `[x]` | P1 | Ne pas journaliser les noms d'utilisateur | Aucun `log.*` de la gateway ne porte de nom d'utilisateur ; le chemin de requête est rédigé. **Item ajouté le 2026-07-30**, découvert en livrant COR-002 : anonymiser en base est sans effet si le journal garde une copie du nom. |
 
 ### Lot E — tests, exploitation et standardisation
@@ -1343,6 +1486,9 @@ Conditions :
 - plan inspectable sans écriture.
 
 Décision de sortie : le système sait expliquer ce qu'il installera et pourquoi.
+
+**Jalon atteint le 2026-07-31**, sortie prononcée — détail des cinq conditions
+et de leurs preuves en §0.12.1.
 
 ### M2 — installation jusqu'au premier token
 
