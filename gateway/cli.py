@@ -515,5 +515,173 @@ def doctor(
     raise typer.Exit(report.exit_code(strict=strict))
 
 
+# ── Planificateur de bootstrap (AUT-001 → AUT-005, AUT-013) ───────────────────
+
+@app.command("bootstrap-plan")
+def bootstrap_plan(
+    json_output: bool = typer.Option(
+        False, "--json", help="Plan JSON (schéma versionné) au lieu du texte"
+    ),
+    mode: str = typer.Option("local", "--mode", help="Topologie visée : local ou cluster"),
+    catalog: Optional[str] = typer.Option(
+        None, "--catalog", help="Catalogue de modèles approuvés (défaut : celui du dépôt)"
+    ),
+    hardware_profile: Optional[str] = typer.Option(
+        None, "--hardware-profile",
+        help="Profil matériel DÉCLARÉ (JSON §5) au lieu de sonder — VM, passthrough, hôte où les outils constructeur échouent",
+    ),
+    models_dir: Optional[str] = typer.Option(
+        None, "--models-dir", help="Volume où atterriraient les GGUF (défaut : /models)"
+    ),
+    model: Optional[list[str]] = typer.Option(
+        None, "--model", help="Restreindre à ces identifiants de catalogue (répétable)"
+    ),
+    max_models: int = typer.Option(1, "--max-models", help="Nombre maximal de modèles retenus"),
+    llama_bin: Optional[str] = typer.Option(
+        None, "--llama-bin", help="Binaire llama-server déjà en place, à évaluer (`--version` sera exécuté)"
+    ),
+    pin_version: Optional[str] = typer.Option(
+        None, "--pin-version", help="Version llama.cpp épinglée, au format « bNNNNN »"
+    ),
+    pin_commit: Optional[str] = typer.Option(
+        None, "--pin-commit", help="Commit git correspondant à --pin-version"
+    ),
+    min_build: int = typer.Option(
+        0, "--min-build",
+        help="Premier build patché connu — plancher de sécurité d'où LLAMA_SERVER_MIN_BUILD est généré",
+    ),
+    llmfit_bin: Optional[str] = typer.Option(
+        None, "--llmfit-bin", help="Binaire LLMfit à consulter (défaut : recherché dans le PATH)"
+    ),
+    llmfit_version: Optional[str] = typer.Option(
+        None, "--llmfit-version", help="Version LLMfit attendue — va de pair avec --llmfit-sha256"
+    ),
+    llmfit_sha256: Optional[str] = typer.Option(
+        None, "--llmfit-sha256", help="Empreinte SHA-256 attendue du binaire LLMfit (64 hex minuscules)"
+    ),
+    llmfit_timeout: float = typer.Option(
+        20.0, "--llmfit-timeout", help="Délai maximal accordé à LLMfit, en secondes"
+    ),
+    llmfit_profile: Optional[str] = typer.Option(
+        None, "--llmfit-profile",
+        help="Profil de recommandation écrit à la main, à la place de LLMfit — même validation",
+    ),
+    no_llmfit: bool = typer.Option(
+        False, "--no-llmfit", help="Ne pas consulter LLMfit du tout"
+    ),
+    strict: bool = typer.Option(
+        False, "--strict", help="Traite les avertissements comme des blocages"
+    ),
+):
+    """
+    Calcule le plan d'amorçage de cet hôte — SANS RIEN APPLIQUER.
+
+    Inventorie le matériel, résout le runtime llama-server, consulte LLMfit s'il
+    est présent, filtre le catalogue de modèles approuvés et rend la séquence
+    d'étapes qu'une application exécuterait, avec ses décisions et leurs raisons.
+    Aucun téléchargement, aucune compilation, aucune écriture : le seul
+    sous-processus possible est `llama-server --version`, et seulement si
+    `--llama-bin` est fourni.
+
+    Sans `--pin-version`/`--pin-commit`, le runtime ne peut pas être résolu et le
+    plan sort bloqué : le planificateur refuse d'inventer un numéro de build, qui
+    se propagerait dans les manifestes de provenance avec l'apparence d'un fait.
+
+    LLMfit est un conseiller OPTIONNEL : sans `--llmfit-version`/`--llmfit-sha256`,
+    son binaire n'est pas exécuté et la section sort en `skip` — un binaire non
+    épinglé n'est pas un binaire de confiance. `--llmfit-profile` fournit une
+    recommandation écrite à la main, qui passe par la même validation.
+
+    Le mode `cluster` n'est pas planifiable au jalon M1 et est refusé
+    explicitement : le plan produit inventorierait l'hôte gateway alors que le
+    binaire et les modèles vivent sur les nœuds.
+
+    Exit codes : 0 applicable, 1 bloqué, 3 avertissements seulement,
+    4 erreur interne (2 est réservé aux erreurs d'usage de la CLI).
+    """
+    from datetime import datetime, timezone
+    from pathlib import Path as _Path
+
+    from bootstrap import llmfit as _llmfit
+    from bootstrap import planner as planner_module
+    from bootstrap import runtime_resolver as _runtime
+    from bootstrap import schema as _schema
+
+    if (llmfit_version is None) != (llmfit_sha256 is None):
+        console.print(
+            "[red]--llmfit-version et --llmfit-sha256 vont ensemble :[/red] une version seule se "
+            "déclare, une empreinte seule ne dit pas ce qu'on croyait installer."
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+    if (pin_version is None) != (pin_commit is None):
+        console.print("[red]--pin-version et --pin-commit vont ensemble : l'un sans l'autre n'épingle rien.[/red]")
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    release = None
+    if pin_version is not None:
+        try:
+            release = _runtime.ReleasePolicy(
+                pinned_version=pin_version,
+                pinned_commit=pin_commit or "",
+                security_floor_build=min_build,
+            )
+        except _runtime.ProvenanceError as exc:
+            console.print(f"[red]Politique de release refusée :[/red] {exc}")
+            raise typer.Exit(_schema.EXIT_USAGE)
+
+    try:
+        llmfit_config = _llmfit.LLMfitConfig(
+            enabled=not no_llmfit,
+            binary_path=_Path(llmfit_bin) if llmfit_bin else None,
+            pin=(
+                _llmfit.LLMfitPin(version=llmfit_version, sha256=llmfit_sha256)
+                if llmfit_version is not None else None
+            ),
+            timeout_seconds=llmfit_timeout,
+            manual_profile_path=_Path(llmfit_profile) if llmfit_profile else None,
+        )
+    except _llmfit.LLMfitError as exc:
+        console.print(f"[red]Réglage LLMfit refusé :[/red] {exc}")
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    options = planner_module.PlannerOptions(
+        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        mode=mode,
+        catalog_path=_Path(catalog) if catalog else None,
+        hardware_profile_path=_Path(hardware_profile) if hardware_profile else None,
+        models_dir=_Path(models_dir) if models_dir else planner_module.PlannerOptions.models_dir,
+        selected_ids=tuple(model) if model else None,
+        max_models=max_models,
+        existing_binary=_Path(llama_bin) if llama_bin else None,
+        release_policy=release,
+        llmfit_config=llmfit_config,
+    )
+
+    try:
+        plan = _run(planner_module.build_plan(options))
+        rendered = (
+            _schema.render_json(plan, strict=strict) if json_output
+            else _schema.render_human(plan, strict=strict)
+        )
+    except planner_module.PlannerUsageError as exc:
+        # Faute de saisie de l'opérateur — pas une panne du planificateur.
+        console.print(f"[red]Demande impossible à honorer :[/red] {exc}")
+        raise typer.Exit(_schema.EXIT_USAGE)
+    except _schema.PlanError as exc:
+        console.print(f"[red]Plan refusé :[/red] {exc}")
+        raise typer.Exit(_schema.EXIT_ERROR)
+    except Exception as exc:
+        console.print(f"[red]bootstrap-plan a échoué :[/red] {type(exc).__name__}: {exc}")
+        raise typer.Exit(_schema.EXIT_ERROR)
+
+    if json_output:
+        # Écriture brute : le rendu rich reformaterait le document JSON.
+        sys.stdout.write(rendered + "\n")
+    else:
+        console.print(rendered, markup=False, highlight=False, soft_wrap=True)
+
+    raise typer.Exit(plan.exit_code(strict=strict))
+
+
 if __name__ == "__main__":
     app()

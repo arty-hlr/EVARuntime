@@ -1,0 +1,25 @@
+{
+  "llmfit_version": "0.6.1",
+  "recommendations": [
+    {
+      "model": "qwen2.5-7b-instruct",
+      "quantization": "Q4_K_M",
+      "estimated_vram_mb": 5804.5,
+      "estimated_ram_mb": 1280,
+      "gpu_layers": 29,
+      "context_length": 8192,
+      "fit": "fits",
+      "score": 0.91
+    },
+    {
+      "model": "llama-3.1-8b-instruct",
+      "quantization": "Q4_K_S",
+      "estimated_vram_mb": 6410,
+      "estimated_ram_mb": 1408,
+      "gpu_layers": 33,
+      "context_length": 8192,
+      "fit": "tight",
+      "score": 0.74
+    }
+  ]
+}
