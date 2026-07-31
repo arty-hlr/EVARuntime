@@ -550,6 +550,25 @@ def bootstrap_plan(
         0, "--min-build",
         help="Premier build patché connu — plancher de sécurité d'où LLAMA_SERVER_MIN_BUILD est généré",
     ),
+    llmfit_bin: Optional[str] = typer.Option(
+        None, "--llmfit-bin", help="Binaire LLMfit à consulter (défaut : recherché dans le PATH)"
+    ),
+    llmfit_version: Optional[str] = typer.Option(
+        None, "--llmfit-version", help="Version LLMfit attendue — va de pair avec --llmfit-sha256"
+    ),
+    llmfit_sha256: Optional[str] = typer.Option(
+        None, "--llmfit-sha256", help="Empreinte SHA-256 attendue du binaire LLMfit (64 hex minuscules)"
+    ),
+    llmfit_timeout: float = typer.Option(
+        20.0, "--llmfit-timeout", help="Délai maximal accordé à LLMfit, en secondes"
+    ),
+    llmfit_profile: Optional[str] = typer.Option(
+        None, "--llmfit-profile",
+        help="Profil de recommandation écrit à la main, à la place de LLMfit — même validation",
+    ),
+    no_llmfit: bool = typer.Option(
+        False, "--no-llmfit", help="Ne pas consulter LLMfit du tout"
+    ),
     strict: bool = typer.Option(
         False, "--strict", help="Traite les avertissements comme des blocages"
     ),
@@ -568,18 +587,31 @@ def bootstrap_plan(
     plan sort bloqué : le planificateur refuse d'inventer un numéro de build, qui
     se propagerait dans les manifestes de provenance avec l'apparence d'un fait.
 
+    LLMfit est un conseiller OPTIONNEL : sans `--llmfit-version`/`--llmfit-sha256`,
+    son binaire n'est pas exécuté et la section sort en `skip` — un binaire non
+    épinglé n'est pas un binaire de confiance. `--llmfit-profile` fournit une
+    recommandation écrite à la main, qui passe par la même validation.
+
+    Le mode `cluster` n'est pas planifiable au jalon M1 et est refusé
+    explicitement : le plan produit inventorierait l'hôte gateway alors que le
+    binaire et les modèles vivent sur les nœuds.
+
     Exit codes : 0 applicable, 1 bloqué, 3 avertissements seulement,
     4 erreur interne (2 est réservé aux erreurs d'usage de la CLI).
     """
     from datetime import datetime, timezone
     from pathlib import Path as _Path
 
+    from bootstrap import llmfit as _llmfit
     from bootstrap import planner as planner_module
     from bootstrap import runtime_resolver as _runtime
     from bootstrap import schema as _schema
 
-    if mode not in ("local", "cluster"):
-        console.print(f"[red]--mode doit valoir « local » ou « cluster », reçu {mode!r}.[/red]")
+    if (llmfit_version is None) != (llmfit_sha256 is None):
+        console.print(
+            "[red]--llmfit-version et --llmfit-sha256 vont ensemble :[/red] une version seule se "
+            "déclare, une empreinte seule ne dit pas ce qu'on croyait installer."
+        )
         raise typer.Exit(_schema.EXIT_USAGE)
     if (pin_version is None) != (pin_commit is None):
         console.print("[red]--pin-version et --pin-commit vont ensemble : l'un sans l'autre n'épingle rien.[/red]")
@@ -597,6 +629,21 @@ def bootstrap_plan(
             console.print(f"[red]Politique de release refusée :[/red] {exc}")
             raise typer.Exit(_schema.EXIT_USAGE)
 
+    try:
+        llmfit_config = _llmfit.LLMfitConfig(
+            enabled=not no_llmfit,
+            binary_path=_Path(llmfit_bin) if llmfit_bin else None,
+            pin=(
+                _llmfit.LLMfitPin(version=llmfit_version, sha256=llmfit_sha256)
+                if llmfit_version is not None else None
+            ),
+            timeout_seconds=llmfit_timeout,
+            manual_profile_path=_Path(llmfit_profile) if llmfit_profile else None,
+        )
+    except _llmfit.LLMfitError as exc:
+        console.print(f"[red]Réglage LLMfit refusé :[/red] {exc}")
+        raise typer.Exit(_schema.EXIT_USAGE)
+
     options = planner_module.PlannerOptions(
         generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         mode=mode,
@@ -607,6 +654,7 @@ def bootstrap_plan(
         max_models=max_models,
         existing_binary=_Path(llama_bin) if llama_bin else None,
         release_policy=release,
+        llmfit_config=llmfit_config,
     )
 
     try:

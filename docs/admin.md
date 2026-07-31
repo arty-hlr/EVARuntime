@@ -1588,7 +1588,32 @@ cd /opt/llm-gateway
 | `--pin-version` | Version llama.cpp épinglée, au format « bNNNNN » | aucune |
 | `--pin-commit` | Commit git correspondant à `--pin-version` | aucun |
 | `--min-build` | Premier build patché connu — plancher de sécurité | `0` |
+| `--llmfit-bin` | Binaire LLMfit à consulter | recherché dans le `PATH` |
+| `--llmfit-version` | Version LLMfit attendue — va de pair avec `--llmfit-sha256` | aucune |
+| `--llmfit-sha256` | Empreinte attendue du binaire LLMfit (64 hex minuscules) | aucune |
+| `--llmfit-timeout` | Délai maximal accordé à LLMfit, en secondes | `20` |
+| `--llmfit-profile` | Recommandation écrite à la main, à la place de LLMfit | aucune |
+| `--no-llmfit` | Ne pas consulter LLMfit du tout | désactivé |
 | `--strict` | Les avertissements deviennent bloquants | désactivé |
+
+`--llmfit-version` et `--llmfit-sha256` vont ensemble, pour la même raison que
+`--pin-version` et `--pin-commit` : une version seule se déclare — c'est une
+chaîne que le binaire choisit —, une empreinte seule ne dit pas ce qu'on croyait
+installer. **Sans les deux, le binaire LLMfit n'est pas exécuté** et la section
+sort en `skip` : un conseiller non épinglé n'est pas un conseiller de confiance.
+`--llmfit-profile` remplace intégralement LLMfit par un profil écrit à la main,
+qui passe par **la même validation** — une entrée d'opérateur n'est pas plus
+fiable qu'une sortie d'outil, elle est seulement plus facile à corriger.
+
+#### Le mode `cluster` est refusé au jalon M1
+
+`--mode cluster` sort en code `2` avec un message explicite. Ce n'est pas un
+oubli : en cluster, le binaire `llama-server` et les GGUF vivent sur les nœuds,
+alors que le planificateur inventorie l'hôte sur lequel il tourne. Accepter
+l'option produirait un plan **cohérent et entièrement faux** — il proposerait un
+runtime local et des modèles sous le volume de la gateway. En attendant que la
+planification des nœuds existe, planifiez chaque nœud séparément avec
+`--hardware-profile` et `--models-dir`, ou restez en `--mode local`.
 
 `--pin-version` et `--pin-commit` vont ensemble : l'un sans l'autre n'épingle
 rien et la commande refuse (code `2`). `--min-build` est la valeur d'où
@@ -1614,9 +1639,17 @@ Mêmes conventions que `doctor`, volontairement.
 Les trois codes d'échec disent trois choses différentes, et un script doit
 pouvoir les distinguer : `1` = **cet hôte** est bloqué, `2` = **votre commande**
 est mal formée, `4` = **l'outil** a cassé. Relèvent du code `2` : une option
-inconnue, un `--mode` hors `local`/`cluster`, un `--pin-version` sans son
-commit, un `--model` absent du catalogue, un `--hardware-profile` illisible ou
-invalide.
+inconnue, `--mode cluster` (non planifiable au jalon M1) ou un `--mode` hors
+`local`/`cluster`, un `--pin-version` sans son commit, un `--llmfit-version` sans
+son empreinte, un `--model` absent du catalogue, un `--hardware-profile`
+illisible ou invalide.
+
+**Un plan bloqué (code `1`) ne décrit aucune étape**, quelle que soit la cause du
+blocage — runtime non résolu, catalogue illisible, aucun modèle ne tenant sur
+l'hôte. La règle est portée par le contrat lui-même : un document qui porterait à
+la fois un bloqueur et des étapes est rejeté par la validation. Sans quoi un
+applicateur pourrait n'exécuter que la moitié du plan, et c'est justement la
+moitié qui consomme du disque et du réseau.
 
 ### Sans épinglage, le plan sort bloqué — et c'est voulu
 

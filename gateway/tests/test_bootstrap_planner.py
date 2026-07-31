@@ -175,6 +175,78 @@ def test_un_profil_materiel_invalide_est_refuse(tmp_path):
         _plan(_options(tmp_path, hardware_profile_path=mauvais))
 
 
+def test_un_runtime_non_resolu_ne_laisse_passer_aucune_etape(tmp_path):
+    """
+    Régression : l'invariant « un plan bloqué ne propose aucune étape » n'était
+    tenu QUE pour l'absence de politique de release. Un résolveur rendant
+    `resolved=False` laissait passer téléchargement, écriture de registre,
+    activation et recette — **sans la moindre étape d'installation**. Un
+    applicateur y aurait lu de quoi consommer disque et réseau pour rien.
+
+    Une plateforme sans aucune variante d'artefact produit exactement ce cas.
+    """
+    exotique = _profile_document(arch="riscv64", backend_candidates=["cpu"])
+    plan = _plan(_options(tmp_path, profile=exotique))
+    assert "runtime_unresolved" in [f.code for f in plan.blockers]
+    assert plan.applicable is False
+    assert plan.steps == ()
+
+
+def test_aucun_bloqueur_quelle_qu_en_soit_la_cause_ne_laisse_d_etapes(tmp_path):
+    """
+    L'invariant est adossé aux BLOQUEURS, pas à une cause particulière : il doit
+    donc valoir aussi pour une cause qui n'a rien à voir avec le runtime.
+    """
+    plan = _plan(_options(tmp_path, catalog_path=tmp_path / "absent.yaml"))
+    assert plan.blockers
+    assert plan.steps == ()
+    # Contrôle positif : le même hôte, catalogue sain, produit bien des étapes.
+    assert _plan(_options(tmp_path)).steps
+
+
+def test_cuda_visible_devices_s_applique_a_un_profil_declare(tmp_path, monkeypatch):
+    """
+    Régression : le planificateur appelait le chargeur sans lui transmettre
+    l'environnement, qui retombait sur `{}`. Deux GPU déclarés avec
+    `CUDA_VISIBLE_DEVICES=1` donnaient un budget VRAM **doublé** — la variable
+    gouverne ce que CUDA expose au runtime, quelle que soit l'origine de la liste.
+    """
+    premier = _profile_document()["gpus"][0]
+    second = dict(premier, index=1, uuid="GPU-11111111-1111-1111-1111-111111111111")
+    deux_gpu = _profile_document(gpus=[premier, second])
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    data = _plan(_options(tmp_path, profile=deux_gpu)).section(sc.SECTION_HARDWARE).data
+    assert data["visible_gpu_count"] == 1
+    assert data["visible_vram_total_bytes"] == premier["vram_total_bytes"]
+
+    # Contrôle positif : sans restriction, les deux GPU comptent bien.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    data = _plan(_options(tmp_path, profile=deux_gpu)).section(sc.SECTION_HARDWARE).data
+    assert data["visible_gpu_count"] == 2
+
+
+def test_le_mode_cluster_est_refuse_explicitement(tmp_path):
+    """
+    Le mode était accepté et simplement recopié dans le document. Le plan produit
+    inventoriait l'hôte gateway, choisissait un runtime LOCAL et prévoyait des
+    GGUF sous son propre volume — un plan cohérent et entièrement faux, ce qui
+    est pire qu'une absence de plan.
+    """
+    with pytest.raises(planner.PlannerUsageError) as exc:
+        _plan(_options(tmp_path, mode="cluster"))
+    message = str(exc.value)
+    assert "cluster" in message
+    assert "M1" in message
+    # Le message doit dire quoi faire, pas seulement ce qui ne va pas.
+    assert "--hardware-profile" in message or "--mode local" in message
+
+
+def test_un_mode_inconnu_est_refuse(tmp_path):
+    with pytest.raises(planner.PlannerUsageError):
+        _plan(_options(tmp_path, mode="bizarre"))
+
+
 def test_toutes_les_sections_du_contrat_sont_produites(tmp_path):
     plan = _plan(_options(tmp_path))
     assert [s.name for s in plan.sections] == list(sc.SECTION_NAMES)
@@ -497,6 +569,60 @@ def test_cli_signale_un_profil_illisible_sans_pretendre_bloquer_l_hote(tmp_path)
         "bootstrap-plan", "--hardware-profile", str(tmp_path / "nulle-part.json"),
     ])
     assert result.exit_code == sc.EXIT_USAGE
+
+
+def test_cli_refuse_le_mode_cluster_en_erreur_d_usage(tmp_path):
+    result = _invoke(tmp_path, "--mode", "cluster")
+    assert result.exit_code == sc.EXIT_USAGE
+    assert "cluster" in result.output
+
+
+def test_cli_expose_l_epinglage_llmfit(tmp_path):
+    """
+    Régression : l'adaptateur refusait — correctement — d'exécuter LLMfit sans
+    version ni empreinte épinglées, mais AUCUNE option ne permettait de les
+    fournir. AUT-004 était implémenté comme bibliothèque et inatteignable depuis
+    le parcours opérateur.
+    """
+    from typer.testing import CliRunner
+
+    import cli
+
+    aide = CliRunner().invoke(cli.app, ["bootstrap-plan", "--help"]).output
+    for option in ("--llmfit-bin", "--llmfit-version", "--llmfit-sha256",
+                   "--llmfit-profile", "--llmfit-timeout", "--no-llmfit"):
+        assert option in aide, f"{option} absente de la CLI"
+
+
+@pytest.mark.parametrize("args", [
+    ("--llmfit-version", "0.6.1"),                       # sans son empreinte
+    ("--llmfit-sha256", "a" * 64),                       # sans sa version
+    ("--llmfit-version", "0.6.1", "--llmfit-sha256", "trop-court"),
+    ("--llmfit-timeout", "0"),
+])
+def test_cli_refuse_un_epinglage_llmfit_incoherent(tmp_path, args):
+    """Une version seule se déclare ; une empreinte seule ne dit pas ce qu'on installait."""
+    assert _invoke(tmp_path, *args).exit_code == sc.EXIT_USAGE
+
+
+def test_cli_permet_de_desactiver_llmfit(tmp_path):
+    pin = ("--pin-version", "b6800", "--pin-commit", "a" * 40, "--min-build", "6600")
+    result = _invoke(tmp_path, *pin, "--no-llmfit", "--json")
+    assert result.exit_code in (sc.EXIT_OK, sc.EXIT_WARNINGS), result.output
+    document = json.loads(result.output)
+    section = next(s for s in document["sections"] if s["name"] == sc.SECTION_RECOMMENDATION)
+    assert section["status"] == "skip"
+
+
+def test_cli_accepte_un_profil_de_recommandation_manuel(tmp_path):
+    """Le fallback de §7 : une recommandation écrite à la main, MÊME validation."""
+    profil = tmp_path / "recommandation.json"
+    profil.write_text(json.dumps({"recommendations": [{"model": "qwen2.5-0.5b"}]}), encoding="utf-8")
+    pin = ("--pin-version", "b6800", "--pin-commit", "a" * 40, "--min-build", "6600")
+    result = _invoke(tmp_path, *pin, "--llmfit-profile", str(profil), "--json")
+    assert result.exit_code in (sc.EXIT_OK, sc.EXIT_WARNINGS, sc.EXIT_BLOCKED), result.output
+    document = json.loads(result.output)
+    assert sc.validate_plan_dict(document) == ()
 
 
 def test_cli_n_expose_aucun_secret(tmp_path, monkeypatch):

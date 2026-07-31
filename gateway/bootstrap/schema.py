@@ -405,7 +405,110 @@ def validate_plan_dict(document: Any) -> tuple[str, ...]:
     errors.extend(_validate_steps(document.get("steps")))
     errors.extend(_validate_decisions(document.get("decisions")))
 
+    # Le verdict n'est contrôlé que si la structure tient : recalculer un verdict
+    # à partir de sections mal formées produirait du bruit, pas un diagnostic.
+    if not errors:
+        errors.extend(_validate_verdict(document))
+
     return tuple(errors)
+
+
+def _validate_verdict(document: dict) -> list[str]:
+    """
+    Recalcule le verdict depuis les sections et le confronte à celui du document.
+
+    Sans ce contrôle, un plan enregistré puis retouché — `status: ok`,
+    `applicable: true`, `exit_code: 0`, `blockers: []` — passait la validation
+    alors qu'une de ses sections était en échec. Ce n'est pas une hypothèse : un
+    document falsifié à la main était accepté sans une erreur.
+
+    L'enjeu grandit avec M2, qui appliquera des plans **relus depuis un fichier**
+    et non plus seulement calculés en mémoire. Un applicateur ne doit jamais
+    pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe.
+    """
+    errors: list[str] = []
+    sections = document.get("sections", [])
+    steps = document.get("steps", [])
+    strict = bool(document.get("strict", False))
+
+    blockers: list[dict] = []
+    warnings: list[dict] = []
+    counts = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
+
+    for section in sections:
+        status = section.get("status")
+        counts[status] = counts.get(status, 0) + 1
+        findings = section.get("findings", [])
+        fails = [f for f in findings if f.get("level") == "fail"]
+        blockers.extend(fails)
+        warnings.extend(f for f in findings if f.get("level") == "warn")
+        if status == "fail" and not fails:
+            blockers.append({
+                "code": f"{section.get('name')}_failed",
+                "level": "fail",
+                "message": section.get("summary") or f"Section « {section.get('name')} » en échec.",
+            })
+
+    counts["steps"] = len(steps)
+    counts["decisions"] = len(document.get("decisions", []))
+
+    if blockers:
+        expected_status = "blocked"
+    elif warnings:
+        expected_status = "fail" if strict else "warn"
+    else:
+        expected_status = "ok"
+    expected_exit = (
+        EXIT_BLOCKED if expected_status in ("blocked", "fail")
+        else EXIT_WARNINGS if expected_status == "warn"
+        else EXIT_OK
+    )
+
+    if document.get("status") != expected_status:
+        errors.append(
+            f"status annonce {document.get('status')!r} alors que les sections donnent "
+            f"{expected_status!r}"
+        )
+    if document.get("applicable") is not (not blockers):
+        errors.append(
+            f"applicable annonce {document.get('applicable')!r} alors que le plan porte "
+            f"{len(blockers)} bloqueur(s)"
+        )
+    if document.get("exit_code") != expected_exit:
+        errors.append(
+            f"exit_code annonce {document.get('exit_code')!r}, attendu {expected_exit}"
+        )
+    if len(document.get("blockers", [])) != len(blockers):
+        errors.append(
+            f"blockers en contient {len(document.get('blockers', []))}, "
+            f"attendu {len(blockers)} d'après les sections"
+        )
+    if len(document.get("warnings", [])) != len(warnings):
+        errors.append(
+            f"warnings en contient {len(document.get('warnings', []))}, "
+            f"attendu {len(warnings)} d'après les sections"
+        )
+    if document.get("counts") != counts:
+        errors.append(f"counts annonce {document.get('counts')!r}, attendu {counts!r}")
+
+    declared_bytes = document.get("estimated_download_bytes")
+    expected_bytes = sum(s.get("estimated_bytes") or 0 for s in steps)
+    if declared_bytes != expected_bytes:
+        errors.append(
+            f"estimated_download_bytes annonce {declared_bytes!r}, "
+            f"attendu {expected_bytes} d'après les étapes"
+        )
+
+    # L'invariant le plus lourd de conséquence : un plan bloqué ne doit décrire
+    # aucune action. Un applicateur qui lirait des étapes dans un plan bloqué
+    # pourrait en exécuter la moitié — celle qui consomme du disque et du réseau.
+    if blockers and steps:
+        errors.append(
+            f"le plan est bloqué ({len(blockers)} bloqueur(s)) mais décrit "
+            f"{len(steps)} étape(s) : un plan bloqué ne propose aucune action"
+        )
+
+    return errors
 
 
 def _validate_sections(sections: Any) -> list[str]:

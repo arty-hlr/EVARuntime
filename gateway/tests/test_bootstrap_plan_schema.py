@@ -182,6 +182,70 @@ def test_decision_sans_justification_est_refusee():
     assert any("rationale" in e for e in sc.validate_plan_dict(document))
 
 
+# ── Cohérence du verdict : un champ dérivé doit être recoupable ───────────────
+#
+# Ces régressions comptent surtout pour M2, qui appliquera des plans RELUS depuis
+# un fichier. Un applicateur ne doit jamais pouvoir être convaincu d'agir par un
+# champ dérivé que personne ne recoupe.
+
+def test_un_verdict_falsifie_est_refuse():
+    """
+    Un document portant une section `fail` mais retouché en `status: ok`,
+    `applicable: true`, `exit_code: 0`, `blockers: []` passait la validation sans
+    une seule erreur. Il ne passe plus.
+    """
+    plan = _plan(sections=(_section(status="fail", findings=(sc.Finding("x", "fail", "dur"),)),))
+    document = plan.to_dict()
+    document["status"] = "ok"
+    document["applicable"] = True
+    document["exit_code"] = sc.EXIT_OK
+    document["blockers"] = []
+    document["counts"] = {"ok": 1, "warn": 0, "fail": 0, "skip": 0, "steps": 1, "decisions": 1}
+
+    errors = sc.validate_plan_dict(document)
+    for champ in ("status", "applicable", "exit_code", "blockers", "counts"):
+        assert any(champ in e for e in errors), f"{champ} non recoupé : {errors}"
+
+
+@pytest.mark.parametrize("champ,valeur", [
+    ("status", "blocked"),
+    ("applicable", False),
+    ("exit_code", 1),
+    ("estimated_download_bytes", 42),
+])
+def test_chaque_champ_derive_est_recoupe_isolement(champ, valeur):
+    """Un seul champ retouché suffit à faire échouer la validation."""
+    document = _plan().to_dict()
+    assert sc.validate_plan_dict(document) == ()   # contrôle positif
+    document[champ] = valeur
+    assert any(champ in e for e in sc.validate_plan_dict(document))
+
+
+def test_un_plan_bloque_ne_peut_pas_porter_d_etapes():
+    """
+    L'invariant le plus lourd de conséquence, verrouillé au niveau du document :
+    un applicateur qui lirait des étapes dans un plan bloqué pourrait en exécuter
+    la moitié — celle qui consomme du disque et du réseau.
+    """
+    plan = _plan(sections=(_section(status="fail", findings=(sc.Finding("x", "fail", "dur"),)),))
+    document = plan.to_dict()
+    assert document["steps"], "la fabrique doit fournir au moins une étape"
+    errors = sc.validate_plan_dict(document)
+    assert any("plan est bloqué" in e and "aucune action" in e for e in errors), errors
+
+
+def test_le_verdict_n_est_recoupe_que_si_la_structure_tient():
+    """
+    Recalculer un verdict depuis des sections mal formées produirait du bruit et
+    noierait la vraie erreur. La validation de structure passe d'abord.
+    """
+    document = _plan().to_dict()
+    document["sections"][0]["status"] = "presque"
+    errors = sc.validate_plan_dict(document)
+    assert any("status invalide" in e for e in errors)
+    assert not any("les sections donnent" in e for e in errors)
+
+
 # ── Statuts, bloqueurs et codes de sortie ─────────────────────────────────────
 
 def test_plan_sain_est_applicable_et_sort_en_zero():

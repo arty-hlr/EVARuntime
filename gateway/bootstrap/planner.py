@@ -49,6 +49,7 @@ servir. Le smoke test est unique et final : il traverse le vrai chemin public
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
@@ -123,6 +124,8 @@ async def build_plan(options: PlannerOptions) -> schema.BootstrapPlan:
     sections dégradées, des constats et, s'il le faut, un plan **bloqué** — qui
     reste lisible et dit pourquoi. Un plan absent n'explique rien à personne.
     """
+    _reject_unsupported_mode(options.mode)
+
     sections: list[schema.PlanSection] = []
     decisions: list[schema.Decision] = []
 
@@ -151,15 +154,51 @@ async def build_plan(options: PlannerOptions) -> schema.BootstrapPlan:
     sections.append(_models_section(selection, options))
     decisions.append(_selection_decision(selection))
 
-    steps = _assemble_steps(resolution, selection, options)
-
-    return schema.BootstrapPlan(
+    plan = schema.BootstrapPlan(
         generated_at=options.generated_at,
         mode=options.mode,
         sections=tuple(sections),
-        steps=steps,
         decisions=tuple(decisions),
     )
+
+    # L'invariant « un plan bloqué ne propose aucune étape » est posé ICI, sur le
+    # verdict complet, et non au cas par cas dans l'assemblage. La première
+    # écriture ne le tenait que pour l'absence de politique de release : un
+    # runtime déclaré NON RÉSOLU laissait passer téléchargement, écriture de
+    # registre, activation et recette — sans la moindre étape d'installation.
+    # Adossé aux bloqueurs, l'invariant vaut désormais pour toutes leurs causes,
+    # y compris celles qui n'existent pas encore.
+    if plan.blockers:
+        return plan
+    return replace(plan, steps=_assemble_steps(resolution, selection, options))
+
+
+def _reject_unsupported_mode(mode: str) -> None:
+    """
+    Refuse le mode cluster tant qu'il n'est pas planifié pour de vrai.
+
+    L'accepter en le recopiant dans le document serait pire que de le refuser :
+    le plan produit inventorierait l'hôte gateway, choisirait un runtime LOCAL et
+    prévoirait des GGUF sous son propre `/models`, alors qu'en cluster le binaire
+    et les modèles vivent sur les nœuds. Un opérateur lirait un plan cohérent et
+    entièrement faux — la pire des sorties, bien avant l'absence de sortie.
+
+    Planifier un cluster suppose d'interroger chaque node-agent : c'est un
+    chantier à part entière, hors du jalon M1. En attendant, la conduite à tenir
+    est dans le message.
+    """
+    if mode == "cluster":
+        raise PlannerUsageError(
+            "La planification du mode cluster n'est pas implémentée (jalon M1). "
+            "Accepter --mode cluster produirait un plan cohérent et faux : il "
+            "inventorierait l'hôte gateway, choisirait un runtime local et "
+            "prévoirait des modèles sous son propre volume, alors qu'en cluster le "
+            "binaire et les GGUF vivent sur les nœuds. En attendant, planifiez "
+            "chaque nœud séparément avec --hardware-profile et --models-dir, ou "
+            "restez en --mode local."
+        )
+    if mode != "local":
+        raise PlannerUsageError(f"--mode doit valoir « local » ou « cluster », reçu {mode!r}.")
 
 
 # ── Étape 1 : inventaire ──────────────────────────────────────────────────────
@@ -186,7 +225,14 @@ def _collect_hardware(options: PlannerOptions) -> inventory_mod.HardwareProfile:
     except OSError as exc:
         raise PlannerUsageError(f"--hardware-profile {path} : lecture impossible ({exc}).") from exc
     try:
-        return inventory_mod.load_hardware_profile(text, origin=f"--hardware-profile {path}")
+        # `env` transmis explicitement : sans lui, le chargeur retombe sur `{}` et
+        # CUDA_VISIBLE_DEVICES est ignoré pour un profil DÉCLARÉ. Deux GPU
+        # déclarés avec `CUDA_VISIBLE_DEVICES=1` produisaient alors un budget VRAM
+        # doublé — la variable gouverne ce que CUDA expose au runtime, quelle que
+        # soit l'origine de la liste de GPU.
+        return inventory_mod.load_hardware_profile(
+            text, origin=f"--hardware-profile {path}", env=os.environ
+        )
     except inventory_mod.InventoryError as exc:
         raise PlannerUsageError(str(exc)) from exc
 
