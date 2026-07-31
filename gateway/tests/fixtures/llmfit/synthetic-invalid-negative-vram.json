@@ -1,0 +1,12 @@
+{
+  "llmfit_version": "0.6.1",
+  "recommendations": [
+    {
+      "model": "qwen2.5-7b-instruct",
+      "quantization": "Q4_K_M",
+      "estimated_vram_mb": -4096,
+      "gpu_layers": 29,
+      "fit": "fits"
+    }
+  ]
+}
