@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -500,6 +501,22 @@ def test_la_section_modeles_rappelle_que_les_ressources_sont_estimees(tmp_path):
 
 # ── Intégration CLI (`python cli.py bootstrap-plan`) ──────────────────────────
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _sans_ansi(texte: str) -> str:
+    """
+    Retire les séquences de couleur avant toute recherche dans une sortie CLI.
+
+    rich colorise dès qu'il détecte GitHub Actions : sans ce nettoyage, une
+    recherche de sous-chaîne devient dépendante de l'environnement — verte en
+    local, rouge en CI. Le cas est pire pour un test d'ABSENCE : un secret
+    fragmenté par des séquences ANSI passerait inaperçu, et le test rassurerait
+    à tort.
+    """
+    return _ANSI_RE.sub("", texte)
+
+
 def _invoke(tmp_path, *extra: str, profile: dict | None = None):
     """Appelle la commande telle qu'un opérateur la lancera avant d'installer."""
     from typer.testing import CliRunner
@@ -533,7 +550,7 @@ def test_cli_json_est_un_plan_valide(tmp_path):
 def test_cli_bloque_sans_epinglage_du_runtime(tmp_path):
     result = _invoke(tmp_path)
     assert result.exit_code == sc.EXIT_BLOCKED
-    assert "politique_de_release_absente" in result.output
+    assert "politique_de_release_absente" in _sans_ansi(result.output)
 
 
 def test_cli_strict_promeut_les_avertissements(tmp_path):
@@ -574,7 +591,27 @@ def test_cli_signale_un_profil_illisible_sans_pretendre_bloquer_l_hote(tmp_path)
 def test_cli_refuse_le_mode_cluster_en_erreur_d_usage(tmp_path):
     result = _invoke(tmp_path, "--mode", "cluster")
     assert result.exit_code == sc.EXIT_USAGE
-    assert "cluster" in result.output
+    assert "cluster" in _sans_ansi(result.output)
+
+
+def _options_de_la_commande(nom: str = "bootstrap-plan") -> set[str]:
+    """
+    Options réellement déclarées par la commande, lues sur l'objet Click.
+
+    Volontairement PAS lues dans la sortie de `--help` : rich colorise cette
+    sortie dès qu'il détecte GitHub Actions, et découpe alors les noms d'options
+    en fragments séparés par des séquences ANSI. Un `--llmfit-bin` parfaitement
+    présent devenait introuvable par recherche de sous-chaîne — un test vert en
+    local et rouge en CI, qui ne disait rien de la commande et tout de son
+    rendu. On interroge donc le contrat, pas l'affichage.
+    """
+    import typer.main
+
+    import cli
+
+    groupe = typer.main.get_command(cli.app)
+    commande = groupe.commands[nom]  # type: ignore[attr-defined]
+    return {opt for param in commande.params for opt in getattr(param, "opts", ())}
 
 
 def test_cli_expose_l_epinglage_llmfit(tmp_path):
@@ -584,14 +621,24 @@ def test_cli_expose_l_epinglage_llmfit(tmp_path):
     fournir. AUT-004 était implémenté comme bibliothèque et inatteignable depuis
     le parcours opérateur.
     """
-    from typer.testing import CliRunner
-
-    import cli
-
-    aide = CliRunner().invoke(cli.app, ["bootstrap-plan", "--help"]).output
+    options = _options_de_la_commande()
     for option in ("--llmfit-bin", "--llmfit-version", "--llmfit-sha256",
                    "--llmfit-profile", "--llmfit-timeout", "--no-llmfit"):
-        assert option in aide, f"{option} absente de la CLI"
+        assert option in options, f"{option} absente de la CLI"
+
+
+def test_cli_expose_les_options_du_plan():
+    """
+    Contrôle positif de l'introspection : elle voit bien les autres options.
+    Sans lui, une extraction devenue inerte rendrait le test précédent vide de
+    sens tout en le laissant vert.
+    """
+    options = _options_de_la_commande()
+    for option in ("--json", "--mode", "--catalog", "--hardware-profile",
+                   "--models-dir", "--model", "--max-models", "--llama-bin",
+                   "--pin-version", "--pin-commit", "--min-build", "--strict"):
+        assert option in options, f"{option} absente de la CLI"
+    assert "--option-qui-n-existe-pas" not in options
 
 
 @pytest.mark.parametrize("args", [
@@ -634,6 +681,7 @@ def test_cli_n_expose_aucun_secret(tmp_path, monkeypatch):
     result = _invoke(
         tmp_path, "--pin-version", "b6800", "--pin-commit", "a" * 40, "--min-build", "6600",
     )
-    assert "hf_zzzzzzzzzzzzzzzzzzzzzzzz" not in result.output
+    texte = _sans_ansi(result.output)
+    assert "hf_zzzzzzzzzzzzzzzzzzzzzzzz" not in texte
     # Contrôle positif : la sortie n'est pas vide, le test voit bien quelque chose.
-    assert "PLAN DE BOOTSTRAP" in result.output
+    assert "PLAN DE BOOTSTRAP" in texte
