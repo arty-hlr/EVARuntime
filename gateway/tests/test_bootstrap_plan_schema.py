@@ -221,17 +221,126 @@ def test_chaque_champ_derive_est_recoupe_isolement(champ, valeur):
     assert any(champ in e for e in sc.validate_plan_dict(document))
 
 
-def test_un_plan_bloque_ne_peut_pas_porter_d_etapes():
+def test_un_plan_bloque_ne_publie_plus_ses_etapes():
     """
-    L'invariant le plus lourd de conséquence, verrouillé au niveau du document :
-    un applicateur qui lirait des étapes dans un plan bloqué pourrait en exécuter
-    la moitié — celle qui consomme du disque et du réseau.
+    Le rendu lui-même retire les étapes d'un plan bloqué : elles restent portées
+    par l'objet — le planificateur les a calculées — mais ne sont ni publiées ni
+    imprimées tant que le verdict interdit l'application.
     """
     plan = _plan(sections=(_section(status="fail", findings=(sc.Finding("x", "fail", "dur"),)),))
+    assert plan.steps, "la fabrique doit fournir au moins une étape"
     document = plan.to_dict()
-    assert document["steps"], "la fabrique doit fournir au moins une étape"
+    assert document["steps"] == []
+    assert document["counts"]["steps"] == 0
+    assert document["estimated_download_bytes"] == 0
+    assert sc.validate_plan_dict(document) == ()
+    # L'opérateur doit savoir que des étapes existaient, sinon il cherche au
+    # mauvais endroit en croyant à un plan vide.
+    texte = sc.render_human(plan)
+    assert "Le plan est bloqué" in texte and "ne sont pas" in texte
+
+
+def test_un_document_bloque_portant_des_etapes_est_rejete():
+    """
+    L'invariant le plus lourd de conséquence, verrouillé pour un document VENU DE
+    L'EXTÉRIEUR : un applicateur qui lirait des étapes dans un plan bloqué
+    pourrait en exécuter la moitié — celle qui consomme disque et réseau.
+    """
+    document = _plan().to_dict()
+    assert document["steps"], "contrôle positif : le cas sain porte bien des étapes"
+    # Falsification : on ajoute un constat bloquant sans retirer les étapes,
+    # exactement ce que produirait une édition à la main ou un outil tiers.
+    document["sections"][0]["status"] = "fail"
+    document["sections"][0]["findings"] = [{"code": "x", "level": "fail", "message": "dur"}]
     errors = sc.validate_plan_dict(document)
-    assert any("plan est bloqué" in e and "aucune action" in e for e in errors), errors
+    assert any("aucune action" in e for e in errors), errors
+
+
+def test_strict_bloque_reellement_le_plan_et_pas_seulement_son_code_de_sortie():
+    """
+    Régression : `--strict` promouvait les avertissements pour le code de sortie
+    mais **pas** pour `applicable` ni pour les étapes. Le document se
+    contredisait : code 1, statut `fail`, et pourtant `applicable: true` avec
+    neuf actions à exécuter — et le validateur n'y trouvait rien à redire.
+    """
+    plan = _plan(sections=(
+        _section(status="warn", findings=(sc.Finding("gpu_absent", "warn", "Aucun GPU."),)),
+    ))
+    souple = plan.to_dict()
+    assert souple["applicable"] is True and souple["steps"], "contrôle positif : sans strict, applicable"
+
+    strict = plan.to_dict(strict=True)
+    assert strict["status"] == "fail"
+    assert strict["exit_code"] == sc.EXIT_BLOCKED
+    assert strict["applicable"] is False
+    assert strict["steps"] == []
+    assert strict["counts"]["steps"] == 0
+    assert strict["estimated_download_bytes"] == 0
+    assert sc.validate_plan_dict(strict) == ()
+
+
+def test_strict_retire_aussi_les_etapes_du_rendu_humain():
+    plan = _plan(sections=(
+        _section(status="warn", findings=(sc.Finding("gpu_absent", "warn", "Aucun GPU."),)),
+    ))
+    assert "download_model" in sc.render_human(plan)          # contrôle positif
+    assert "download_model" not in sc.render_human(plan, strict=True)
+
+
+def test_une_liste_recapitulative_falsifiee_est_refusee_meme_a_longueur_egale():
+    """
+    Comparer les longueurs ne suffisait pas : une liste `warnings` entièrement
+    inventée mais de même taille passait sans un mot. Or c'est précisément ce
+    qu'un opérateur lit en diagonale avant de décider d'appliquer.
+    """
+    plan = _plan(sections=(
+        _section(status="warn", findings=(sc.Finding("gpu_absent", "warn", "Aucun GPU."),)),
+    ))
+    document = plan.to_dict()
+    assert sc.validate_plan_dict(document) == ()              # contrôle positif
+    document["warnings"] = [{"code": "tout_va_bien", "level": "warn", "message": "rien à signaler"}]
+    errors = sc.validate_plan_dict(document)
+    assert any("warnings[0].code" in e for e in errors), errors
+
+
+def test_un_bloqueur_falsifie_est_refuse_meme_a_longueur_egale():
+    plan = _plan(sections=(_section(status="fail", findings=(sc.Finding("x", "fail", "dur"),)),))
+    document = plan.to_dict()
+    document["blockers"] = [{"code": "x", "level": "fail", "message": "message réécrit"}]
+    assert any("blockers[0].message" in e for e in sc.validate_plan_dict(document))
+
+
+@pytest.mark.parametrize("champ,valeur", [
+    ("warnings", 7),
+    ("warnings", None),
+    ("blockers", "aucun"),
+    ("counts", []),
+    ("applicable", "oui"),
+    ("exit_code", "0"),
+    ("estimated_download_bytes", "0"),
+    ("strict", "false"),
+])
+def test_un_champ_recapitulatif_mal_type_produit_une_erreur_pas_une_exception(champ, valeur):
+    """
+    `warnings: 7` faisait lever un TypeError : un validateur qui plante n'est pas
+    un validateur, il est un déni de service sur le chemin de la relecture.
+    Et `strict: "false"` était converti en VRAI par `bool(...)` — toute chaîne non
+    vide l'est — donc le verdict était recalculé en mode strict à contresens.
+    """
+    document = _plan().to_dict()
+    document[champ] = valeur
+    errors = sc.validate_plan_dict(document)                  # ne doit pas lever
+    assert any(champ in e and "doit être" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("champ", [
+    "applicable", "strict", "exit_code", "estimated_download_bytes",
+    "counts", "blockers", "warnings",
+])
+def test_un_champ_recapitulatif_absent_est_refuse(champ):
+    document = _plan().to_dict()
+    del document[champ]
+    assert any(champ in e and "obligatoire" in e for e in sc.validate_plan_dict(document))
 
 
 def test_le_verdict_n_est_recoupe_que_si_la_structure_tient():

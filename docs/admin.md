@@ -1644,12 +1644,24 @@ inconnue, `--mode cluster` (non planifiable au jalon M1) ou un `--mode` hors
 son empreinte, un `--model` absent du catalogue, un `--hardware-profile`
 illisible ou invalide.
 
-**Un plan bloqué (code `1`) ne décrit aucune étape**, quelle que soit la cause du
-blocage — runtime non résolu, catalogue illisible, aucun modèle ne tenant sur
-l'hôte. La règle est portée par le contrat lui-même : un document qui porterait à
-la fois un bloqueur et des étapes est rejeté par la validation. Sans quoi un
-applicateur pourrait n'exécuter que la moitié du plan, et c'est justement la
-moitié qui consomme du disque et du réseau.
+**Tout plan qui sort en code `1` ne décrit aucune étape**, quelle que soit la
+cause — runtime non résolu, catalogue illisible, aucun modèle ne tenant sur
+l'hôte, **ou `--strict` sur un plan qui ne portait que des avertissements**. Le
+critère est le statut, pas la seule présence de bloqueurs : `--strict` promeut
+les avertissements en blocage, et cette promotion vaut pour `applicable` et pour
+les étapes exactement comme elle vaut pour le code de sortie.
+
+Les étapes ne disparaissent pas en silence : le rendu humain indique combien
+avaient été calculées et invite à lever les bloqueurs. La règle est portée par le
+contrat lui-même — un document qui porterait à la fois un statut non applicable
+et des étapes est rejeté par la validation. Sans quoi un applicateur pourrait
+n'exécuter que la moitié du plan, et c'est justement la moitié qui consomme du
+disque et du réseau.
+
+`--strict` change donc le **document**, pas seulement son affichage : le JSON
+produit avec `--strict` porte `strict: true`, `applicable: false` et
+`steps: []`. Un plan enregistré reste ainsi cohérent avec le code de sortie qui
+l'accompagnait.
 
 ### Sans épinglage, le plan sort bloqué — et c'est voulu
 

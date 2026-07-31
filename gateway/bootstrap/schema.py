@@ -316,11 +316,11 @@ class BootstrapPlan:
             out.extend(f for f in section.findings if f.level == "warn")
         return tuple(out)
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, *, strict: bool = False) -> dict[str, int]:
         counts = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
         for section in self.sections:
             counts[section.status] = counts.get(section.status, 0) + 1
-        counts["steps"] = len(self.steps)
+        counts["steps"] = len(self.effective_steps(strict=strict))
         counts["decisions"] = len(self.decisions)
         return counts
 
@@ -331,10 +331,34 @@ class BootstrapPlan:
             return "fail" if strict else "warn"
         return "ok"
 
+    def is_blocked(self, *, strict: bool = False) -> bool:
+        """
+        Le plan interdit-il l'application ? `strict` fait partie de la réponse.
+
+        `--strict` signifie « traitez les avertissements comme bloquants ». Le
+        prendre en compte pour le code de sortie mais pas pour `applicable` ni
+        pour les étapes produisait un document qui se contredisait lui-même :
+        code 1, statut `fail`, et pourtant `applicable: true` avec neuf actions à
+        exécuter. Un seul lieu décide désormais, et les trois champs en dérivent.
+        """
+        return bool(self.blockers) or (strict and bool(self.warnings))
+
     @property
     def applicable(self) -> bool:
         """Un plan bloqué ne doit être appliqué par personne, jamais partiellement."""
-        return not self.blockers
+        return not self.is_blocked()
+
+    def effective_steps(self, *, strict: bool = False) -> tuple[PlanStep, ...]:
+        """
+        Étapes réellement proposées. Vide dès que le plan est bloqué.
+
+        Les étapes restent portées par l'objet — le planificateur les a bien
+        calculées — mais elles ne sont ni publiées ni rendues tant que le verdict
+        interdit l'application. C'est la même règle que celle du planificateur,
+        appliquée une seconde fois et à un autre niveau : ni un producteur, ni un
+        assembleur, ni un mode d'affichage ne peut la contourner seul.
+        """
+        return () if self.is_blocked(strict=strict) else self.steps
 
     def exit_code(self, *, strict: bool = False) -> int:
         state = self.status(strict=strict)
@@ -344,8 +368,8 @@ class BootstrapPlan:
             return EXIT_WARNINGS
         return EXIT_OK
 
-    def total_download_bytes(self) -> int:
-        return sum(s.estimated_bytes or 0 for s in self.steps)
+    def total_download_bytes(self, *, strict: bool = False) -> int:
+        return sum(s.estimated_bytes or 0 for s in self.effective_steps(strict=strict))
 
     # ── Sérialisation ─────────────────────────────────────────────────────────
 
@@ -355,14 +379,14 @@ class BootstrapPlan:
             "schema_version": self.schema_version,
             "generated_at": self.generated_at,
             "mode": self.mode,
-            "strict": strict,
+            "strict": bool(strict),
             "status": self.status(strict=strict),
-            "applicable": self.applicable,
+            "applicable": not self.is_blocked(strict=strict),
             "exit_code": self.exit_code(strict=strict),
-            "counts": self.counts(),
-            "estimated_download_bytes": self.total_download_bytes(),
+            "counts": self.counts(strict=strict),
+            "estimated_download_bytes": self.total_download_bytes(strict=strict),
             "sections": [s.to_dict() for s in self.sections],
-            "steps": [s.to_dict() for s in self.steps],
+            "steps": [s.to_dict() for s in self.effective_steps(strict=strict)],
             "decisions": [d.to_dict() for d in self.decisions],
             "blockers": [f.to_dict() for f in self.blockers],
             "warnings": [f.to_dict() for f in self.warnings],
@@ -413,6 +437,35 @@ def validate_plan_dict(document: Any) -> tuple[str, ...]:
     return tuple(errors)
 
 
+_ABSENT = object()
+
+
+def _compare_findings(declares: list, attendus: list, champ: str) -> list[str]:
+    """
+    Compare INTÉGRALEMENT une liste récapitulative aux constats recalculés.
+
+    Comparer les longueurs ne suffisait pas : une liste `warnings` entièrement
+    inventée mais de même taille passait sans un mot. Or ces listes sont
+    précisément ce qu'un opérateur lit en diagonale pour décider d'appliquer.
+    """
+    if len(declares) != len(attendus):
+        return [
+            f"{champ} en contient {len(declares)}, attendu {len(attendus)} d'après les sections"
+        ]
+    erreurs: list[str] = []
+    for index, (declare, attendu) in enumerate(zip(declares, attendus)):
+        if not isinstance(declare, dict):
+            erreurs.append(f"{champ}[{index}] doit être un objet, reçu {type(declare).__name__}")
+            continue
+        for cle in ("code", "level", "message"):
+            if declare.get(cle) != attendu.get(cle):
+                erreurs.append(
+                    f"{champ}[{index}].{cle} annonce {declare.get(cle)!r}, "
+                    f"attendu {attendu.get(cle)!r} d'après les sections"
+                )
+    return erreurs
+
+
 def _validate_verdict(document: dict) -> list[str]:
     """
     Recalcule le verdict depuis les sections et le confronte à celui du document.
@@ -427,9 +480,31 @@ def _validate_verdict(document: dict) -> list[str]:
     pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe.
     """
     errors: list[str] = []
+
+    # Types d'abord. Sans cela, `warnings: 7` faisait lever un TypeError au lieu
+    # de produire un diagnostic — un validateur qui plante n'est pas un validateur.
+    for champ, attendu, libelle in (
+        ("applicable", bool, "un booléen"),
+        ("strict", bool, "un booléen"),
+        ("exit_code", int, "un entier"),
+        ("estimated_download_bytes", int, "un entier"),
+        ("counts", dict, "un objet"),
+        ("blockers", list, "une liste"),
+        ("warnings", list, "une liste"),
+    ):
+        valeur = document.get(champ, _ABSENT)
+        if valeur is _ABSENT:
+            errors.append(f"{champ} est obligatoire")
+        elif not isinstance(valeur, attendu) or (attendu is int and isinstance(valeur, bool)):
+            # `strict: "false"` était converti en vrai par `bool(...)` : une chaîne
+            # non vide est toujours vraie. Le type est donc exigé, pas déduit.
+            errors.append(f"{champ} doit être {libelle}, reçu {type(valeur).__name__}")
+    if errors:
+        return errors
+
     sections = document.get("sections", [])
     steps = document.get("steps", [])
-    strict = bool(document.get("strict", False))
+    strict = document["strict"]
 
     blockers: list[dict] = []
     warnings: list[dict] = []
@@ -452,6 +527,10 @@ def _validate_verdict(document: dict) -> list[str]:
     counts["steps"] = len(steps)
     counts["decisions"] = len(document.get("decisions", []))
 
+    # `strict` fait partie du verdict, pas seulement de l'affichage : il promeut
+    # les avertissements en blocage, et ce blocage doit valoir pour `applicable`
+    # et pour les étapes comme il vaut pour le code de sortie.
+    bloque = bool(blockers) or (strict and bool(warnings))
     if blockers:
         expected_status = "blocked"
     elif warnings:
@@ -469,43 +548,35 @@ def _validate_verdict(document: dict) -> list[str]:
             f"status annonce {document.get('status')!r} alors que les sections donnent "
             f"{expected_status!r}"
         )
-    if document.get("applicable") is not (not blockers):
+    if document["applicable"] is not (not bloque):
         errors.append(
-            f"applicable annonce {document.get('applicable')!r} alors que le plan porte "
-            f"{len(blockers)} bloqueur(s)"
+            f"applicable annonce {document['applicable']!r} alors que le verdict "
+            f"{'interdit' if bloque else 'autorise'} l'application"
         )
-    if document.get("exit_code") != expected_exit:
-        errors.append(
-            f"exit_code annonce {document.get('exit_code')!r}, attendu {expected_exit}"
-        )
-    if len(document.get("blockers", [])) != len(blockers):
-        errors.append(
-            f"blockers en contient {len(document.get('blockers', []))}, "
-            f"attendu {len(blockers)} d'après les sections"
-        )
-    if len(document.get("warnings", [])) != len(warnings):
-        errors.append(
-            f"warnings en contient {len(document.get('warnings', []))}, "
-            f"attendu {len(warnings)} d'après les sections"
-        )
-    if document.get("counts") != counts:
-        errors.append(f"counts annonce {document.get('counts')!r}, attendu {counts!r}")
+    if document["exit_code"] != expected_exit:
+        errors.append(f"exit_code annonce {document['exit_code']!r}, attendu {expected_exit}")
 
-    declared_bytes = document.get("estimated_download_bytes")
+    errors.extend(_compare_findings(document["blockers"], blockers, "blockers"))
+    errors.extend(_compare_findings(document["warnings"], warnings, "warnings"))
+
+    if document["counts"] != counts:
+        errors.append(f"counts annonce {document['counts']!r}, attendu {counts!r}")
+
     expected_bytes = sum(s.get("estimated_bytes") or 0 for s in steps)
-    if declared_bytes != expected_bytes:
+    if document["estimated_download_bytes"] != expected_bytes:
         errors.append(
-            f"estimated_download_bytes annonce {declared_bytes!r}, "
+            f"estimated_download_bytes annonce {document['estimated_download_bytes']!r}, "
             f"attendu {expected_bytes} d'après les étapes"
         )
 
-    # L'invariant le plus lourd de conséquence : un plan bloqué ne doit décrire
-    # aucune action. Un applicateur qui lirait des étapes dans un plan bloqué
-    # pourrait en exécuter la moitié — celle qui consomme du disque et du réseau.
-    if blockers and steps:
+    # L'invariant le plus lourd de conséquence : un plan qui sort en code 1 ne
+    # doit décrire aucune action. Le critère est le STATUT, pas la seule présence
+    # de bloqueurs — sous `--strict`, un plan sans bloqueur mais avec des
+    # avertissements sort en 1 lui aussi, et doit donc être vide d'étapes.
+    if steps and (expected_status in ("blocked", "fail") or document.get("status") in ("blocked", "fail")):
         errors.append(
-            f"le plan est bloqué ({len(blockers)} bloqueur(s)) mais décrit "
-            f"{len(steps)} étape(s) : un plan bloqué ne propose aucune action"
+            f"le plan sort en statut {expected_status!r} (code {expected_exit}) mais décrit "
+            f"{len(steps)} étape(s) : un plan non applicable ne propose aucune action"
         )
 
     return errors
@@ -741,10 +812,20 @@ def render_human(plan: BootstrapPlan, *, strict: bool = False) -> str:
         if decision.rejected:
             lines.append(f"      écarté : {', '.join(decision.rejected)}")
 
+    steps = plan.effective_steps(strict=strict)
     lines.extend(["", "ÉTAPES QUE L'APPLICATION EXÉCUTERAIT"])
-    if not plan.steps:
+    if not steps:
         lines.append("  (aucune)")
-    for step in plan.steps:
+        if plan.steps:
+            # Le planificateur en avait calculé : dire pourquoi elles sont retenues,
+            # sinon l'opérateur croit à un plan vide et cherche au mauvais endroit.
+            lines.append(
+                f"  Le plan est bloqué : les {len(plan.steps)} étape(s) calculées ne sont pas"
+            )
+            lines.append(
+                "  proposées. Levez les bloqueurs ci-dessous, puis relancez la commande."
+            )
+    for step in steps:
         flags = []
         if step.requires_root:
             flags.append("root")
@@ -756,7 +837,7 @@ def render_human(plan: BootstrapPlan, *, strict: bool = False) -> str:
         lines.append(f"  {step.order:>2}. [{step.action}] {step.target}{suffix}")
         lines.append(f"      {step.detail}")
 
-    total = plan.total_download_bytes()
+    total = plan.total_download_bytes(strict=strict)
     if total:
         lines.extend(["", f"Volume à télécharger : {_human_bytes(total)}"])
 
