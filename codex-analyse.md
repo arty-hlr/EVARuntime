@@ -21,7 +21,7 @@
 |---|---|
 | **Où en est-on** | Jalon **M1 atteint** (§0.12). Le système sait désormais **expliquer ce qu'il installerait et pourquoi**, sans rien appliquer : `python cli.py bootstrap-plan` rend un plan versionné, validé, sans secret et lisible avant application. M0 était atteint, le premier déploiement réel sur deux VMs avait révélé 6 défauts invisibles en CI (§0.10), tous fermés (§0.11) |
 | **Ce qui vient ensuite** | Jalon **M2 — installation jusqu'au premier token** (§13) : c'est l'exécution du plan que M1 sait maintenant écrire. Lot D sécurité reste l'alternative selon arbitrage. **Plus aucun P0 ouvert dans les Lots A et B** |
-| **Santé des tests** | **1202 tests verts** (1139 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
+| **Santé des tests** | **1203 tests verts** (1140 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
 | **Reste à faire** | 36 items sur 63 (§0.3). Aucun P0 ouvert hors Lots C, D et E |
 | **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU. Le plan de bootstrap n'a **jamais été appliqué** — c'est M2, pas M1 |
 
@@ -48,13 +48,13 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir.
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1139** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **1140** 🔬 |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **1202** 🔬 |
+| **Total** | — | **354** | **1203** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
-**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+444 par
+**+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, puis **+445 par
 la vague 5**, tous des régressions rouges avant correctif et vertes après. Les
 scripts de déploiement passent `bash -n`.
 
@@ -181,7 +181,9 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-31 | AUT-013, AUT-005 | `c349470`, `07534cd` | `pytest tests -q` (gateway) + empreintes recoupées | 1100 réussis ; header GGUF borné contre fichier hostile, catalogue fail-closed 🔬 |
 | 2026-07-31 | AUT-001 | `1b77763` | `pytest tests -q` (gateway) + 3 mutations rejouées | Un constat `fail` bloque quelle que soit sa section ; `notes` rendues, `status_from_findings()` 🔬 |
 | 2026-07-31 | AUT-001 | `976894d` | `pytest tests -q` (gateway) + CLI exercée sur 5 codes de sortie | **1139 réussis** ; plan assemblé de bout en bout, `bootstrap-plan` en JSON et en français 🔬 |
-| 2026-07-31 | **M1** | `976894d` | Les 2 suites + `ruff` sur les deux composants | **1202 réussis** (1139 / 63), jalon atteint 🔬 |
+| 2026-07-31 | AUT-001 | `ca0871f` | `pytest tests -q` (gateway) + 5 codes de sortie rejoués | 1140 réussis ; faute de saisie (2) séparée de panne du planificateur (4) 🔬 |
+| 2026-07-31 | — | `898088a` | Relecture de la documentation contre le code | `README`, `docs/admin.md` §9, `docs/architecture.md`, `docs/deployment.md` 📖 |
+| 2026-07-31 | **M1** | `ca0871f` | Les 2 suites + `ruff` sur les deux composants | **1203 réussis** (1140 / 63), jalon atteint 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -401,12 +403,14 @@ et seulement si l'opérateur fournit `--llama-bin`.
 | C3 | AUT-003 | P0 | `bootstrap/runtime_resolver.py` | `54f61f6` | +68 | `[x]` |
 | C4 | AUT-004 | P1 | `bootstrap/llmfit.py` | `f5788c2` | +98 | `[x]` |
 | — | AUT-001 (correctifs de contrat) | P0 | `bootstrap/schema.py` | `1b77763` | +10 | `[x]` |
-| — | AUT-001 (assemblage et CLI) | P0 | `bootstrap/planner.py`, `cli.py` | `976894d` | +39 | `[x]` |
+| — | AUT-001 (assemblage et CLI) | P0 | `bootstrap/planner.py`, `cli.py` | `976894d`, `ca0871f` | +40 | `[x]` |
 
-**Total : +444 tests.** Chaque chantier a été mené dans un worktree git isolé,
+**Total : +445 tests.** Chaque chantier a été mené dans un worktree git isolé,
 avec propriété exclusive de ses fichiers, et a dû prouver la rougeur de ses
 tests en cassant réellement son code — 27 mutations appliquées et rejouées au
-total, pas seulement affirmées.
+total, pas seulement affirmées. La documentation, écrite en dernier contre le
+code plutôt que contre l'intention, a elle-même trouvé un défaut de code de
+sortie — c'est le meilleur argument pour ne pas la rédiger avant.
 
 #### L'architecture qui a rendu la parallélisation possible
 
@@ -483,6 +487,7 @@ l'introduit demain.
 | **`doctor.visible_devices()` confond « `CUDA_VISIBLE_DEVICES` non définie » et « définie et vide »**, et n'implémente pas la troncature que son propre message décrit. | AUT-002 | Constat `📖` — **non bloquant, vérifié** : `cuda_visible_devices` a pour défaut `"0"`, `install.sh` l'écrit et `ServerManager` la propage toujours explicitement, donc une valeur vide signifie réellement « aucun device ». Le helper reste ambigu pour tout futur appelant |
 | **`doctor.parse_nvidia_smi_csv()` accepte `memory.total <= 0`** : un GPU en erreur entre dans l'inventaire et contribue 0 au budget sans un mot. | AUT-002 | Constat `📖` — l'inventaire de la vague 5 l'écarte, `doctor` reste à aligner |
 | **Un trou de couverture dans le planificateur lui-même** : remplacer `plannable_entries()` par `entries` ne faisait tomber aucun test, toutes les entrées livrées étant épinglées. Le filtre fail-closed était libre de disparaître. | Protocole de mutation, à l'assemblage | Corrigé — un test fabrique un catalogue partiellement épinglé 🔬 |
+| **Un `--model` inconnu sortait en code 4**, c'est-à-dire « le planificateur lui-même a échoué » : la `CatalogError` remontait jusqu'au `except Exception` de la CLI. Un script d'exploitation qui lit 4 conclut à une panne de l'outil sur une faute de frappe. Même défaut pour un `--hardware-profile` introuvable. | Le chantier **documentation**, en rédigeant la grille des codes de sortie | Corrigé (`ca0871f`) — `PlannerUsageError` sépare les conséquences : 2 la commande est mal formée, 1 l'hôte est bloqué, 4 l'outil a cassé 🔬 |
 | **`schema.merge_findings()` déduplique par `code` globalement.** Sûr à l'intérieur d'un producteur ; deux producteurs qui choisiraient le même code s'effaceraient mutuellement si le planificateur l'employait entre sections. | AUT-002, confirmé par AUT-003 | Constat `📖` — le planificateur ne l'emploie pas entre sections ; à documenter dans le contrat des producteurs |
 
 #### Ce que la vague 5 ne prétend pas avoir démontré

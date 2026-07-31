@@ -1607,12 +1607,16 @@ Mêmes conventions que `doctor`, volontairement.
 |---|---|---|
 | `0` | Plan complet et applicable | appliquer |
 | `1` | Au moins un bloqueur | **ne rien appliquer**, même partiellement ; corriger d'abord |
-| `2` | *Réservé* : erreur d'usage de la CLI | corriger la ligne de commande |
+| `2` | Erreur d'usage : la commande désigne quelque chose qui n'existe pas | corriger la ligne de commande |
 | `3` | Avertissements seulement — applicable | applicable, dette à traiter |
 | `4` | Erreur d'exécution du planificateur | signaler ; ne pas conclure sur l'état de l'hôte |
 
-`4` couvre aussi les entrées que le planificateur refuse : un `--hardware-profile`
-illisible ou invalide, un `--model` absent du catalogue.
+Les trois codes d'échec disent trois choses différentes, et un script doit
+pouvoir les distinguer : `1` = **cet hôte** est bloqué, `2` = **votre commande**
+est mal formée, `4` = **l'outil** a cassé. Relèvent du code `2` : une option
+inconnue, un `--mode` hors `local`/`cluster`, un `--pin-version` sans son
+commit, un `--model` absent du catalogue, un `--hardware-profile` illisible ou
+invalide.
 
 ### Sans épinglage, le plan sort bloqué — et c'est voulu
 
