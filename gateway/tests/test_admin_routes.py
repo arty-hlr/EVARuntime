@@ -111,6 +111,16 @@ MUTATING_ROUTES = [
     ("POST", "/admin/models", {"id": "x", "path": "/nope.gguf", "vram_gb": 1.0}),
     ("PATCH", "/admin/models/does-not-exist", {"enabled": False}),
     ("DELETE", "/admin/models/does-not-exist", None),
+    (
+        "POST",
+        "/admin/models/does-not-exist/bootstrap-sync",
+        {
+            "action": "activate",
+            "digest": "0" * 64,
+            "vram_gb": 1.0,
+            "lease_seconds": 30,
+        },
+    ),
     ("POST", "/admin/models/does-not-exist/load", None),
     ("POST", "/admin/models/does-not-exist/unload", None),
     ("POST", "/admin/unload", None),

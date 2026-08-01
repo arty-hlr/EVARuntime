@@ -34,6 +34,7 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import socket
 from pathlib import Path
 
 import pytest
@@ -240,6 +241,54 @@ class FakeTransport:
         return payload if keep is None else payload[:keep]
 
 
+class _RawHttpsResponse:
+    def __init__(self, *, status: int = 200, body: bytes = b"ok") -> None:
+        self.status = status
+        self.headers: dict[str, str] = {}
+        self._body = body
+        self.closed = False
+
+    def read(self, size: int) -> bytes:
+        block, self._body = self._body[:size], self._body[size:]
+        return block
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _PinnedConnection:
+    def __init__(self, response: _RawHttpsResponse) -> None:
+        self.response = response
+        self.requests: list[tuple[str, str, dict[str, str]]] = []
+        self.closed = False
+
+    def request(self, method: str, url: str, *, headers: dict[str, str]) -> None:
+        self.requests.append((method, url, headers))
+
+    def getresponse(self) -> _RawHttpsResponse:
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _PinnedConnectionFactory:
+    def __init__(self, responses: list[_RawHttpsResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, int, tuple[downloader.public_https.AddressInfo, ...], float]] = []
+        self.connections: list[_PinnedConnection] = []
+
+    def __call__(self, host, port, addresses, timeout):
+        self.calls.append((host, port, tuple(addresses), timeout))
+        connection = _PinnedConnection(self.responses.pop(0))
+        self.connections.append(connection)
+        return connection
+
+
+def _address(ip: str) -> downloader.public_https.AddressInfo:
+    return (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 443))
+
+
 # ── Montage ───────────────────────────────────────────────────────────────────
 
 def make_context(tmp_path: Path, *, mode=execution.ExecutionMode.APPLY, log=None):
@@ -286,6 +335,14 @@ def acceptance(**overrides) -> downloader.LicenseAcceptance:
     }
     base.update(overrides)
     return downloader.LicenseAcceptance(**base)
+
+
+def write_stored_acceptance(config: downloader.DownloadConfig, **overrides) -> None:
+    document = acceptance().to_dict()
+    document.update(overrides)
+    downloader.acceptance_path(config.models_dir, ENTRY_ID).write_text(
+        json.dumps(document), encoding="utf-8"
+    )
 
 
 def step(action: str, target: str, order: int = 1) -> schema.PlanStep:
@@ -928,6 +985,59 @@ def test_acceptation_enregistree_debloque_le_telechargement(tmp_path):
     assert result.status == execution.STEP_DONE
 
 
+def test_acceptation_enregistree_avec_false_booleen_reste_un_refus(tmp_path):
+    transport = FakeTransport()
+    catalog = write_catalog(tmp_path)
+    config = make_config(tmp_path, catalog, transport=transport)
+    write_stored_acceptance(config, accepted=False)
+
+    result = run_download(tmp_path, config)
+
+    assert result.status == execution.STEP_FAILED
+    assert "REFUSÉE" in result.error
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("accepted", ["false", "true", 0, None, [], {}])
+def test_acceptation_enregistree_refuse_un_accepted_non_booleen(tmp_path, accepted):
+    transport = FakeTransport()
+    catalog = write_catalog(tmp_path)
+    config = make_config(tmp_path, catalog, transport=transport)
+    write_stored_acceptance(config, accepted=accepted)
+
+    result = run_download(tmp_path, config)
+
+    assert result.status == execution.STEP_FAILED
+    assert "illisible" in result.error
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "entry_id",
+        "base_model_license",
+        "fine_tune_license",
+        "operator_reference",
+        "accepted_at",
+    ],
+)
+@pytest.mark.parametrize("value", [0, False, None, [], {}])
+def test_acceptation_enregistree_refuse_un_champ_texte_non_string(
+    tmp_path, field_name, value
+):
+    transport = FakeTransport()
+    catalog = write_catalog(tmp_path)
+    config = make_config(tmp_path, catalog, transport=transport)
+    write_stored_acceptance(config, **{field_name: value})
+
+    result = run_download(tmp_path, config)
+
+    assert result.status == execution.STEP_FAILED
+    assert "illisible" in result.error
+    assert transport.requests == []
+
+
 def test_acceptation_enregistree_pour_une_licence_perimee_ne_vaut_plus(tmp_path):
     catalog = write_catalog(tmp_path)
     config = make_config(tmp_path, catalog, acceptances=(acceptance(),))
@@ -1177,6 +1287,85 @@ def test_redirection_vers_du_non_https_est_refusee(tmp_path):
     result = run_download(tmp_path, config)
     assert result.status == execution.STEP_FAILED
     assert "HTTPS" in result.error
+
+
+@pytest.mark.parametrize("endpoint", [
+    "https://localhost",
+    "https://127.0.0.1",
+    "https://10.42.0.7",
+    "https://169.254.169.254",
+    "https://[::1]",
+])
+def test_endpoint_de_modele_refuse_une_destination_locale_ou_privee(tmp_path, endpoint):
+    catalog = write_catalog(tmp_path)
+    with pytest.raises(downloader.DownloadError, match="endpoint invalide"):
+        downloader.DownloadConfig(catalog=catalog, models_dir=tmp_path, endpoint=endpoint)
+
+
+def test_redirection_https_vers_une_ip_privee_est_refusee_avant_emission(tmp_path):
+    catalog = write_catalog(tmp_path)
+    transport = FakeTransport(redirect_to="https://169.254.169.254/latest")
+    config = make_config(
+        tmp_path,
+        catalog,
+        transport=transport,
+        acceptances=(acceptance(),),
+    )
+
+    result = run_download(tmp_path, config)
+
+    assert result.status == execution.STEP_FAILED
+    assert "privée" in result.error
+    assert len(transport.requests) == 1
+    assert "169.254.169.254" not in transport.requests[0][0]
+
+
+@pytest.mark.parametrize("addresses", [
+    (_address("10.0.0.7"),),
+    (_address("93.184.216.34"), _address("169.254.169.254")),
+])
+def test_transport_de_modele_refuse_un_dns_prive_ou_mixte_avant_connexion(addresses):
+    factory = _PinnedConnectionFactory([])
+    transport = downloader.UrllibTransport(
+        resolver=lambda _host, _port: addresses,
+        connection_factory=factory,
+    )
+
+    with pytest.raises(downloader.DownloadError, match="privée"):
+        asyncio.run(transport.open("https://models.example.test/a.gguf", {}))
+
+    assert factory.calls == []
+
+
+def test_transport_de_modele_epingle_la_resolution_validee_sans_resoudre_deux_fois():
+    response = _RawHttpsResponse(body=b"modele")
+    factory = _PinnedConnectionFactory([response])
+    resolver_calls: list[tuple[str, int]] = []
+
+    def resolve(host: str, port: int):
+        resolver_calls.append((host, port))
+        return (_address("93.184.216.34"),)
+
+    transport = downloader.UrllibTransport(
+        resolver=resolve,
+        connection_factory=factory,
+        chunk_bytes=4,
+    )
+
+    async def exercise() -> bytes:
+        opened = await transport.open("https://models.example.test/a.gguf?sig=x", {})
+        body = b"".join([chunk async for chunk in opened.chunks()])
+        await opened.close()
+        return body
+
+    assert asyncio.run(exercise()) == b"modele"
+    assert resolver_calls == [("models.example.test", 443)]
+    assert factory.calls == [
+        ("models.example.test", 443, (_address("93.184.216.34"),), 60.0)
+    ]
+    assert factory.connections[0].requests == [("GET", "/a.gguf?sig=x", {})]
+    assert response.closed is True
+    assert factory.connections[0].closed is True
 
 
 def test_manifeste_declare_lusage_dun_jeton_sans_le_porter(tmp_path):

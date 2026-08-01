@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from typer.testing import CliRunner
 import cli as cli_module
 import model_registry
 from bootstrap import applier as ap
+from bootstrap import calibration as cal
 from bootstrap import execution as ex
 from bootstrap import first_token as ft
 from bootstrap import registry_writer as rw
@@ -69,6 +71,32 @@ def _propre(texte: str) -> str:
 
 def _iso(moment: datetime) -> str:
     return moment.strftime(rw.PROOF_TIMESTAMP_FORMAT)
+
+
+@pytest.mark.anyio
+async def test_mutation_to_thread_termine_avant_de_propager_l_annulation() -> None:
+    """Le thread d'écriture ne doit jamais survivre au début du rollback."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def mutation() -> str:
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return "published"
+
+    task = asyncio.create_task(ap._to_thread_completed(mutation))
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert not finished.is_set()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
 
 
 # ── Fabriques de plan ─────────────────────────────────────────────────────────
@@ -343,6 +371,68 @@ def test_un_plan_dont_une_action_n_a_pas_d_executeur_n_est_pas_entame(tmp_path):
     assert temoin == []
 
 
+def test_apply_loaded_plan_garde_l_instantane_si_le_fichier_change(tmp_path):
+    chemin = _plan_file(tmp_path, [(sc.ACTION_WARMUP_MODEL, MODEL_ID)])
+    instantane = ex.load_plan_file(chemin)
+
+    # Le chemin n'est plus la source de vérité une fois l'objet relu. Cette
+    # mutation reproduit la fenêtre TOCTOU entre le câblage et l'exécution.
+    chemin.write_text(
+        json.dumps(
+            _plan_document([(sc.ACTION_WARMUP_MODEL, "modele-remplace")]),
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    config = ap.ApplierConfig(warmup=ap.WarmupWiring(
+        settings=_warmup_settings(), client=object(), admin_secret="secret-de-test",
+    ))
+
+    outcome = asyncio.run(ap.apply_loaded_plan(
+        instantane,
+        config,
+        mode=ex.ExecutionMode.DRY_RUN,
+        allowed_roots=[tmp_path],
+    ))
+
+    assert ex.load_plan_file(chemin).steps[0].target == "modele-remplace"
+    assert outcome.plan is instantane
+    assert outcome.report.plan_fingerprint == instantane.fingerprint
+    assert [result.target for result in outcome.report.results] == [MODEL_ID]
+
+
+def test_apply_plan_file_reste_un_adaptateur_qui_delegue(monkeypatch, tmp_path):
+    chemin = _plan_file(tmp_path, [(sc.ACTION_WARMUP_MODEL, MODEL_ID)])
+    instantane = ex.load_plan_file(chemin)
+    attendu = object()
+    appels = []
+
+    def load_once(path):
+        appels.append(("load", Path(path)))
+        return instantane
+
+    async def apply_loaded(plan, config, **kwargs):
+        appels.append(("apply", plan, config, kwargs))
+        return attendu
+
+    config = ap.ApplierConfig()
+    monkeypatch.setattr(ap.execution, "load_plan_file", load_once)
+    monkeypatch.setattr(ap, "apply_loaded_plan", apply_loaded)
+
+    obtenu = asyncio.run(ap.apply_plan_file(
+        chemin,
+        config,
+        mode=ex.ExecutionMode.DRY_RUN,
+        allowed_roots=[tmp_path],
+    ))
+
+    assert obtenu is attendu
+    assert appels[0] == ("load", chemin)
+    assert appels[1][0:3] == ("apply", instantane, config)
+    assert appels[1][3]["mode"] is ex.ExecutionMode.DRY_RUN
+    assert appels[1][3]["allowed_roots"] == [tmp_path]
+
+
 def test_le_pre_vol_nomme_uniquement_ce_qui_manque(tmp_path):
     """Contrôle positif du test précédent : ce qui EST câblé n'est pas signalé."""
     registry = _registre(**{sc.ACTION_WARMUP_MODEL: _executeur(ex.STEP_DONE)})
@@ -365,6 +455,44 @@ def test_le_cablage_fourni_enregistre_exactement_ce_qu_il_couvre():
     ))
     registry = ap.build_registry(config, ap.ProofLedger())
     assert registry.registered_actions() == (sc.ACTION_WARMUP_MODEL,)
+
+
+def test_le_warmup_multi_modele_fabrique_une_sonde_pour_la_cible_de_l_etape():
+    appels: list[str] = []
+
+    def factory(model_id: str):
+        appels.append(model_id)
+
+        async def probe():
+            return None
+
+        return probe
+
+    wiring = ap.WarmupWiring(
+        settings=_warmup_settings(),
+        client=object(),
+        admin_secret="secret-de-test",
+        generation_probe_factory=factory,
+    )
+    executor = ap._targeted_warmup_executor(wiring)
+    result = asyncio.run(executor(
+        _step(1, sc.ACTION_WARMUP_MODEL, "autre-modele"),
+        _contexte(ex.ExecutionMode.DRY_RUN),
+    ))
+
+    assert result.status == ex.STEP_WOULD_APPLY
+    assert appels == ["autre-modele"]
+
+
+def test_le_warmup_refuse_deux_sources_de_sonde_concurrentes():
+    with pytest.raises(ap.ApplierUsageError):
+        ap.WarmupWiring(
+            settings=_warmup_settings(),
+            client=object(),
+            admin_secret="secret-de-test",
+            generation_probe=lambda: None,
+            generation_probe_factory=lambda _model_id: None,
+        )
 
 
 def _warmup_settings():
@@ -430,10 +558,26 @@ def _writer_config(hote: dict) -> rw.WriterConfig:
     )
 
 
+def _registry_sync(calls: list[tuple] | None = None) -> ap.RegistrySyncWiring:
+    journal = calls if calls is not None else []
+
+    async def activate(model_id: str, vram_gb: float, digest: str) -> None:
+        journal.append(("activate", model_id, vram_gb, digest))
+
+    async def rollback(model_id: str, digest: str) -> None:
+        journal.append(("rollback", model_id, digest))
+
+    async def confirm(model_id: str, digest: str) -> None:
+        journal.append(("confirm", model_id, digest))
+
+    return ap.RegistrySyncWiring(activate=activate, rollback=rollback, confirm=confirm)
+
+
 def _config_chainee(hote: dict, **surcharges) -> ap.ApplierConfig:
     """Câblage complet à base de doubles : la calibration et la recette réussissent."""
     base = dict(
         writer=_writer_config(hote),
+        registry_sync=_registry_sync(),
         calibration=None,
         first_token=None,
     )
@@ -442,7 +586,8 @@ def _config_chainee(hote: dict, **surcharges) -> ap.ApplierConfig:
 
 
 def _registre_chaine(hote: dict, ledger: ap.ProofLedger, *, calibration_evidence=None,
-                     smoke_evidence=None) -> ex.ExecutorRegistry:
+                     smoke_evidence=None, smoke_status=ex.STEP_DONE,
+                     registry_sync=None) -> ex.ExecutorRegistry:
     """
     Construit le registre réel, puis y ajoute les deux producteurs sous forme de doubles.
 
@@ -450,7 +595,10 @@ def _registre_chaine(hote: dict, ledger: ap.ProofLedger, *, calibration_evidence
     réseau. Tout le reste — capture, registre de preuves, garde d'activation,
     écriture de `models.yaml` — est le code de production.
     """
-    config = _config_chainee(hote)
+    config = _config_chainee(
+        hote,
+        **({"registry_sync": registry_sync} if registry_sync is not None else {}),
+    )
     registry = ap.build_registry(config, ledger)
     registry.register(
         sc.ACTION_CALIBRATE_MODEL,
@@ -464,9 +612,16 @@ def _registre_chaine(hote: dict, ledger: ap.ProofLedger, *, calibration_evidence
     registry.register(
         sc.ACTION_SMOKE_TEST,
         ap._capturing_smoke_test(
-            _executeur(ex.STEP_DONE, evidence=smoke_evidence
-                       if smoke_evidence is not None else {"proof": _smoke_proof()}),
+            _executeur(
+                smoke_status,
+                evidence=smoke_evidence
+                if smoke_evidence is not None else {"proof": _smoke_proof()},
+                error="recette simulée échouée"
+                if smoke_status == ex.STEP_FAILED else None,
+            ),
             ledger,
+            _writer_config(hote),
+            config.registry_sync,
         ),
     )
     return registry
@@ -474,8 +629,8 @@ def _registre_chaine(hote: dict, ledger: ap.ProofLedger, *, calibration_evidence
 
 ETAPES_CHAINE = [
     (sc.ACTION_CALIBRATE_MODEL, MODEL_ID),
-    (sc.ACTION_SMOKE_TEST, "nginx → gateway → llama-server"),
     (sc.ACTION_ENABLE_MODEL, MODEL_ID),
+    (sc.ACTION_SMOKE_TEST, MODEL_ID),
 ]
 
 
@@ -489,7 +644,13 @@ def _executer(hote: dict, etapes, mode, ledger=None, **kwargs) -> ex.ExecutionRe
 
 
 def test_la_chaine_complete_active_reellement_le_modele(hote):
-    rapport = _executer(hote, ETAPES_CHAINE, ex.ExecutionMode.APPLY)
+    sync_calls: list[tuple] = []
+    rapport = _executer(
+        hote,
+        ETAPES_CHAINE,
+        ex.ExecutionMode.APPLY,
+        registry_sync=_registry_sync(sync_calls),
+    )
 
     assert rapport.verdict() == ex.VERDICT_OK, rapport.failures()
     registre = model_registry.ModelRegistry(
@@ -499,9 +660,91 @@ def test_la_chaine_complete_active_reellement_le_modele(hote):
     assert entree.enabled is True
     # La capacité a été RELEVÉE par la mesure, jamais abaissée.
     assert entree.vram_gb >= 5.5
+    assert rapport.result(2).evidence["provisional"] is True
+    assert rapport.result(2).evidence["written"] is False
+    assert "activation_confirmation" in rapport.result(3).evidence
+    assert [call[0] for call in sync_calls] == ["activate", "confirm"]
 
 
-def test_sans_l_etape_de_recette_l_activation_echoue_et_la_suite_n_est_pas_tentee(hote):
+def test_un_echec_de_recette_annule_immediatement_l_activation_provisoire(hote):
+    sync_calls: list[tuple] = []
+    rapport = _executer(
+        hote,
+        ETAPES_CHAINE,
+        ex.ExecutionMode.APPLY,
+        smoke_status=ex.STEP_FAILED,
+        registry_sync=_registry_sync(sync_calls),
+    )
+
+    assert rapport.result(2).status == ex.STEP_DONE
+    recette = rapport.result(3)
+    assert recette.status == ex.STEP_FAILED
+    assert recette.evidence["rollback"]["enabled"] is False
+    document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
+    assert document["models"][0]["enabled"] is False
+    assert [call[0] for call in sync_calls] == ["activate", "rollback"]
+
+
+def test_une_preuve_complete_refusee_apres_recette_declenche_le_rollback(hote):
+    rapport = _executer(
+        hote,
+        ETAPES_CHAINE,
+        ex.ExecutionMode.APPLY,
+        smoke_evidence={"proof": _smoke_proof(measured_at=_iso(T0 + timedelta(hours=1)))},
+    )
+
+    recette = rapport.result(3)
+    assert recette.status == ex.STEP_FAILED
+    assert "refus" in recette.summary
+    assert recette.evidence["rollback"]["enabled"] is False
+    document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
+    assert document["models"][0]["enabled"] is False
+
+
+def test_reappliquer_sur_un_modele_deja_actif_renouvelle_la_preuve_sans_rollback(hote):
+    config = _writer_config(hote)
+    preuve = rw.ActivationProof(
+        calibration=ap.calibration_proof_from_evidence(
+            {"calibration": _calibration_block()}
+        ),
+        smoke_test=ap.smoke_test_proof_from_evidence({"proof": _smoke_proof()}),
+    )
+    assert rw.enable_model_entry(
+        config, MODEL_ID, preuve, mode=ex.ExecutionMode.APPLY
+    ).status == ex.STEP_DONE
+
+    rapport = _executer(hote, ETAPES_CHAINE, ex.ExecutionMode.APPLY)
+
+    assert rapport.verdict() == ex.VERDICT_OK
+    assert rapport.result(2).status == ex.STEP_ALREADY_SATISFIED
+    assert rapport.result(2).evidence["preexisting_enabled"] is True
+    assert "activation_confirmation" in rapport.result(3).evidence
+    document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
+    assert document["models"][0]["enabled"] is True
+
+
+def test_echec_de_recette_ne_desactive_pas_un_modele_actif_avant_ce_run(hote):
+    config = _writer_config(hote)
+    preuve = rw.ActivationProof(
+        calibration=ap.calibration_proof_from_evidence(
+            {"calibration": _calibration_block()}
+        ),
+        smoke_test=ap.smoke_test_proof_from_evidence({"proof": _smoke_proof()}),
+    )
+    rw.enable_model_entry(config, MODEL_ID, preuve, mode=ex.ExecutionMode.APPLY)
+
+    rapport = _executer(
+        hote, ETAPES_CHAINE, ex.ExecutionMode.APPLY,
+        smoke_status=ex.STEP_FAILED,
+    )
+
+    assert rapport.result(3).status == ex.STEP_FAILED
+    assert "rollback" not in rapport.result(3).evidence
+    document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
+    assert document["models"][0]["enabled"] is True
+
+
+def test_sans_l_etape_de_recette_le_prevol_refuse_la_chaine_non_compensable(hote):
     """
     L'invariant central : une preuve absente n'est jamais présumée.
 
@@ -515,16 +758,8 @@ def test_sans_l_etape_de_recette_l_activation_echoue_et_la_suite_n_est_pas_tente
     ]
     ledger = ap.ProofLedger()
     plan = ex.load_plan_document(json.dumps(_plan_document(etapes)))
-    registry = _registre_chaine(hote, ledger)
-    registry.register(sc.ACTION_WARMUP_MODEL, _executeur(ex.STEP_DONE))
-    rapport = asyncio.run(ex.execute_plan(
-        plan, registry, _contexte(ex.ExecutionMode.APPLY, racines=(hote["tmp_path"],))
-    ))
-
-    assert rapport.result(2).status == ex.STEP_FAILED
-    assert "recette du premier token" in rapport.result(2).error
-    assert rapport.result(3).status == ex.STEP_NOT_ATTEMPTED
-    assert rapport.verdict() == ex.VERDICT_FAILED
+    constats = ap.proof_chain_findings(plan, ledger)
+    assert [f.code for f in constats] == ["chaine_activation_non_compensable"]
 
     # Et l'entrée est restée désactivée sur le disque.
     document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
@@ -550,22 +785,22 @@ def test_une_calibration_dont_la_preuve_est_inexploitable_echoue_a_son_etape(hot
     assert rapport.result(2).status == ex.STEP_NOT_ATTEMPTED
 
 
-def test_une_recette_dont_la_preuve_est_inexploitable_reste_un_succes(hote):
+def test_une_recette_dont_la_preuve_est_inexploitable_echoue_et_rollback(hote):
     """
-    Asymétrie assumée : la recette est finale, sa preuve ne sert plus ici.
-
-    Le constat est publié, le verdict ne change pas — dégrader un premier token
-    réellement servi en échec pour une raison qui ne concerne personne à cet
-    instant serait mentir sur l'état de la machine.
+    Un HTTP 200 ne suffit pas : sans document de preuve complet l'activation
+    provisoire doit être compensée et l'entrée rester désactivée.
     """
-    etapes = [(sc.ACTION_SMOKE_TEST, "nginx → gateway")]
+    etapes = ETAPES_CHAINE
     rapport = _executer(
         hote, etapes, ex.ExecutionMode.APPLY,
         smoke_evidence={"proof": _tronquer(_smoke_proof(), "ttft_ms")},
     )
-    resultat = rapport.result(1)
-    assert resultat.status == ex.STEP_DONE
-    assert any(f.code == "preuve_recette_non_capturee" for f in resultat.findings)
+    resultat = rapport.result(3)
+    assert resultat.status == ex.STEP_FAILED
+    assert any(f.code == "preuve_recette_inexploitable" for f in resultat.findings)
+    assert resultat.evidence["rollback"]["enabled"] is False
+    document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
+    assert document["models"][0]["enabled"] is False
 
 
 def test_une_simulation_ne_produit_aucune_preuve_et_saute_l_activation(hote):
@@ -590,7 +825,7 @@ def test_une_simulation_ne_produit_aucune_preuve_et_saute_l_activation(hote):
         plan, registry, _contexte(ex.ExecutionMode.DRY_RUN, racines=(hote["tmp_path"],))
     ))
 
-    assert rapport.result(3).status == ex.STEP_SKIPPED
+    assert rapport.result(2).status == ex.STEP_SKIPPED
     assert len(ledger) == 0
     assert rapport.verdict() == ex.VERDICT_PARTIAL
     assert rapport.exit_code() == ex.EXIT_PARTIAL
@@ -640,15 +875,13 @@ def test_une_preuve_d_un_autre_materiel_ne_passe_pas_la_garde_de_l_ecrivain(hote
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. La contradiction d'ordonnancement est constatée, pas masquée
+# 5. La chaîne compensable est imposée au pré-vol
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_l_ordre_du_planificateur_rend_la_preuve_inatteignable_et_le_dit():
+def test_un_ancien_ordre_non_compensable_est_refuse():
     """
-    Le plan réel ordonne `calibrate → enable → warmup`, puis un `smoke_test` FINAL.
-
-    L'activation exige pourtant la preuve de ce smoke test. Le constat est émis
-    avant toute exécution, avec la conduite à tenir.
+    Un plan vague 5 ne doit plus pouvoir ouvrir un modèle puis exécuter autre
+    chose avant la recette responsable de son rollback.
     """
     plan = ex.load_plan_document(json.dumps(_plan_document([
         (sc.ACTION_CALIBRATE_MODEL, MODEL_ID),
@@ -657,14 +890,55 @@ def test_l_ordre_du_planificateur_rend_la_preuve_inatteignable_et_le_dit():
         (sc.ACTION_SMOKE_TEST, "nginx → gateway"),
     ])))
     constats = ap.proof_chain_findings(plan, ap.ProofLedger())
-    assert [f.code for f in constats] == ["chaine_de_preuve_impossible"]
-    assert "smoke_test" in constats[0].message
+    assert [f.code for f in constats] == ["chaine_activation_non_compensable"]
+    assert constats[0].level == "fail"
+    assert "Rien ne sera exécuté" in constats[0].message
 
 
-def test_un_ordre_qui_place_les_producteurs_avant_ne_produit_aucun_constat():
-    """Contrôle positif : le détecteur ne crie pas sur tous les plans."""
+def test_le_triplet_dec_010_ne_produit_aucun_constat():
+    """Contrôle positif : la séquence calibrate → enable → smoke est admise."""
     plan = ex.load_plan_document(json.dumps(_plan_document(ETAPES_CHAINE)))
     assert ap.proof_chain_findings(plan, ap.ProofLedger()) == ()
+
+
+def test_apply_refuse_une_chaine_non_compensable_avant_toute_mutation(tmp_path, hote):
+    """La garantie de pré-vol porte sur le point d'entrée réel, pas seulement son helper."""
+    chemin = _plan_file(tmp_path, [
+        (sc.ACTION_CALIBRATE_MODEL, MODEL_ID),
+        (sc.ACTION_ENABLE_MODEL, MODEL_ID),
+        (sc.ACTION_SMOKE_TEST, "autre-modele"),
+    ])
+    avant = hote["registry"].read_bytes()
+    journal: list[str] = []
+    config = ap.ApplierConfig(
+        writer=_writer_config(hote),
+        registry_sync=_registry_sync(),
+        calibration=cal.CalibrationOptions(
+            probes=object(),  # jamais appelé : le pré-vol doit arrêter avant
+            runtime_version="b6042",
+            hardware_fingerprint="sha256:" + "a" * 64,
+            report_dir=tmp_path,
+        ),
+        first_token=ap.FirstTokenWiring(
+            settings=ft.FirstTokenSettings(
+                base_url="https://eva.example", admin_url="http://127.0.0.1:8000"
+            ),
+            client=object(),
+            admin_secret="secret-de-test",
+        ),
+    )
+
+    with pytest.raises(ap.ApplierUsageError, match="rien n'a été tenté"):
+        asyncio.run(ap.apply_plan_file(
+            chemin,
+            config,
+            mode=ex.ExecutionMode.APPLY,
+            allowed_roots=[hote["tmp_path"]],
+            log=journal.append,
+        ))
+
+    assert journal == []
+    assert hote["registry"].read_bytes() == avant
 
 
 def test_une_preuve_deja_disponible_eteint_le_constat():
@@ -676,6 +950,32 @@ def test_une_preuve_deja_disponible_eteint_le_constat():
         (sc.ACTION_ENABLE_MODEL, MODEL_ID),
     ])))
     assert ap.proof_chain_findings(plan, ap.ProofLedger({MODEL_ID: preuve})) == ()
+
+
+def test_apply_reel_refuse_une_activation_sans_synchronisation_live(hote):
+    preuve = rw.ActivationProof(
+        calibration=ap.calibration_proof_from_evidence(
+            {"calibration": _calibration_block()}
+        ),
+        smoke_test=ap.smoke_test_proof_from_evidence({"proof": _smoke_proof()}),
+    )
+    plan = ex.load_plan_document(json.dumps(_plan_document([
+        (sc.ACTION_ENABLE_MODEL, MODEL_ID),
+    ])))
+
+    with pytest.raises(ap.ApplierUsageError, match="registry_sync est absent"):
+        asyncio.run(ap.apply_loaded_plan(
+            plan,
+            ap.ApplierConfig(
+                writer=_writer_config(hote),
+                supplied_proofs={MODEL_ID: preuve},
+            ),
+            mode=ex.ExecutionMode.APPLY,
+            allowed_roots=[hote["tmp_path"]],
+        ))
+
+    document = yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))
+    assert document["models"][0]["enabled"] is False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -722,8 +1022,13 @@ def test_la_commande_declare_les_options_attendues():
     attendues = {
         "--apply", "--json", "--allowed-root", "--catalog", "--models-dir",
         "--registry", "--runtime-version", "--hardware-fingerprint", "--vram-budget-gb",
+        "--runtime-root", "--llama-server-bin", "--calibration-report-dir",
+        "--calibration-port", "--calibration-load-timeout", "--base-url",
+        "--admin-url", "--admin-secret-file", "--accept-license",
+        "--license-reference", "--ttft-threshold-ms", "--ttft-gate",
     }
     assert attendues <= _options()
+    assert "--admin-secret" not in _options()
     # Contrôle positif : la lecture n'invente pas d'options.
     assert "--option-qui-n-existe-pas" not in _options()
 

@@ -25,11 +25,11 @@ d'empreinte détruit le `.part` : il n'est jamais promu, jamais « réparé ».
 Ce que ce module n'est pas
 --------------------------
 Il ne planifie rien, ne choisit aucun modèle, ne décide d'aucune licence et
-n'écrit aucun registre. Il n'importe que la bibliothèque standard, `schema`,
-`execution` et `catalog` — ce dernier parce que c'est *son* contenu qu'on
-télécharge, et parce que `CatalogEntry.download_fileset()` est le seul point
-d'entrée qui rende l'ensemble split GGUF + `mmproj` indivisible par
-construction. Aucun autre chantier M2 n'est importé.
+n'écrit aucun registre. Il n'importe que la bibliothèque standard, les contrats
+`schema`/`execution`, `catalog` — parce que c'est *son* contenu qu'on télécharge
+— et la frontière réseau partagée `public_https`. `CatalogEntry.download_fileset()`
+reste le seul point d'entrée qui rende l'ensemble split GGUF + `mmproj`
+indivisible par construction. Aucun autre exécuteur M2 n'est importé.
 
 Arbitrage : pourquoi pas `huggingface_hub`
 ------------------------------------------
@@ -92,19 +92,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.client
 import json
 import os
 import re
 import shutil
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Mapping, Protocol, Sequence
 
 from . import catalog as catalog_mod
-from . import execution, schema
+from . import execution, public_https, schema
 
 # Version du manifeste de provenance. Indépendante du plan et du rapport : la
 # provenance survit à l'exécution qui l'a produite et se relit des mois après.
@@ -199,11 +198,18 @@ class HttpTransport(Protocol):
 
 
 class _UrllibResponse:
-    """Adaptateur autour d'une réponse `urllib`. Lecture par blocs, hors boucle."""
+    """Adaptateur autour d'une réponse `http.client`. Lecture par blocs, hors boucle."""
 
-    def __init__(self, raw: Any, chunk_bytes: int) -> None:
+    def __init__(
+        self,
+        raw: Any,
+        chunk_bytes: int,
+        connection: public_https.HTTPSConnectionLike,
+    ) -> None:
         self._raw = raw
         self._chunk_bytes = chunk_bytes
+        self._connection = connection
+        self._closed = False
         self.status = int(getattr(raw, "status", 0) or getattr(raw, "code", 0) or 0)
         self.headers = {str(k).lower(): str(v) for k, v in raw.headers.items()}
 
@@ -215,27 +221,31 @@ class _UrllibResponse:
             yield block
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._raw.close)
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Transforme une redirection en réponse ordinaire au lieu de la suivre."""
-
-    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
-        return None
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await asyncio.to_thread(self._raw.close)
+        finally:
+            await asyncio.to_thread(self._connection.close)
 
 
 class UrllibTransport:
     """
-    Transport par défaut : `urllib.request`, zéro dépendance ajoutée.
+    Transport par défaut : `http.client`, zéro dépendance ajoutée.
 
     Le choix de la bibliothèque standard plutôt que `httpx` (pourtant déjà
     requis par la gateway) tient au même argument que l'arbitrage
     `huggingface_hub` : ce module doit pouvoir tourner avant que le venv de la
-    gateway n'existe. `urllib` est là par définition.
+    gateway n'existe. `http.client` est là par définition.
 
-    Les appels bloquants passent par `asyncio.to_thread` : la boucle reste
-    libre, conformément à la règle « async de bout en bout » du dépôt.
+    Chaque hôte est résolu une seule fois. Toute réponse DNS privée ou mixte est
+    refusée, puis la connexion TCP emploie exactement les adresses contrôlées en
+    conservant le nom original pour SNI et le certificat. Aucun proxy issu de
+    l'environnement n'est consulté.
+
+    Les appels bloquants passent par `asyncio.to_thread` : la boucle reste libre,
+    conformément à la règle « async de bout en bout » du dépôt.
     """
 
     def __init__(
@@ -243,24 +253,48 @@ class UrllibTransport:
         *,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+        resolver: public_https.Resolver | None = None,
+        connection_factory: public_https.ConnectionFactory | None = None,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout doit être > 0")
+        if chunk_bytes < 1:
+            raise ValueError("chunk_bytes doit être >= 1")
         self._timeout = timeout
         self._chunk_bytes = chunk_bytes
+        self._resolver = resolver if resolver is not None else public_https.system_resolve
+        self._connection_factory = (
+            connection_factory
+            if connection_factory is not None
+            else public_https.pinned_connection_factory
+        )
 
     async def open(self, url: str, headers: Mapping[str, str]) -> HttpResponse:
         return await asyncio.to_thread(self._open, url, dict(headers))
 
     def _open(self, url: str, headers: dict[str, str]) -> _UrllibResponse:
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        opener = urllib.request.build_opener(_NoRedirect())
         try:
-            raw = opener.open(request, timeout=self._timeout)
-        except urllib.error.HTTPError as exc:
-            # `HTTPError` EST une réponse : elle porte statut, en-têtes et corps.
-            # La traiter comme telle laisse au téléchargeur le soin de décider
-            # ce qu'un 302, un 401 ou un 416 signifient — lui seul le sait.
-            raw = exc
-        return _UrllibResponse(raw, self._chunk_bytes)
+            validated = public_https.validate_url(url)
+            parts = urllib.parse.urlsplit(validated)
+            host = parts.hostname
+            if host is None:  # couvert par validate_url, garde de typage
+                raise public_https.PublicHttpsError("URL d'artefact sans hôte")
+            port = parts.port or 443
+            addresses = public_https.resolve_public_addresses(host, port, self._resolver)
+            connection = self._connection_factory(host, port, addresses, self._timeout)
+        except public_https.PublicHttpsError as exc:
+            raise DownloadError(str(exc)) from exc
+
+        try:
+            target = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+            connection.request("GET", target, headers=headers)
+            raw = connection.getresponse()
+            return _UrllibResponse(raw, self._chunk_bytes, connection)
+        except (OSError, http.client.HTTPException) as exc:
+            connection.close()
+            raise DownloadError(
+                f"connexion HTTPS impossible vers la source d'artefact {host!r}"
+            ) from exc
 
 
 # ── Jeton : obtention, portée, expurgation ────────────────────────────────────
@@ -397,6 +431,36 @@ def _acceptance_problems(
     return tuple(problems)
 
 
+def _parse_stored_acceptance(document: dict[str, Any]) -> LicenseAcceptance:
+    """Relit une acceptation sans jamais coercer les types issus du JSON."""
+    string_fields = (
+        "entry_id",
+        "base_model_license",
+        "fine_tune_license",
+        "operator_reference",
+        "accepted_at",
+    )
+    values: dict[str, str] = {}
+    for field_name in string_fields:
+        value = document[field_name]
+        if type(value) is not str:
+            raise TypeError(f"{field_name} doit être une chaîne JSON")
+        values[field_name] = value
+
+    accepted = document["accepted"]
+    if type(accepted) is not bool:
+        raise TypeError("accepted doit être un booléen JSON")
+
+    return LicenseAcceptance(
+        entry_id=values["entry_id"],
+        base_model_license=values["base_model_license"],
+        fine_tune_license=values["fine_tune_license"],
+        operator_reference=values["operator_reference"],
+        accepted_at=values["accepted_at"],
+        accepted=accepted,
+    )
+
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 def _default_disk_free(path: Path) -> int:
@@ -430,12 +494,12 @@ class DownloadConfig:
     disk_margin_min_bytes: int = DEFAULT_DISK_MARGIN_MIN_BYTES
 
     def __post_init__(self) -> None:
-        parts = urllib.parse.urlsplit(self.endpoint)
-        if parts.scheme.lower() != "https" or not parts.hostname:
+        try:
+            public_https.validate_url(self.endpoint)
+        except public_https.PublicHttpsError as exc:
             raise DownloadError(
-                f"endpoint invalide : {self.endpoint!r} — un téléchargement d'artefact "
-                "vérifié ne part que vers un HTTPS nommé"
-            )
+                f"endpoint invalide : {self.endpoint!r} — {exc}"
+            ) from exc
         if self.chunk_bytes < 1:
             raise DownloadError(f"chunk_bytes doit être >= 1, reçu {self.chunk_bytes!r}")
         if self.disk_margin_ratio < 0 or self.disk_margin_min_bytes < 0:
@@ -906,6 +970,10 @@ async def _open_following_redirects(
     """
     current = url
     for _ in range(MAX_REDIRECTS + 1):
+        try:
+            current = public_https.validate_url(current)
+        except public_https.PublicHttpsError as exc:
+            raise DownloadError(str(exc)) from exc
         headers = {"Accept-Encoding": "identity"}
         if range_start:
             headers["Range"] = f"bytes={range_start}-"
@@ -918,11 +986,6 @@ async def _open_following_redirects(
         if not location:
             raise DownloadError(f"redirection {response.status} sans en-tête Location")
         current = urllib.parse.urljoin(current, location)
-        if urllib.parse.urlsplit(current).scheme.lower() != "https":
-            raise DownloadError(
-                "redirection vers un schéma non HTTPS refusée — un artefact vérifié ne "
-                "se télécharge pas en clair"
-            )
     raise DownloadError(f"plus de {MAX_REDIRECTS} redirections — chaîne refusée")
 
 
@@ -1153,14 +1216,7 @@ def _license_gate(
     stored = _read_json(acceptance_path(models_dir, entry.id))
     if stored is not None:
         try:
-            recorded = LicenseAcceptance(
-                entry_id=str(stored["entry_id"]),
-                base_model_license=str(stored["base_model_license"]),
-                fine_tune_license=str(stored["fine_tune_license"]),
-                operator_reference=str(stored["operator_reference"]),
-                accepted_at=str(stored["accepted_at"]),
-                accepted=bool(stored["accepted"]),
-            )
+            recorded = _parse_stored_acceptance(stored)
         except (KeyError, TypeError, ValueError):
             return None, "acceptation enregistrée illisible — refaites l'étape accept_license"
         problems = _acceptance_problems(recorded, entry)

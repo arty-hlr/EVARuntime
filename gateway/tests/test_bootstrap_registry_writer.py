@@ -240,6 +240,16 @@ def _entree(registry: Path, model_id: str) -> dict:
     raise AssertionError(f"« {model_id} » absent du registre")
 
 
+def _set_enabled_yaml(registry: Path, model_id: str, value) -> None:
+    document = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    for entry in document["models"]:
+        if entry["id"] == model_id:
+            entry["enabled"] = value
+            registry.write_text(yaml.safe_dump(document), encoding="utf-8")
+            return
+    raise AssertionError(f"« {model_id} » absent du registre")
+
+
 def _step(action: str, target: str, order: int = 1) -> sc.PlanStep:
     return sc.PlanStep(
         order=order,
@@ -333,6 +343,20 @@ def test_le_fichier_ecrit_est_charge_par_model_registry(atelier):
     assert modele.llama_params.ctx_size == 8192
     assert modele.llama_params.parallel == 1
     assert modele.sha256 == _catalog_dict()["source"]["files"][0]["sha256"]
+
+
+def test_ecriture_refuse_enabled_false_entre_guillemets(atelier):
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    _set_enabled_yaml(atelier["registry"], MODEL_ID, "false")
+    avant = atelier["registry"].read_bytes()
+
+    with pytest.raises(
+        rw.RegistryWriterError, match="enabled.*booléen YAML réel.*non quoté"
+    ):
+        rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+
+    assert atelier["registry"].read_bytes() == avant
 
 
 def test_l_entree_reelle_du_catalogue_livre_produit_un_registre_chargeable(atelier):
@@ -743,6 +767,38 @@ def test_sans_preuve_le_modele_reste_desactive(atelier):
     ok = rw.enable_model_entry(config, MODEL_ID, _preuve(), mode=ex.ExecutionMode.APPLY)
     assert ok.status == ex.STEP_DONE
     assert _entree(atelier["registry"], MODEL_ID)["enabled"] is True
+
+
+def test_activation_refuse_enabled_false_entre_guillemets(atelier):
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    _set_enabled_yaml(atelier["registry"], MODEL_ID, "false")
+    avant = atelier["registry"].read_bytes()
+
+    with pytest.raises(
+        rw.RegistryWriterError, match="enabled.*booléen YAML réel.*non quoté"
+    ):
+        rw.enable_model_entry(
+            config, MODEL_ID, _preuve(), mode=ex.ExecutionMode.APPLY
+        )
+
+    assert atelier["registry"].read_bytes() == avant
+
+
+def test_budget_refuse_enabled_non_booleen_sur_un_autre_modele(atelier):
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    _set_enabled_yaml(atelier["registry"], "llama-3.1-8b-instruct", "false")
+    avant = atelier["registry"].read_bytes()
+
+    with pytest.raises(
+        rw.RegistryWriterError, match="llama-3.1-8b-instruct.*enabled.*booléen YAML"
+    ):
+        rw.enable_model_entry(
+            config, MODEL_ID, _preuve(), mode=ex.ExecutionMode.APPLY
+        )
+
+    assert atelier["registry"].read_bytes() == avant
 
 
 @pytest.mark.parametrize("preuve_nue", [True, 1, "ok", {"calibration": True}])

@@ -38,6 +38,7 @@ M2 — un module par exécuteur, plus le contrat et les deux documents finaux :
 | `warmup`             | AUT-010 | Pré-chauffage avant ouverture du trafic        |
 | `install_report`     | AUT-011 | Rapport d'installation : ce qui tourne, d'où   |
 | `applier`            | AUT-015 | Assemblage : câblage, chaîne des preuves       |
+| `production`         | AUT-017 | Clients/sondes réels et relecture du runtime   |
 
 La règle d'indépendance, telle qu'elle est réellement appliquée
 ---------------------------------------------------------------

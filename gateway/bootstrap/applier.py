@@ -39,23 +39,18 @@ Le registre est vide au départ et **ne fabrique jamais rien** :
   tard, à l'activation, sans dire d'où il vient ;
 - une simulation ne produit aucun volet, donc n'autorise aucune activation.
 
-Contradiction d'ordonnancement, constatée et non masquée
----------------------------------------------------------
-Le planificateur ordonne `calibrate_model → enable_model → warmup_model`, puis
-un `smoke_test` **unique et final**. Or `enable_model` exige la preuve de ce
-smoke test. Aucun plan produit par `bootstrap-plan` ne peut donc satisfaire
-`enable_model` en application réelle : la recette a besoin d'un modèle activé,
-et l'activation a besoin de la recette.
+Activation provisoire et compensation (DEC-010)
+-------------------------------------------------
+La recette publique a besoin d'un modèle visible, mais l'activation définitive
+exige justement cette recette. Le plan résout ce cycle explicitement :
+`calibrate_model → enable_model (provisoire) → smoke_test → warmup_model`.
 
-Ce module ne tranche pas ce nœud — il n'en a pas le mandat — mais il refuse de
-le masquer :
-
-- `proof_chain_findings()` le CONSTATE avant toute exécution et le publie ;
-- en application, `enable_model` échoue explicitement en nommant le volet
-  manquant et l'étape qui aurait dû le produire ;
-- en simulation, `enable_model` est **sauté** avec la même explication : une
-  simulation ne peut pas produire de preuve, et prétendre qu'elle « appliquerait »
-  ferait croire l'activation acquise.
+L'applicateur porte la compensation : seule une calibration recoupée autorise la
+transition provisoire dans le registre vivant, tandis que le disque reste à
+`enabled: false`. Le smoke test suivant doit produire le second volet, puis la
+preuve complète est validée et seulement alors persistée. Un échec HTTP, une
+preuve illisible ou un refus final ferme l'admission live et décharge le modèle.
+Un plan mal ordonné est refusé au pré-vol, avant toute mutation.
 
 `verify_artifact`, une action à deux domaines
 ----------------------------------------------
@@ -69,10 +64,11 @@ jamais rapportée comme faite.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Iterator, Mapping, Sequence, TypeVar
 
 from bootstrap import calibration as calibration_mod
 from bootstrap import downloader as downloader_mod
@@ -109,6 +105,33 @@ class ApplierUsageError(ApplierError):
     """
 
 
+_T = TypeVar("_T")
+
+
+async def _to_thread_completed(
+    function: Callable[..., _T], *args: Any, **kwargs: Any
+) -> _T:
+    """Attend la fin réelle d'une mutation disque même si l'appelant est annulé.
+
+    Annuler ``asyncio.to_thread`` n'arrête pas son thread. Rendre la main avant
+    sa fin permettrait au rollback de constater un fichier encore désactivé,
+    puis au thread orphelin de publier ``enabled: true`` après la compensation.
+    On préserve l'annulation, mais seulement après la terminaison de l'opération
+    bloquante afin que l'appelant puisse compenser son état final réel.
+    """
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            # L'appelant exécute le rollback dans son ``except BaseException``.
+            # L'annulation originale reste le signal le plus fidèle à propager.
+            pass
+        raise
+
+
 # ── Câblages qui demandent plus qu'une configuration ──────────────────────────
 
 @dataclass(frozen=True)
@@ -128,7 +151,24 @@ class WarmupWiring:
     client: Any
     admin_secret: str
     generation_probe: Any = None
+    generation_probe_factory: Callable[[str], Any] | None = None
     sleep: warmup_mod.AsyncSleep = warmup_mod._no_sleep
+
+    def __post_init__(self) -> None:
+        if self.generation_probe is not None and self.generation_probe_factory is not None:
+            raise ApplierUsageError(
+                "WarmupWiring : fournissez generation_probe OU "
+                "generation_probe_factory, jamais les deux"
+            )
+
+
+@dataclass(frozen=True)
+class RegistrySyncWiring:
+    """Synchronisation éphémère du registre disque avec la gateway mono-worker."""
+
+    activate: Callable[[str, float, str], Awaitable[None]]
+    rollback: Callable[[str, str], Awaitable[None]]
+    confirm: Callable[[str, str], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -144,6 +184,7 @@ class ApplierConfig:
     runtime: runtime_installer_mod.RuntimeInstaller | None = None
     download: downloader_mod.DownloadConfig | None = None
     writer: writer_mod.WriterConfig | None = None
+    registry_sync: RegistrySyncWiring | None = None
     calibration: calibration_mod.CalibrationOptions | None = None
     first_token: FirstTokenWiring | None = None
     warmup: WarmupWiring | None = None
@@ -179,6 +220,8 @@ class ProofLedger(Mapping[str, writer_mod.ActivationProof]):
         self._calibrations: dict[str, writer_mod.CalibrationProof] = {}
         self._smoke_tests: dict[str, writer_mod.SmokeTestProof] = {}
         self._supplied: dict[str, writer_mod.ActivationProof] = dict(supplied or {})
+        self._provisional: set[str] = set()
+        self._awaiting_confirmation: set[str] = set()
         for model_id, proof in self._supplied.items():
             if not isinstance(proof, writer_mod.ActivationProof):
                 raise ApplierUsageError(
@@ -194,6 +237,36 @@ class ProofLedger(Mapping[str, writer_mod.ActivationProof]):
 
     def record_smoke_test(self, proof: writer_mod.SmokeTestProof) -> None:
         self._smoke_tests[proof.model_id] = proof
+
+    def calibration(self, model_id: str) -> writer_mod.CalibrationProof | None:
+        """Calibration courante, ou celle d'une preuve complète fournie."""
+        measured = self._calibrations.get(model_id)
+        if measured is not None:
+            return measured
+        supplied = self._supplied.get(model_id)
+        return supplied.calibration if supplied is not None else None
+
+    def mark_provisional(self, model_id: str) -> None:
+        self._provisional.add(model_id)
+        self._awaiting_confirmation.add(model_id)
+
+    def mark_awaiting_confirmation(self, model_id: str) -> None:
+        self._awaiting_confirmation.add(model_id)
+
+    def clear_provisional(self, model_id: str) -> None:
+        self._provisional.discard(model_id)
+
+    def clear_awaiting_confirmation(self, model_id: str) -> None:
+        self._awaiting_confirmation.discard(model_id)
+
+    def is_awaiting_confirmation(self, model_id: str) -> bool:
+        return model_id in self._awaiting_confirmation
+
+    def is_provisional(self, model_id: str) -> bool:
+        return model_id in self._provisional
+
+    def provisional_models(self) -> tuple[str, ...]:
+        return tuple(sorted(self._provisional))
 
     def missing_volets(self, model_id: str) -> tuple[str, ...]:
         """Volets qui manquent pour ce modèle. Vide si une preuve est disponible."""
@@ -351,7 +424,7 @@ def build_registry(config: ApplierConfig, ledger: ProofLedger) -> execution.Exec
         )
         registry.register(
             schema.ACTION_ENABLE_MODEL,
-            _guarded_enable(writer_mod.make_enable_model_executor(writer_config), ledger),
+            _guarded_enable(writer_config, ledger, config.registry_sync),
         )
 
     if config.calibration is not None:
@@ -365,26 +438,63 @@ def build_registry(config: ApplierConfig, ledger: ProofLedger) -> execution.Exec
         registry.register(
             schema.ACTION_SMOKE_TEST,
             _capturing_smoke_test(
-                first_token_mod.make_smoke_test_executor(
-                    settings=wiring.settings, client=wiring.client,
-                    admin_secret=wiring.admin_secret, sleep=wiring.sleep,
-                    identity_suffix=wiring.identity_suffix,
-                ),
+                _targeted_smoke_test_executor(wiring),
                 ledger,
+                replace(config.writer, activation_proofs=ledger)
+                if config.writer is not None else None,
+                config.registry_sync,
             ),
         )
 
     if config.warmup is not None:
-        warmup_mod.register_executors(
-            registry,
-            settings=config.warmup.settings,
-            client=config.warmup.client,
-            admin_secret=config.warmup.admin_secret,
-            generation_probe=config.warmup.generation_probe,
-            sleep=config.warmup.sleep,
+        registry.register(
+            schema.ACTION_WARMUP_MODEL,
+            _targeted_warmup_executor(config.warmup),
         )
 
     return registry
+
+
+def _targeted_smoke_test_executor(wiring: FirstTokenWiring) -> execution.StepExecutor:
+    """Lie chaque recette au modèle nommé par SON étape, y compris en plan multi-modèle."""
+
+    async def executer(
+        step: schema.PlanStep, context: execution.ExecutionContext
+    ) -> execution.StepResult:
+        model_id = writer_mod.model_id_from_target(step.action, step.target)
+        inner = first_token_mod.make_smoke_test_executor(
+            settings=replace(wiring.settings, model_id=model_id),
+            client=wiring.client,
+            admin_secret=wiring.admin_secret,
+            sleep=wiring.sleep,
+            identity_suffix=wiring.identity_suffix,
+        )
+        return await inner(step, context)
+
+    return executer
+
+
+def _targeted_warmup_executor(wiring: WarmupWiring) -> execution.StepExecutor:
+    """Lie le pré-chauffage à la cible relue dans le plan, pas à un réglage global."""
+
+    async def executer(
+        step: schema.PlanStep, context: execution.ExecutionContext
+    ) -> execution.StepResult:
+        model_id = writer_mod.model_id_from_target(step.action, step.target)
+        inner = warmup_mod.make_warmup_executor(
+            settings=replace(wiring.settings, model_id=model_id),
+            client=wiring.client,
+            admin_secret=wiring.admin_secret,
+            generation_probe=(
+                wiring.generation_probe_factory(model_id)
+                if wiring.generation_probe_factory is not None
+                else wiring.generation_probe
+            ),
+            sleep=wiring.sleep,
+        )
+        return await inner(step, context)
+
+    return executer
 
 
 def _verify_dispatcher(
@@ -488,61 +598,278 @@ def _capturing_calibration(
 
 
 def _capturing_smoke_test(
-    inner: execution.StepExecutor, ledger: ProofLedger
+    inner: execution.StepExecutor,
+    ledger: ProofLedger,
+    writer_config: writer_mod.WriterConfig | None = None,
+    registry_sync: RegistrySyncWiring | None = None,
 ) -> execution.StepExecutor:
     """
-    Exécute la recette, puis capture son volet de preuve **sans jamais échouer dessus**.
+    Exécute la recette, capture sa preuve et confirme l'activation provisoire.
 
-    Asymétrie assumée avec la calibration : la recette est l'étape FINALE du
-    plan. Sa preuve ne sert plus à rien dans cette exécution-ci — elle ne peut
-    servir qu'à une exécution ultérieure. Faire échouer une recette réussie
-    parce que sa preuve n'est pas capturable dégraderait un succès réel en échec
-    pour une raison qui ne concerne personne à cet instant. Le constat est
-    publié, le résultat ne change pas.
-    """
-
-    async def executer(
-        step: schema.PlanStep, context: execution.ExecutionContext
-    ) -> execution.StepResult:
-        result = await inner(step, context)
-        if result.status != execution.STEP_DONE:
-            return result
-        try:
-            ledger.record_smoke_test(smoke_test_proof_from_evidence(result.evidence))
-        except (writer_mod.ProofRejected, writer_mod.RegistryWriterError) as exc:
-            return replace(
-                result,
-                findings=result.findings + (_finding(
-                    "preuve_recette_non_capturee", "warn",
-                    f"La recette a réussi, mais sa preuve n'a pas pu être constituée "
-                    f"({exc}). Elle n'autorisera donc aucune activation ultérieure.",
-                ),),
-            )
-        return result
-
-    return executer
-
-
-def _guarded_enable(
-    inner: execution.StepExecutor, ledger: ProofLedger
-) -> execution.StepExecutor:
-    """
-    Refuse l'activation AVANT de la tenter quand la preuve n'existe pas.
-
-    AUT-007 refuserait de lui-même, mais avec un message qui ne dit pas QUEL
-    volet manque ni quelle étape aurait dû le produire. Cette garde nomme les
-    deux. En simulation, elle **saute** l'étape au lieu de la faire échouer :
-    une simulation ne produit aucune preuve, et rapporter un échec ferait
-    conclure à un défaut de l'hôte là où il n'y a qu'une propriété du mode.
+    Dès que `enable_model` a réellement ouvert le modèle, tout chemin d'échec de
+    cette fonction compense sur disque ET dans la gateway avant de rendre la main. Une recette qui
+    répond mais dont le document de preuve est incomplet n'est donc pas un
+    succès : sans preuve complète, l'entrée ne peut rester servable.
     """
 
     async def executer(
         step: schema.PlanStep, context: execution.ExecutionContext
     ) -> execution.StepResult:
         model_id = writer_mod.model_id_from_target(step.action, step.target)
+        try:
+            result = await inner(step, context)
+        except BaseException:
+            if writer_config is not None and ledger.is_provisional(model_id):
+                await _rollback_provisional(
+                    writer_config, ledger, model_id,
+                    mode=context.mode, reason="exception pendant la recette publique",
+                    registry_sync=registry_sync,
+                )
+            raise
+        if result.status != execution.STEP_DONE:
+            if writer_config is not None and ledger.is_provisional(model_id):
+                rollback = await _rollback_provisional(
+                    writer_config, ledger, model_id,
+                    mode=context.mode, reason="échec de la recette publique",
+                    registry_sync=registry_sync,
+                )
+                return _result_with_rollback(result, rollback)
+            return result
+        try:
+            proof = smoke_test_proof_from_evidence(result.evidence)
+            if proof.model_id != model_id:
+                raise writer_mod.ProofRejected(
+                    f"la recette annonce « {proof.model_id} » mais l'étape cible "
+                    f"« {model_id} »"
+                )
+            ledger.record_smoke_test(proof)
+        except (writer_mod.ProofRejected, writer_mod.RegistryWriterError) as exc:
+            message = (
+                f"la recette de « {model_id} » a répondu mais sa preuve n'est pas "
+                f"exploitable : {exc}"
+            )
+            rollback = None
+            if writer_config is not None and ledger.is_provisional(model_id):
+                rollback = await _rollback_provisional(
+                    writer_config, ledger, model_id,
+                    mode=context.mode, reason="preuve de recette inexploitable",
+                    registry_sync=registry_sync,
+                )
+            failed = execution.StepResult.for_step(
+                step,
+                status=execution.STEP_FAILED,
+                summary=f"preuve de recette inexploitable pour « {model_id} »",
+                duration_ms=result.duration_ms,
+                evidence=result.evidence,
+                findings=result.findings + (_finding(
+                    "preuve_recette_inexploitable", "fail", message,
+                ),),
+                error=message,
+            )
+            return _result_with_rollback(failed, rollback) if rollback else failed
+        except BaseException:
+            if writer_config is not None and ledger.is_provisional(model_id):
+                await _rollback_provisional(
+                    writer_config, ledger, model_id,
+                    mode=context.mode, reason="exception pendant la capture de preuve",
+                    registry_sync=registry_sync,
+                )
+            raise
+
+        if writer_config is None or not ledger.is_awaiting_confirmation(model_id):
+            return result
+
+        try:
+            activation_proof = ledger[model_id]
+        except KeyError:
+            message = f"preuve complète absente après la recette de « {model_id} »"
+            rollback = await _rollback_provisional(
+                writer_config, ledger, model_id,
+                mode=context.mode, reason=message, registry_sync=registry_sync,
+            )
+            failed = execution.StepResult.for_step(
+                step, status=execution.STEP_FAILED,
+                summary=f"activation définitive impossible pour « {model_id} »",
+                evidence=result.evidence,
+                findings=result.findings + (_finding(
+                    "activation_preuve_complete_absente", "fail", message,
+                ),),
+                error=message,
+            )
+            return _result_with_rollback(failed, rollback)
+
+        try:
+            confirmation = await _to_thread_completed(
+                writer_mod.enable_model_entry,
+                writer_config,
+                model_id,
+                activation_proof,
+                mode=context.mode,
+            )
+        except BaseException:
+            if ledger.is_provisional(model_id):
+                await _rollback_provisional(
+                    writer_config, ledger, model_id,
+                    mode=context.mode, reason="exception pendant la confirmation de preuve",
+                    registry_sync=registry_sync,
+                )
+            raise
+        if confirmation.failed:
+            rollback = None
+            if ledger.is_provisional(model_id):
+                rollback = await _rollback_provisional(
+                    writer_config, ledger, model_id,
+                    mode=context.mode, reason="preuve complète refusée après la recette",
+                    registry_sync=registry_sync,
+                )
+            message = confirmation.error or confirmation.summary
+            failed = execution.StepResult.for_step(
+                step, status=execution.STEP_FAILED,
+                summary=f"activation définitive refusée pour « {model_id} »",
+                duration_ms=result.duration_ms,
+                evidence={
+                    **result.evidence,
+                    "activation_confirmation": confirmation.evidence,
+                },
+                findings=result.findings + confirmation.findings,
+                error=message,
+            )
+            return _result_with_rollback(failed, rollback) if rollback else failed
+
+        if (
+            context.mode is execution.ExecutionMode.APPLY
+            and registry_sync is not None
+            and ledger.is_provisional(model_id)
+        ):
+            digest = confirmation.evidence.get("registry_sha256")
+            if not isinstance(digest, str) or not digest:
+                sync_error = "confirmation sans empreinte du registre publié"
+            else:
+                try:
+                    await registry_sync.confirm(model_id, digest)
+                except Exception as exc:
+                    sync_error = execution.redact_for_log(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    sync_error = ""
+            if sync_error:
+                rollback = await _rollback_provisional(
+                    writer_config,
+                    ledger,
+                    model_id,
+                    mode=context.mode,
+                    reason="confirmation live du registre impossible",
+                    registry_sync=registry_sync,
+                )
+                failed = execution.StepResult.for_step(
+                    step,
+                    status=execution.STEP_FAILED,
+                    summary=f"synchronisation live refusée pour « {model_id} »",
+                    duration_ms=result.duration_ms,
+                    evidence={
+                        **result.evidence,
+                        "activation_confirmation": confirmation.evidence,
+                    },
+                    findings=result.findings + (_finding(
+                        "activation_live_confirmation_echouee",
+                        "fail",
+                        f"La preuve est valide, mais la gateway n'a pas confirmé le "
+                        f"snapshot persistant de « {model_id} » : {sync_error}.",
+                    ),),
+                    error=sync_error,
+                )
+                return _result_with_rollback(failed, rollback)
+
+        ledger.clear_provisional(model_id)
+        ledger.clear_awaiting_confirmation(model_id)
+        return replace(
+            result,
+            evidence={
+                **result.evidence,
+                "activation_confirmation": confirmation.evidence,
+            },
+            findings=result.findings + confirmation.findings,
+        )
+
+    return executer
+
+
+def _guarded_enable(
+    writer_config: writer_mod.WriterConfig,
+    ledger: ProofLedger,
+    registry_sync: RegistrySyncWiring | None = None,
+) -> execution.StepExecutor:
+    """
+    Confirme sur preuve complète, ou ouvre provisoirement sur calibration.
+
+    L'ouverture provisoire est enregistrée dans le ledger uniquement quand une
+    écriture réelle a eu lieu. Le smoke test qui suit en devient alors
+    responsable jusqu'à confirmation ou rollback.
+    """
+
+    async def executer(
+        step: schema.PlanStep, context: execution.ExecutionContext
+    ) -> execution.StepResult:
+        model_id = writer_mod.model_id_from_target(step.action, step.target)
+        if model_id in ledger:
+            return await writer_mod.make_enable_model_executor(writer_config)(step, context)
+
+        calibration = ledger.calibration(model_id)
+        if calibration is not None:
+            change = await asyncio.to_thread(
+                writer_mod.provisionally_enable_model_entry,
+                writer_config,
+                model_id,
+                calibration,
+                mode=context.mode,
+            )
+            if change.status == execution.STEP_DONE:
+                # Le marqueur précède le réseau : une réponse perdue après une
+                # activation live réussie doit tout de même déclencher le rollback.
+                ledger.mark_provisional(model_id)
+                if (
+                    context.mode is execution.ExecutionMode.APPLY
+                    and registry_sync is not None
+                ):
+                    digest = change.evidence.get("registry_sha256")
+                    vram_gb = change.evidence.get("vram_gb")
+                    try:
+                        if not isinstance(digest, str) or not digest:
+                            raise ApplierError("empreinte du registre provisoire absente")
+                        if not isinstance(vram_gb, (int, float)) or isinstance(vram_gb, bool):
+                            raise ApplierError("capacité VRAM provisoire absente")
+                        await registry_sync.activate(model_id, float(vram_gb), digest)
+                    except Exception as exc:
+                        detail = execution.redact_for_log(
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        rollback = await _rollback_provisional(
+                            writer_config,
+                            ledger,
+                            model_id,
+                            mode=context.mode,
+                            reason="activation live impossible",
+                            registry_sync=registry_sync,
+                        )
+                        failed = execution.StepResult.for_step(
+                            step,
+                            status=execution.STEP_FAILED,
+                            summary=f"activation live refusée pour « {model_id} »",
+                            evidence=change.evidence,
+                            findings=change.findings + (_finding(
+                                "activation_live_echouee", "fail",
+                                f"La gateway n'a pas publié l'activation provisoire : {detail}",
+                            ),),
+                            error=detail,
+                        )
+                        return _result_with_rollback(failed, rollback)
+            elif change.status == execution.STEP_ALREADY_SATISFIED:
+                ledger.mark_awaiting_confirmation(model_id)
+            context.journaliser(f"activation provisoire [{model_id}] → {change.status}")
+            return writer_mod._to_step_result(step, change)
+
         manquants = ledger.missing_volets(model_id)
-        if not manquants:
-            return await inner(step, context)
 
         detail = (
             f"« {model_id} » ne sera pas activé : "
@@ -567,6 +894,92 @@ def _guarded_enable(
         )
 
     return executer
+
+
+async def _rollback_provisional(
+    writer_config: writer_mod.WriterConfig,
+    ledger: ProofLedger,
+    model_id: str,
+    *,
+    mode: execution.ExecutionMode,
+    reason: str,
+    registry_sync: RegistrySyncWiring | None = None,
+) -> writer_mod.RegistryChange:
+    """Compense sur disque puis en mémoire, et ne libère le marqueur qu'après les deux."""
+    try:
+        change = await _to_thread_completed(
+            writer_mod.rollback_provisional_model_entry,
+            writer_config,
+            model_id,
+            mode=mode,
+            reason=reason,
+        )
+    except Exception as exc:
+        detail = execution.redact_for_log(f"{type(exc).__name__}: {exc}")
+        return writer_mod.RegistryChange(
+            status=execution.STEP_FAILED,
+            summary=f"rollback impossible pour « {model_id} »",
+            evidence={
+                "model_id": model_id,
+                "written": False,
+                "rollback": False,
+            },
+            findings=(_finding(
+                "rollback_activation_exception", "fail",
+                f"La désactivation compensatoire de « {model_id} » a levé : {detail}",
+            ),),
+            error=f"rollback impossible pour « {model_id} » : {detail}",
+        )
+    disk_safe = change.status in {
+        execution.STEP_DONE, execution.STEP_ALREADY_SATISFIED,
+    }
+    if not disk_safe:
+        return change
+
+    if mode is execution.ExecutionMode.APPLY and registry_sync is not None:
+        digest = change.evidence.get("registry_sha256")
+        try:
+            if not isinstance(digest, str) or not digest:
+                raise ApplierError("empreinte du registre désactivé absente")
+            await registry_sync.rollback(model_id, digest)
+        except Exception as exc:
+            detail = execution.redact_for_log(f"{type(exc).__name__}: {exc}")
+            return writer_mod.RegistryChange(
+                status=execution.STEP_FAILED,
+                summary=f"rollback live impossible pour « {model_id} »",
+                evidence={
+                    **change.evidence,
+                    "live_rollback": False,
+                },
+                findings=change.findings + (_finding(
+                    "rollback_activation_live_echoue", "fail",
+                    f"Le disque est désactivé, mais la gateway n'a pas confirmé la "
+                    f"fermeture live de « {model_id} » : {detail}",
+                ),),
+                error=f"rollback live impossible pour « {model_id} » : {detail}",
+            )
+
+    ledger.clear_provisional(model_id)
+    ledger.clear_awaiting_confirmation(model_id)
+    return change
+
+
+def _result_with_rollback(
+    result: execution.StepResult, rollback: writer_mod.RegistryChange
+) -> execution.StepResult:
+    """Joint la preuve de compensation au résultat qui a déclenché le rollback."""
+    evidence = dict(result.evidence)
+    evidence["rollback"] = rollback.evidence
+    findings = result.findings + rollback.findings
+    error = result.error
+    if rollback.failed:
+        detail = rollback.error or rollback.summary
+        error = f"{error or result.summary} ; rollback ÉCHOUÉ : {detail}"
+        findings += (_finding(
+            "rollback_activation_echoue", "fail",
+            f"La recette a échoué et la désactivation compensatoire a aussi échoué : {detail}",
+        ),)
+    return replace(result, evidence=evidence, findings=findings, error=error)
 
 
 # ── Contrôles de pré-vol ──────────────────────────────────────────────────────
@@ -605,48 +1018,56 @@ def proof_chain_findings(
     plan: execution.LoadedPlan, ledger: ProofLedger
 ) -> tuple[schema.Finding, ...]:
     """
-    Constate, AVANT d'exécuter, les activations dont la preuve est hors d'atteinte.
+    Valide le triplet atomique calibration → activation provisoire → recette.
 
-    Le contrôle est purement ordinal : pour chaque `enable_model`, les deux
-    étapes productrices doivent le PRÉCÉDER. Le planificateur place le smoke
-    test en dernier — la contradiction est donc structurelle et non
-    accidentelle, et elle est nommée ici plutôt que découverte à l'étape N.
-
-    Un constat, pas un refus : les étapes antérieures (installation,
-    téléchargement, vérification, écriture du registre) restent utiles et
-    idempotentes. Les interdire ferait payer à l'opérateur un nœud qu'il n'a pas
-    noué.
+    Sans preuve complète déjà fournie, la calibration doit précéder
+    immédiatement l'activation et un smoke test du MÊME modèle doit la suivre
+    immédiatement. Toute autre forme est refusée avant le départ : exécuter la
+    partie amont d'un plan structurellement incapable de compenser laisserait
+    précisément l'état partiel que le pré-vol doit empêcher.
     """
     constats: list[schema.Finding] = []
-    for step in plan.steps:
+    steps = list(plan.steps)
+    for index, step in enumerate(steps):
         if step.action != schema.ACTION_ENABLE_MODEL:
             continue
         try:
             model_id = writer_mod.model_id_from_target(step.action, step.target)
-        except writer_mod.RegistryWriterError:
+        except writer_mod.RegistryWriterError as exc:
+            constats.append(_finding(
+                "chaine_activation_invalide", "fail",
+                f"Étape {step.order} : cible d'activation invalide ({exc}).",
+            ))
             continue
         if model_id in ledger:
             continue
-        amont = [s.action for s in plan.steps if s.order < step.order]
-        manquants = [
-            libelle
-            for action, libelle in (
-                (schema.ACTION_CALIBRATE_MODEL, "calibrate_model"),
-                (schema.ACTION_SMOKE_TEST, "smoke_test"),
-            )
-            if action not in amont
-        ]
-        if not manquants:
+
+        previous = steps[index - 1] if index > 0 else None
+        following = steps[index + 1] if index + 1 < len(steps) else None
+        calibration_ok = (
+            previous is not None
+            and previous.action == schema.ACTION_CALIBRATE_MODEL
+            and previous.target == model_id
+        )
+        smoke_ok = (
+            following is not None
+            and following.action == schema.ACTION_SMOKE_TEST
+            and following.target == model_id
+        )
+        if calibration_ok and smoke_ok:
             continue
+        attendu = (
+            f"calibrate_model({model_id}) → enable_model({model_id}) → "
+            f"smoke_test({model_id})"
+        )
+        recu = (
+            f"{previous.action if previous else '<début>'} → enable_model → "
+            f"{following.action if following else '<fin>'}"
+        )
         constats.append(_finding(
-            "chaine_de_preuve_impossible", "warn",
-            f"Étape {step.order} : l'activation de « {model_id} » exige une preuve à deux "
-            f"volets, mais le plan ne place aucune étape {' ni '.join(manquants)} avant "
-            "elle. Le smoke test est unique et FINAL dans un plan de bootstrap, alors que "
-            "l'activation en dépend — et la recette a elle-même besoin d'un modèle activé. "
-            "En application, cette étape échouera ; fournissez une preuve d'une "
-            "installation antérieure (ApplierConfig.supplied_proofs) ou faites trancher "
-            "l'ordonnancement.",
+            "chaine_activation_non_compensable", "fail",
+            f"Étape {step.order} : « {model_id} » ne suit pas le triplet atomique "
+            f"DEC-010. Attendu {attendu}, reçu {recu}. Rien ne sera exécuté.",
         ))
     return tuple(constats)
 
@@ -674,8 +1095,8 @@ class ApplicationOutcome:
 
 # ── Point d'entrée ────────────────────────────────────────────────────────────
 
-async def apply_plan_file(
-    path: Path | str,
+async def apply_loaded_plan(
+    plan: execution.LoadedPlan,
     config: ApplierConfig,
     *,
     mode: execution.ExecutionMode,
@@ -685,20 +1106,27 @@ async def apply_plan_file(
     log: Callable[[str], None] = execution._discard_log,
 ) -> ApplicationOutcome:
     """
-    Relit un plan, l'exécute, et rend journal + rapport d'installation.
+    Exécute exactement un plan déjà relu et rend journal + rapport.
 
     `mode` n'a **pas de défaut** : personne n'applique par omission d'argument.
     C'est la propriété que `ExecutionMode` a été conçu pour donner, et la
     reprendre ici est ce qui la rend effective au niveau de l'applicateur.
 
+    Le consommateur passe le `LoadedPlan` issu de `execution.load_plan_file()` ou
+    `execution.load_plan_document()`. L'applicateur ne relit aucun chemin ici :
+    les raccords de production et l'exécution portent donc sur le même instantané
+    validé, même si le fichier source change ensuite.
+
     Ordre des refus, du moins cher au plus cher :
 
-    1. le plan est refusé par `execution.load_plan_file()` — toutes ses barrières
-       s'appliquent, aucune n'est réimplémentée ici ;
-    2. une action du plan n'a pas d'exécuteur : refus **avant** tout départ ;
-    3. la chaîne des preuves est impossible : constat publié, exécution menée.
+    1. une action du plan n'a pas d'exécuteur : refus **avant** tout départ ;
+    2. une chaîne d'activation n'est pas compensable : refus avant tout départ.
     """
-    plan = execution.load_plan_file(path)
+    if not isinstance(plan, execution.LoadedPlan):
+        raise ApplierUsageError(
+            "apply_loaded_plan exige un LoadedPlan déjà validé ; "
+            "utilisez execution.load_plan_file() ou apply_plan_file()"
+        )
 
     ledger = ProofLedger(config.supplied_proofs)
     registry = build_registry(config, ledger)
@@ -710,7 +1138,23 @@ async def apply_plan_file(
             "tenté : " + " ; ".join(reasons)
         )
 
+    if (
+        mode is execution.ExecutionMode.APPLY
+        and any(step.action == schema.ACTION_ENABLE_MODEL for step in plan.steps)
+        and config.registry_sync is None
+    ):
+        raise ApplierUsageError(
+            "ce plan active un modèle, mais ApplierConfig.registry_sync est absent — "
+            "rien n'a été tenté : écrire models.yaml ne met pas à jour le registre "
+            "déjà chargé par la gateway et ne permet pas un rollback live sûr"
+        )
+
     findings = proof_chain_findings(plan, ledger)
+    if findings:
+        raise ApplierUsageError(
+            "ce plan porte une chaîne d'activation non compensable — rien n'a été "
+            "tenté : " + " ; ".join(f.message for f in findings)
+        )
 
     context = execution.ExecutionContext(
         mode,
@@ -719,12 +1163,66 @@ async def apply_plan_file(
         now=now,
         log=log,
     )
-    report = await execution.execute_plan(plan, registry, context)
+    rollback_failures: list[str] = []
+    try:
+        report = await execution.execute_plan(plan, registry, context)
+    finally:
+        # Filet de dernier recours : couvre notamment une annulation entre
+        # `enable_model` et l'entrée dans l'exécuteur `smoke_test`, ou un callback
+        # de journalisation qui lève. Le chemin normal compense dans l'étape de
+        # recette et retire déjà le marqueur.
+        if config.writer is not None:
+            writer_config = replace(config.writer, activation_proofs=ledger)
+            for model_id in ledger.provisional_models():
+                rollback = await _rollback_provisional(
+                    writer_config,
+                    ledger,
+                    model_id,
+                    mode=mode,
+                    reason="sortie de l'applicateur avant confirmation de la recette",
+                    registry_sync=config.registry_sync,
+                )
+                if rollback.failed:
+                    rollback_failures.append(rollback.error or rollback.summary)
+        if rollback_failures:
+            raise ApplierError(
+                "l'applicateur s'est arrêté avec une activation provisoire et sa "
+                "compensation a échoué : " + " ; ".join(rollback_failures)
+            )
     install = install_report_mod.build_install_report(
         plan_document=plan.document, execution_report=report, now=now,
     )
     return ApplicationOutcome(
         plan=plan, report=report, install=install, findings=findings
+    )
+
+
+async def apply_plan_file(
+    path: Path | str,
+    config: ApplierConfig,
+    *,
+    mode: execution.ExecutionMode,
+    allowed_roots: Sequence[Path],
+    now: Callable[[], str] = execution._utc_now_iso,
+    monotonic: Callable[[], float] = time.monotonic,
+    log: Callable[[str], None] = execution._discard_log,
+) -> ApplicationOutcome:
+    """
+    Relit une fois un fichier de plan, puis délègue son instantané validé.
+
+    Cette entrée est conservée pour les appelants qui ne construisent pas encore
+    leur raccord depuis un `LoadedPlan`. Un appelant qui a déjà relu le document
+    doit employer `apply_loaded_plan()` afin d'éviter une seconde lecture TOCTOU.
+    """
+    plan = execution.load_plan_file(path)
+    return await apply_loaded_plan(
+        plan,
+        config,
+        mode=mode,
+        allowed_roots=allowed_roots,
+        now=now,
+        monotonic=monotonic,
+        log=log,
     )
 
 
@@ -735,7 +1233,9 @@ __all__ = [
     "ApplierUsageError",
     "FirstTokenWiring",
     "ProofLedger",
+    "RegistrySyncWiring",
     "WarmupWiring",
+    "apply_loaded_plan",
     "apply_plan_file",
     "build_registry",
     "calibration_proof_from_evidence",

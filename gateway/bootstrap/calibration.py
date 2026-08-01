@@ -69,7 +69,9 @@ from . import schema
 
 # Version du document de calibration. Indépendante du plan et du journal
 # d'exécution : les trois évoluent séparément.
-CALIBRATION_SCHEMA_VERSION = 1
+# v2 : l'empreinte couvre désormais TOUS les paramètres réellement servis,
+# selon le même document canonique que `registry_writer` / `LlamaParams`.
+CALIBRATION_SCHEMA_VERSION = 2
 
 # Discriminant publié en tête de rapport. Le pendant de `"kind": "estimation"`
 # de `gguf_meta.FootprintEstimate.to_dict()` — un consommateur doit pouvoir
@@ -208,7 +210,7 @@ def hardware_fingerprint(gpus: Sequence[Mapping[str, Any]]) -> str:
 @dataclass(frozen=True)
 class CalibrationParams:
     """
-    Paramètres de service dont dépend l'empreinte mémoire, et rien d'autre.
+    Paramètres de service complets, au même contrat que `model_registry.LlamaParams`.
 
     `reduced_ctx_size` / `reduced_parallel` décrivent la passe de mise en jambes
     (§9, étape 2). Ils sont EXCLUS de `fingerprint()` : ce sont un échafaudage de
@@ -220,8 +222,13 @@ class CalibrationParams:
     parallel: int = 1
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
-    n_gpu_layers: int = -1
+    n_gpu_layers: int = 999
     flash_attention: bool = False
+    batch_size: int = 4096
+    ubatch_size: int = 512
+    threads: int = 8
+    threads_http: int = 4
+    cpu_moe: bool = False
     reduced_ctx_size: int = DEFAULT_REDUCED_CTX_SIZE
     reduced_parallel: int = DEFAULT_REDUCED_PARALLEL
 
@@ -229,11 +236,34 @@ class CalibrationParams:
         for label, value in (
             ("ctx_size", self.ctx_size),
             ("parallel", self.parallel),
+            ("batch_size", self.batch_size),
+            ("ubatch_size", self.ubatch_size),
+            ("threads", self.threads),
+            ("threads_http", self.threads_http),
             ("reduced_ctx_size", self.reduced_ctx_size),
             ("reduced_parallel", self.reduced_parallel),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise CalibrationError(f"{label} doit être un entier >= 1, reçu {value!r}")
+        if not isinstance(self.n_gpu_layers, int) or isinstance(self.n_gpu_layers, bool):
+            raise CalibrationError(
+                f"n_gpu_layers doit être un entier >= 0, reçu {self.n_gpu_layers!r}"
+            )
+        if self.n_gpu_layers < 0:
+            raise CalibrationError(
+                f"n_gpu_layers doit être >= 0, reçu {self.n_gpu_layers!r}"
+            )
+        if self.ubatch_size > self.batch_size:
+            raise CalibrationError(
+                f"ubatch_size ({self.ubatch_size}) dépasse batch_size "
+                f"({self.batch_size})"
+            )
+        for label, value in (
+            ("flash_attention", self.flash_attention),
+            ("cpu_moe", self.cpu_moe),
+        ):
+            if type(value) is not bool:
+                raise CalibrationError(f"{label} doit être un booléen, reçu {value!r}")
         if self.reduced_ctx_size > self.ctx_size:
             raise CalibrationError(
                 f"reduced_ctx_size ({self.reduced_ctx_size}) dépasse ctx_size "
@@ -248,14 +278,19 @@ class CalibrationParams:
             )
 
     def target(self) -> dict[str, Any]:
-        """Les seuls paramètres qui définissent l'identité de la mesure."""
+        """Paramètres effectifs, nommés exactement comme dans le registre servi."""
         return {
+            "n_gpu_layers": self.n_gpu_layers,
             "ctx_size": self.ctx_size,
             "parallel": self.parallel,
+            "batch_size": self.batch_size,
+            "ubatch_size": self.ubatch_size,
             "cache_type_k": self.cache_type_k,
             "cache_type_v": self.cache_type_v,
-            "n_gpu_layers": self.n_gpu_layers,
-            "flash_attention": self.flash_attention,
+            "flash_attn": self.flash_attention,
+            "threads": self.threads,
+            "threads_http": self.threads_http,
+            "cpu_moe": self.cpu_moe,
         }
 
     def fingerprint(self) -> str:
@@ -444,6 +479,12 @@ LoadProbe = Callable[[LoadRequest], Awaitable[LoadOutcome]]
 UnloadProbe = Callable[[str], Awaitable[UnloadOutcome]]
 PromptProbe = Callable[[str, str], Awaitable[PromptOutcome]]
 SleepProbe = Callable[[float], Awaitable[None]]
+EnvironmentValidator = Callable[[CalibrationIdentity], Awaitable[None]]
+
+
+async def _noop_environment_validator(_identity: CalibrationIdentity) -> None:
+    """Compatibilité des doubles : aucune attestation hôte n'est inventée."""
+    return None
 
 
 @dataclass(frozen=True)
@@ -463,6 +504,7 @@ class CalibrationProbes:
     unload_model: UnloadProbe
     run_prompt: PromptProbe
     sleep: SleepProbe
+    validate_environment: EnvironmentValidator = _noop_environment_validator
 
 
 # ── Échantillonnage des pics ──────────────────────────────────────────────────
@@ -1238,8 +1280,19 @@ class CalibrationOptions:
     max_samples: int = DEFAULT_MAX_SAMPLES
     expected_load_seconds: float = 120.0
     expected_prompt_seconds: float = 30.0
+    validate_environment: EnvironmentValidator | None = None
 
     def __post_init__(self) -> None:
+        if self.validate_environment is None:
+            object.__setattr__(
+                self,
+                "validate_environment",
+                getattr(
+                    self.probes,
+                    "validate_environment",
+                    _noop_environment_validator,
+                ),
+            )
         if not isinstance(self.runtime_version, str) or not self.runtime_version.strip():
             raise CalibrationError(
                 "runtime_version doit être une chaîne non vide : une mesure qui ne sait "
@@ -1452,6 +1505,23 @@ async def calibrate(
     params = options.params_for(model_id)
     identity = options.identity_for(model_id)
 
+    validator = options.validate_environment
+    if validator is None:  # garde de production, y compris sous `python -O`
+        raise CalibrationError("validateur d'environnement de calibration absent")
+    await validator(identity)
+
+    return await _calibrate_validated(model_id, params, identity, options, context)
+
+
+async def _calibrate_validated(
+    model_id: str,
+    params: CalibrationParams,
+    identity: CalibrationIdentity,
+    options: CalibrationOptions,
+    context: ex.ExecutionContext,
+) -> CalibrationReport:
+    """Mesure après attestation du runtime et du matériel courants."""
+
     idle_vram, idle_ram = await _relever_repos(options.probes)  # étape 1
 
     passes: list[PassMeasurement] = []
@@ -1608,6 +1678,22 @@ def make_executor(options: CalibrationOptions) -> ex.StepExecutor:
         if context.dry_run:
             return _resultat_simulation(step, options, identity, params)
 
+        validator = options.validate_environment
+        if validator is None:  # garde de production, y compris sous `python -O`
+            return _echec(
+                step,
+                "validateur d'environnement de calibration absent",
+                "environnement_calibration_invalide",
+            )
+        try:
+            await validator(identity)
+        except (CalibrationError, ex.ExecutionError, OSError) as exc:
+            return _echec(
+                step,
+                f"{type(exc).__name__}: {exc}",
+                "environnement_calibration_invalide",
+            )
+
         try:
             existantes = find_reusable_proof(options.report_dir, identity)
         except CalibrationError as exc:
@@ -1630,7 +1716,9 @@ def make_executor(options: CalibrationOptions) -> ex.StepExecutor:
 
         debut = context.monotonic()
         try:
-            rapport = await calibrate(model_id, options, context)
+            rapport = await _calibrate_validated(
+                model_id, params, identity, options, context
+            )
             chemin = write_report(rapport, options, context)
         except (CalibrationError, ex.ExecutionError, OSError) as exc:
             return _echec(

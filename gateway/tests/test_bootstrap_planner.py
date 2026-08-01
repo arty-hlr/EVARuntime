@@ -265,8 +265,8 @@ def test_la_sequence_suit_l_ordre_impose(tmp_path):
         sc.ACTION_WRITE_REGISTRY,
         sc.ACTION_CALIBRATE_MODEL,
         sc.ACTION_ENABLE_MODEL,
-        sc.ACTION_WARMUP_MODEL,
         sc.ACTION_SMOKE_TEST,
+        sc.ACTION_WARMUP_MODEL,
     ]
 
 
@@ -280,7 +280,8 @@ def test_l_activation_suit_la_calibration(tmp_path):
     """Activer avant de calibrer publierait une capacité supposée (AUT-007)."""
     actions = _actions(_plan(_options(tmp_path)))
     assert actions.index(sc.ACTION_ENABLE_MODEL) > actions.index(sc.ACTION_CALIBRATE_MODEL)
-    assert actions.index(sc.ACTION_WARMUP_MODEL) > actions.index(sc.ACTION_ENABLE_MODEL)
+    assert actions.index(sc.ACTION_SMOKE_TEST) == actions.index(sc.ACTION_ENABLE_MODEL) + 1
+    assert actions.index(sc.ACTION_WARMUP_MODEL) > actions.index(sc.ACTION_SMOKE_TEST)
 
 
 def test_la_licence_est_acceptee_avant_tout_telechargement(tmp_path):
@@ -294,17 +295,22 @@ def test_le_registre_est_ecrit_desactive(tmp_path):
     assert "enabled: false" in step.detail
 
 
-def test_le_smoke_test_est_unique_et_final_meme_avec_plusieurs_modeles(tmp_path):
+def test_le_smoke_test_est_execute_et_cible_pour_chaque_modele(tmp_path):
     """
-    La recette traverse le chemin public (§10) : elle valide la chaîne, pas un
-    modèle. La répliquer par modèle serait un contresens.
+    DEC-010 ouvre chaque modèle provisoirement : chacun doit donc produire sa
+    propre preuve publique avant son warmup, sans pouvoir réutiliser celle du voisin.
     """
     plan = _plan(_options(tmp_path, max_models=2))
     actions = _actions(plan)
-    assert actions.count(sc.ACTION_SMOKE_TEST) == 1
-    assert actions[-1] == sc.ACTION_SMOKE_TEST
-    # Contrôle positif : les étapes par modèle, elles, sont bien dupliquées.
+    assert actions.count(sc.ACTION_SMOKE_TEST) == 2
     assert actions.count(sc.ACTION_DOWNLOAD_MODEL) == 2
+    for step in plan.steps:
+        if step.action != sc.ACTION_ENABLE_MODEL:
+            continue
+        smoke = plan.steps[step.order]
+        warmup = plan.steps[step.order + 1]
+        assert (smoke.action, smoke.target) == (sc.ACTION_SMOKE_TEST, step.target)
+        assert (warmup.action, warmup.target) == (sc.ACTION_WARMUP_MODEL, step.target)
 
 
 def test_la_numerotation_reste_continue_apres_assemblage(tmp_path):

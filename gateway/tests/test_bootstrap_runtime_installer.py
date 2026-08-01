@@ -33,6 +33,7 @@ import hashlib
 import io
 import json
 import os
+import socket
 import stat
 import tarfile
 import zipfile
@@ -225,6 +226,72 @@ class _FauxTransport:
         return len(self.payload)
 
 
+class _FausseReponseHTTPS:
+    """Réponse HTTP injectée pour exercer le vrai transport sans socket."""
+
+    def __init__(
+        self,
+        status: int,
+        *,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status = status
+        self._chunks = [body] if body else []
+        self._headers = {key.lower(): value for key, value in (headers or {}).items()}
+        self.closed = False
+
+    def getheader(self, name: str) -> str | None:
+        return self._headers.get(name.lower())
+
+    def read(self, _size: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FausseConnexionHTTPS:
+    def __init__(self, response: _FausseReponseHTTPS) -> None:
+        self.response = response
+        self.requests: list[tuple[str, str, dict[str, str]]] = []
+        self.closed = False
+
+    def request(self, method: str, url: str, *, headers: dict[str, str]) -> None:
+        self.requests.append((method, url, headers))
+
+    def getresponse(self) -> _FausseReponseHTTPS:
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FabriqueConnexionsHTTPS:
+    def __init__(self, responses: list[_FausseReponseHTTPS]) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, int, tuple[ri.AddressInfo, ...], float]] = []
+        self.connections: list[_FausseConnexionHTTPS] = []
+
+    def __call__(
+        self,
+        host: str,
+        port: int,
+        addresses: tuple[ri.AddressInfo, ...],
+        timeout: float,
+    ) -> _FausseConnexionHTTPS:
+        self.calls.append((host, port, tuple(addresses), timeout))
+        connection = _FausseConnexionHTTPS(self._responses.pop(0))
+        self.connections.append(connection)
+        return connection
+
+
+def _adresse(ip: str) -> ri.AddressInfo:
+    if ":" in ip:
+        return (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 443, 0, 0))
+    return (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 443))
+
+
 def _sonde(build: int | None, raw: str = "version: 6500 (abc1234)"):
     """Sonde de version injectée. Aucun sous-processus n'est jamais lancé dans ces tests."""
     async def probe(binary: Path) -> LlamaVersion:
@@ -303,6 +370,223 @@ def test_sanitize_url_retire_la_requete_et_garde_l_origine():
     # Contrôle positif : si la fonction rendait une constante, l'assertion
     # d'absence ci-dessus passerait tout autant.
     assert propre == "https://example.invalid:8443/llama/a.tar.gz"
+
+
+@pytest.mark.parametrize("host", [
+    "localhost",
+    "api.localhost",
+    "127.0.0.1",        # loopback
+    "10.42.0.1",        # privée
+    "100.64.0.1",       # plage partagée, non publique
+    "169.254.169.254",  # link-local et métadonnées cloud
+    "224.0.0.1",        # multicast
+    "0.0.0.0",          # unspecified
+    "192.0.2.1",        # réservée à la documentation
+    "[::1]",            # loopback IPv6
+    "[fd00::1]",        # privée IPv6
+    "[fe80::1]",        # link-local IPv6
+    "[ff02::1]",        # multicast IPv6
+    "[::]",             # unspecified IPv6
+    "[2001:db8::1]",    # réservée à la documentation
+])
+def test_url_refuse_les_adresses_non_publiques(host):
+    with pytest.raises(ri.InstallError) as exc:
+        ri.validate_artifact_url(f"https://{host}/a.tar.gz")
+    assert "refus" in str(exc.value)
+
+
+def test_url_accepte_une_adresse_publique():
+    """Contrôle positif : la garde IP ne refuse pas tout littéral."""
+    url = "https://8.8.8.8/a.tar.gz"
+    assert ri.validate_artifact_url(url) == url
+
+
+def test_transport_refuse_une_resolution_dns_privee_avant_connexion(tmp_path):
+    factory = _FabriqueConnexionsHTTPS([])
+    transport = ri.UrllibTransport(
+        resolver=lambda _host, _port: (_adresse("10.0.0.7"),),
+        connection_factory=factory,
+    )
+
+    with pytest.raises(ri.InstallError) as exc:
+        asyncio.run(transport.fetch(URL, tmp_path / "archive", max_bytes=100))
+
+    assert "privée" in str(exc.value)
+    assert factory.calls == []
+    assert not (tmp_path / "archive").exists()
+
+
+def test_transport_refuse_toute_resolution_dns_mixte(tmp_path):
+    """Une réponse publique + privée ne doit pas dépendre de son ordre."""
+    factory = _FabriqueConnexionsHTTPS([])
+    transport = ri.UrllibTransport(
+        resolver=lambda _host, _port: (
+            _adresse("93.184.216.34"),
+            _adresse("169.254.169.254"),
+        ),
+        connection_factory=factory,
+    )
+
+    with pytest.raises(ri.InstallError):
+        asyncio.run(transport.fetch(URL, tmp_path / "archive", max_bytes=100))
+
+    assert factory.calls == []
+
+
+def test_transport_suit_une_redirection_https_apres_validation(tmp_path):
+    responses = [
+        _FausseReponseHTTPS(302, headers={"Location": "https://cdn.example.invalid/final?sig=x"}),
+        _FausseReponseHTTPS(200, body=b"archive"),
+    ]
+    factory = _FabriqueConnexionsHTTPS(responses)
+    resolutions: list[tuple[str, int]] = []
+
+    def resolve(host: str, port: int):
+        resolutions.append((host, port))
+        return (_adresse("93.184.216.34"),)
+
+    transport = ri.UrllibTransport(resolver=resolve, connection_factory=factory)
+    destination = tmp_path / "archive"
+    written = asyncio.run(transport.fetch(URL, destination, max_bytes=100))
+
+    assert written == len(b"archive")
+    assert destination.read_bytes() == b"archive"
+    assert resolutions == [("example.invalid", 443), ("cdn.example.invalid", 443)]
+    assert [call[:2] for call in factory.calls] == [
+        ("example.invalid", 443),
+        ("cdn.example.invalid", 443),
+    ]
+    assert factory.connections[0].requests[0][:2] == (
+        "GET", "/llama/llama-server-b6500-linux-x86_64.tar.gz",
+    )
+    assert factory.connections[1].requests[0][:2] == ("GET", "/final?sig=x")
+    assert all(connection.closed for connection in factory.connections)
+    assert all(response.closed for response in responses)
+
+
+@pytest.mark.parametrize("location", [
+    "http://cdn.example.invalid/archive",
+    "file:///etc/passwd",
+    "https://127.0.0.1/archive",
+    "https://[::1]/archive",
+])
+def test_transport_refuse_une_redirection_dangereuse_avant_emission(tmp_path, location):
+    response = _FausseReponseHTTPS(302, headers={"Location": location})
+    factory = _FabriqueConnexionsHTTPS([response])
+    resolutions: list[str] = []
+
+    def resolve(host: str, _port: int):
+        resolutions.append(host)
+        return (_adresse("93.184.216.34"),)
+
+    transport = ri.UrllibTransport(resolver=resolve, connection_factory=factory)
+    with pytest.raises(ri.InstallError):
+        asyncio.run(transport.fetch(URL, tmp_path / "archive", max_bytes=100))
+
+    # Seule la source initiale a été résolue et contactée. La cible du 3xx
+    # est refusée pendant le traitement de la réponse, avant l'itération suivante.
+    assert resolutions == ["example.invalid"]
+    assert len(factory.calls) == 1
+    assert not (tmp_path / "archive").exists()
+
+
+def test_transport_refuse_le_dns_prive_d_une_redirection_avant_connexion(tmp_path):
+    response = _FausseReponseHTTPS(
+        307, headers={"Location": "https://internal.example.invalid/archive"},
+    )
+    factory = _FabriqueConnexionsHTTPS([response])
+
+    def resolve(host: str, _port: int):
+        ip = "93.184.216.34" if host == "example.invalid" else "192.168.1.9"
+        return (_adresse(ip),)
+
+    transport = ri.UrllibTransport(resolver=resolve, connection_factory=factory)
+    with pytest.raises(ri.InstallError):
+        asyncio.run(transport.fetch(URL, tmp_path / "archive", max_bytes=100))
+
+    assert len(factory.calls) == 1
+    assert factory.calls[0][0] == "example.invalid"
+
+
+def test_transport_borne_les_redirections_avant_la_connexion_suivante(tmp_path):
+    responses = [
+        _FausseReponseHTTPS(302, headers={"Location": "/encore"}),
+        _FausseReponseHTTPS(307, headers={"Location": "/toujours"}),
+    ]
+    factory = _FabriqueConnexionsHTTPS(responses)
+    transport = ri.UrllibTransport(
+        max_redirects=1,
+        resolver=lambda _host, _port: (_adresse("93.184.216.34"),),
+        connection_factory=factory,
+    )
+
+    with pytest.raises(ri.InstallError) as exc:
+        asyncio.run(transport.fetch(URL, tmp_path / "archive", max_bytes=100))
+
+    assert "trop de redirections" in str(exc.value)
+    assert len(factory.calls) == 2
+    assert all(connection.closed for connection in factory.connections)
+
+
+def test_transport_epingle_la_resolution_validee_contre_le_dns_rebinding(tmp_path):
+    """Le résolveur n'est appelé qu'une fois et son adresse est passée au connecteur."""
+    response = _FausseReponseHTTPS(200, body=b"ok")
+    factory = _FabriqueConnexionsHTTPS([response])
+    answers = iter([
+        (_adresse("93.184.216.34"),),
+        (_adresse("127.0.0.1"),),
+    ])
+    resolver_calls = 0
+
+    def resolve(_host: str, _port: int):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return next(answers)
+
+    transport = ri.UrllibTransport(resolver=resolve, connection_factory=factory)
+    destination = tmp_path / "archive"
+    asyncio.run(transport.fetch(URL, destination, max_bytes=100))
+
+    assert resolver_calls == 1
+    assert factory.calls[0][2] == (_adresse("93.184.216.34"),)
+    assert destination.read_bytes() == b"ok"
+
+
+def test_connexion_epinglee_contacte_l_ip_validee_et_garde_le_sni(monkeypatch):
+    """Le connecteur réel ne relance pas une résolution via HTTPConnection."""
+    events: list[tuple[str, object]] = []
+
+    class FauxSocket:
+        def settimeout(self, timeout):
+            events.append(("timeout", timeout))
+
+        def bind(self, source):
+            events.append(("bind", source))
+
+        def connect(self, address):
+            events.append(("connect", address))
+
+        def close(self):
+            events.append(("close", None))
+
+    class FauxContexteTLS:
+        def wrap_socket(self, sock, *, server_hostname):
+            events.append(("sni", server_hostname))
+            return sock
+
+    monkeypatch.setattr(ri.socket, "socket", lambda *_args: FauxSocket())
+    connection = ri._PinnedHTTPSConnection(
+        "downloads.example.invalid",
+        443,
+        (_adresse("93.184.216.34"),),
+        12.5,
+    )
+    connection._context = FauxContexteTLS()
+    connection.connect()
+
+    assert ("connect", ("93.184.216.34", 443)) in events
+    assert ("sni", "downloads.example.invalid") in events
+    assert all(event[0] != "bind" for event in events)
 
 
 # ══ 2. Extraction défensive ═══════════════════════════════════════════════════

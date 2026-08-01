@@ -956,3 +956,22 @@ class TestGracefulShutdown:
 
         assert backend.unload_all_called is True
         assert backend._loaded == {}
+
+
+@pytest.mark.anyio
+async def test_admission_rechecks_enabled_after_waiting_for_model_lock():
+    """Un rollback gagné pendant l'attente du lock interdit tout nouveau load."""
+    backend = FakeNodeBackend("a")
+    model = FakeModelDef("m1", 20.0, enabled=True)
+    mgr = make_manager([backend], models=[model])
+    lock = mgr._model_locks.setdefault("m1", asyncio.Lock())
+    await lock.acquire()
+    task = asyncio.create_task(mgr.ensure_model_loaded("m1"))
+    await asyncio.sleep(0)
+
+    model.enabled = False
+    lock.release()
+
+    with pytest.raises(PermissionError):
+        await task
+    assert backend.load_calls == []

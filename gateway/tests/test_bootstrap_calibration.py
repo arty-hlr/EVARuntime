@@ -350,6 +350,25 @@ def test_empreinte_des_parametres_change_avec_le_cache_kv():
     assert _params(cache_type_k="q8_0").fingerprint() != _params().fingerprint()
 
 
+def test_empreinte_des_parametres_est_canonique_avec_le_registre_aut_007():
+    """
+    Une calibration ne sert à rien si l'écrivain refuse ensuite son empreinte.
+
+    Ce test relie les deux consommateurs réels : ajouter un paramètre de service
+    d'un seul côté doit le faire tomber avant tout déploiement GPU.
+    """
+    params = _params(
+        batch_size=2048,
+        ubatch_size=256,
+        threads=6,
+        threads_http=3,
+        cpu_moe=True,
+        flash_attention=True,
+        n_gpu_layers=999,
+    )
+    assert params.fingerprint() == rw.params_fingerprint(params.target())
+
+
 def test_parametres_refusent_une_passe_reduite_plus_grande_que_la_cible():
     with pytest.raises(cal.CalibrationError, match="reduced_ctx_size"):
         _params(ctx_size=512, reduced_ctx_size=4096)
@@ -762,6 +781,38 @@ def test_une_mesure_reutilisable_rend_already_satisfied_sans_recharger(tmp_path)
     assert second_sondes.appels["vram"] == 0
     assert second.evidence["reused"] is True
     assert second.evidence["calibration"]["proposed_vram_gb"] == 13.2
+
+
+def test_attestation_hote_precede_toute_reutilisation_de_preuve(tmp_path):
+    assert _executer(Sondes(), tmp_path).status == ex.STEP_DONE
+    calls = []
+
+    async def runtime_changed(identity):
+        calls.append(identity)
+        raise cal.CalibrationError("runtime courant changé depuis la preuve")
+
+    sondes = Sondes()
+    result = _executer(
+        sondes, tmp_path, validate_environment=runtime_changed
+    )
+    assert result.status == ex.STEP_FAILED
+    assert "runtime courant changé" in result.error
+    assert len(calls) == 1
+    assert sondes.appels["load"] == 0
+    assert result.evidence.get("reused") is not True
+
+
+def test_attestation_hote_protege_aussi_une_nouvelle_calibration(tmp_path):
+    calls = []
+
+    async def validate(identity):
+        calls.append(identity)
+
+    result = _executer(
+        Sondes(), tmp_path, validate_environment=validate
+    )
+    assert result.status == ex.STEP_DONE
+    assert len(calls) == 1
 
 
 def test_un_autre_gpu_force_une_recalibration_et_nomme_la_divergence(tmp_path):

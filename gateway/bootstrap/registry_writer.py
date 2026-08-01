@@ -13,7 +13,9 @@ vague 5 vaut aussi pour les exécuteurs de la vague 6.
 Il exécute deux actions du contrat, et deux seulement :
 
 - `schema.ACTION_WRITE_REGISTRY` — écrire l'entrée, **toujours `enabled: false`** ;
-- `schema.ACTION_ENABLE_MODEL` — la basculer en service, **sur preuve**.
+- `schema.ACTION_ENABLE_MODEL` — autoriser son ouverture provisoire **en
+  mémoire** sur calibration, puis persister cette activation sur preuve complète
+  (DEC-010).
 
 Pourquoi deux actions et pas une
 --------------------------------
@@ -21,9 +23,11 @@ Le critère d'acceptation du backlog est « entrée désactivée tant que la
 calibration et le smoke test n'ont pas réussi ». Un seul exécuteur portant un
 drapeau `enabled=…` aurait rendu l'activation atteignable par un argument par
 défaut mal choisi. Ici, `build_registry_entry()` ne prend **aucun paramètre**
-permettant d'écrire autre chose que `false`, et l'activation exige une preuve
-structurée. Les deux fonctions sont testées sur leur signature, pas seulement sur
-leur comportement : une option qui n'existe pas ne peut pas être mal employée.
+permettant d'écrire autre chose que `false`. L'ouverture provisoire exige une
+calibration structurée et fraîche ; le fichier reste à `false` pendant cette
+fenêtre, afin qu'un crash ou un redémarrage revienne à l'état sûr. L'activation
+définitive exige les deux volets de preuve. La compensation ferme le registre
+vivant et vérifie que le disque est toujours à `false`.
 
 La preuve exigée pour activer
 -----------------------------
@@ -34,7 +38,7 @@ nu ne dit ni de quel modèle il parle, ni avec quels paramètres, ni sur quel
 matériel, ni quand : il n'est pas recoupable, et la vague 5 a passé trois passes
 de revue à fermer des champs dérivés que personne ne recoupait.
 
-Sont donc recoupés, à l'activation :
+Sont donc recoupés, à la confirmation définitive :
 
 1. les deux volets de la preuve nomment le **même** `model_id`, et c'est celui de
    l'entrée du registre ;
@@ -48,7 +52,8 @@ Sont donc recoupés, à l'activation :
 5. la recette a traversé le **chemin public** (`/v1/…`), a répondu `200` et a
    produit au moins un token avec un TTFT mesuré (§10).
 
-Un seul de ces points en défaut ⇒ refus, et l'entrée reste désactivée.
+Un seul de ces points en défaut ⇒ refus et compensation immédiate par
+l'applicateur ; l'entrée revient désactivée.
 
 Ce que la génération garantit
 -----------------------------
@@ -116,7 +121,7 @@ from . import execution, schema
 
 # Version du générateur. Figure dans les preuves d'exécution pour qu'un registre
 # régénéré plus tard soit rattachable à la logique qui l'a produit.
-REGISTRY_WRITER_VERSION = 1
+REGISTRY_WRITER_VERSION = 2
 
 # Convention de sauvegarde, calquée sur `database._backup_path()` :
 # « <nom d'origine>.<raison>.<horodatage>.bak ».
@@ -176,6 +181,19 @@ class ProofRejected(RegistryWriterError):
 
 class RegistryConflict(RegistryWriterError):
     """L'entrée présente diffère de l'entrée générée : refus d'écraser."""
+
+
+def _enabled_state(entry: Mapping[str, Any], model_id: str | None = None) -> bool:
+    """Lit ``enabled`` sans coercition ; absent conserve le défaut historique ``true``."""
+    value = entry.get("enabled", True)
+    if type(value) is not bool:
+        raw_id = model_id if model_id is not None else entry.get("id")
+        entry_id = raw_id if isinstance(raw_id, str) else "entrée sans id"
+        raise RegistryWriterError(
+            f"« {entry_id} » : enabled doit être un booléen YAML réel "
+            f"(true ou false non quoté), reçu {value!r}"
+        )
+    return value
 
 
 # ── Horloge injectable ────────────────────────────────────────────────────────
@@ -428,10 +446,11 @@ class SmokeTestProof:
 @dataclass(frozen=True)
 class ActivationProof:
     """
-    Les DEUX volets, indissociables. C'est le seul objet qui autorise l'activation.
+    Les DEUX volets, indissociables. Seul cet objet confirme l'activation définitive.
 
-    Il n'existe aucun autre chemin vers `enabled: true` dans ce module : ni
-    drapeau, ni option, ni valeur par défaut.
+    L'unique autre chemin vers `enabled: true` est l'ouverture provisoire de
+    DEC-010, sur `CalibrationProof`, qui porte une obligation de rollback jusqu'à
+    la recette suivante. Il n'existe ni drapeau, ni option, ni valeur par défaut.
     """
     calibration: CalibrationProof
     smoke_test: SmokeTestProof
@@ -1300,6 +1319,7 @@ def write_model_entry(
 
     if index is not None:
         present = document.models[index]
+        present_enabled = _enabled_state(present, model_id)
         divergents = _compare_entries(present, genere)
         if not divergents:
             return RegistryChange(
@@ -1309,7 +1329,7 @@ def write_model_entry(
                     "model_id": model_id,
                     "registry": str(config.registry_path),
                     "written": False,
-                    "enabled": bool(present.get("enabled", True)),
+                    "enabled": present_enabled,
                 },
             )
         return _failure(
@@ -1404,48 +1424,87 @@ def _check_proof(
             f"la preuve concerne « {proof.model_id} », l'étape active « {model_id} »"
         )
 
+    _check_calibration(config, model_id, proof.calibration, entry)
+
+    maintenant = config.now().astimezone(timezone.utc)
+    _check_proof_timestamp(
+        "recette du premier token",
+        proof.smoke_test.measured_at,
+        maintenant=maintenant,
+        max_age_seconds=config.proof_max_age_seconds,
+    )
+
+
+def _check_calibration(
+    config: WriterConfig,
+    model_id: str,
+    calibration: CalibrationProof,
+    entry: Mapping[str, Any],
+) -> None:
+    """Recoupe le volet mesuré qui autorise l'activation provisoire de DEC-010."""
+    if calibration.model_id != model_id:
+        raise ProofRejected(
+            f"la calibration concerne « {calibration.model_id} », l'étape active "
+            f"« {model_id} »"
+        )
+
     attendue = params_fingerprint(entry.get("llama_params"))
-    if proof.calibration.params_fingerprint != attendue:
+    if calibration.params_fingerprint != attendue:
         raise ProofRejected(
             "la calibration n'a pas été faite avec les paramètres que le registre servira : "
-            f"empreinte mesurée {proof.calibration.params_fingerprint}, empreinte de "
+            f"empreinte mesurée {calibration.params_fingerprint}, empreinte de "
             f"l'entrée {attendue}. Recalibrez avec les paramètres en vigueur — une mesure "
             "faite à un autre ctx_size ou parallélisme ne dit rien de celui-ci (§9)."
         )
-    if proof.calibration.runtime_version != config.runtime_version:
+    if calibration.runtime_version != config.runtime_version:
         raise ProofRejected(
-            f"la calibration a été faite sur le runtime {proof.calibration.runtime_version!r}, "
+            f"la calibration a été faite sur le runtime {calibration.runtime_version!r}, "
             f"l'hôte sert {config.runtime_version!r} : la mesure n'est pas réutilisable (§9)"
         )
-    if proof.calibration.hardware_fingerprint != config.hardware_fingerprint:
+    if calibration.hardware_fingerprint != config.hardware_fingerprint:
         raise ProofRejected(
             "la calibration a été faite sur un autre matériel "
-            f"({proof.calibration.hardware_fingerprint!r} contre "
+            f"({calibration.hardware_fingerprint!r} contre "
             f"{config.hardware_fingerprint!r}) : la mesure n'est pas réutilisable (§9)"
         )
 
     maintenant = config.now().astimezone(timezone.utc)
-    limite = timedelta(seconds=config.proof_max_age_seconds)
+    _check_proof_timestamp(
+        "calibration",
+        calibration.measured_at,
+        maintenant=maintenant,
+        max_age_seconds=config.proof_max_age_seconds,
+    )
+
+
+def _check_proof_timestamp(
+    label: str,
+    value: str,
+    *,
+    maintenant: datetime,
+    max_age_seconds: int,
+) -> None:
+    """Une preuve future ou périmée ne peut autoriser aucune transition d'état."""
+    limite = timedelta(seconds=max_age_seconds)
     tolerance = timedelta(seconds=CLOCK_SKEW_TOLERANCE_SECONDS)
-    for libelle, horodatage in (
-        ("calibration", proof.calibration.measured_at),
-        ("recette du premier token", proof.smoke_test.measured_at),
-    ):
-        mesure = _parse_timestamp(horodatage, libelle)
-        if mesure > maintenant + tolerance:
-            raise ProofRejected(
-                f"la {libelle} est datée du futur ({horodatage}, l'hôte est à "
-                f"{maintenant.strftime(PROOF_TIMESTAMP_FORMAT)})"
-            )
-        if maintenant - mesure > limite:
-            raise ProofRejected(
-                f"la {libelle} date du {horodatage} et dépasse la fraîcheur admise "
-                f"({config.proof_max_age_seconds} s). Rejouez-la : l'état de l'hôte a pu "
-                "changer depuis."
-            )
+    mesure = _parse_timestamp(value, label)
+    if mesure > maintenant + tolerance:
+        raise ProofRejected(
+            f"la {label} est datée du futur ({value}, l'hôte est à "
+            f"{maintenant.strftime(PROOF_TIMESTAMP_FORMAT)})"
+        )
+    if maintenant - mesure > limite:
+        raise ProofRejected(
+            f"la {label} date du {value} et dépasse la fraîcheur admise "
+            f"({max_age_seconds} s). Rejouez-la : l'état de l'hôte a pu changer depuis."
+        )
 
 
-def _target_vram_gb(config: WriterConfig, entry: Mapping[str, Any], proof: ActivationProof) -> float:
+def _target_vram_gb_from_calibration(
+    config: WriterConfig,
+    entry: Mapping[str, Any],
+    calibration: CalibrationProof,
+) -> float:
     """
     Capacité à inscrire : le maximum entre l'estimation écrite et le pic mesuré + marge.
 
@@ -1453,12 +1512,263 @@ def _target_vram_gb(config: WriterConfig, entry: Mapping[str, Any], proof: Activ
     réduit ou d'un prompt trop court ; abaisser sur cette base, c'est
     l'optimisme d'estimation que §0.9 a déjà payé une fois.
     """
-    mesure = _round_up_gb(proof.calibration.peak_vram_gb * config.vram_safety_factor)
+    mesure = _round_up_gb(calibration.peak_vram_gb * config.vram_safety_factor)
     try:
         courante = float(entry.get("vram_gb", 0.0))
     except (TypeError, ValueError):
         courante = 0.0
     return max(mesure, _round_up_gb(courante))
+
+
+def _target_vram_gb(
+    config: WriterConfig, entry: Mapping[str, Any], proof: ActivationProof
+) -> float:
+    """Compatibilité interne de l'activation définitive avec la preuve complète."""
+    return _target_vram_gb_from_calibration(config, entry, proof.calibration)
+
+
+def _registry_sha256(document: _Document) -> str:
+    """Empreinte exacte des octets relus, utilisée par la synchronisation live."""
+    return hashlib.sha256(document.text.encode("utf-8")).hexdigest()
+
+
+def provisionally_enable_model_entry(
+    config: WriterConfig,
+    model_id: str,
+    calibration: CalibrationProof | None,
+    *,
+    mode: execution.ExecutionMode,
+) -> RegistryChange:
+    """
+    Autorise l'activation temporaire *en mémoire* pour la recette (DEC-010).
+
+    Cette fonction valide la transition et calcule la capacité, mais laisse
+    volontairement le fichier à ``enabled: false``. L'applicateur synchronise
+    ensuite cet état comme une activation live éphémère auprès de la gateway.
+    Ainsi, un crash ou un redémarrage avant le smoke test revient naturellement
+    à l'état sûr du disque. Seule `enable_model_entry()` persiste ``true`` après
+    la preuve complète.
+    """
+    if not isinstance(calibration, CalibrationProof):
+        return _failure(
+            f"calibration absente ou invalide pour « {model_id} »",
+            "activation_provisoire_sans_calibration",
+            f"« {model_id} » reste désactivé : une activation provisoire exige une "
+            "CalibrationProof réelle et recoupable.",
+            evidence={"model_id": model_id, "written": False, "enabled": False},
+        )
+
+    document = _read_document(config.registry_path)
+    index = document.index_of(model_id)
+    if index is None:
+        return _failure(
+            f"« {model_id} » est absent du registre",
+            "activation_provisoire_entree_absente",
+            f"« {model_id} » n'est pas dans {config.registry_path} : aucune activation "
+            "provisoire n'est possible.",
+            evidence={"model_id": model_id, "written": False, "enabled": False},
+        )
+    entry = dict(document.models[index])
+    enabled_state = entry.get("enabled")
+    if type(enabled_state) is not bool:
+        return _failure(
+            f"« {model_id} » porte un état d'activation invalide",
+            "activation_provisoire_etat_inattendu",
+            f"« {model_id} » porte enabled={enabled_state!r}, qui n'est pas un booléen. "
+            "Aucune transition d'état n'est tentée.",
+            evidence={"model_id": model_id, "written": False, "enabled": enabled_state},
+        )
+
+    try:
+        _check_calibration(config, model_id, calibration, entry)
+    except ProofRejected as exc:
+        return _failure(
+            f"calibration refusée pour « {model_id} »",
+            "activation_provisoire_calibration_refusee",
+            f"« {model_id} » reste désactivé : {exc}",
+            evidence={"model_id": model_id, "written": False, "enabled": False},
+        )
+
+    cible_vram = _target_vram_gb_from_calibration(config, entry, calibration)
+    if cible_vram > config.vram_budget_gb:
+        return _failure(
+            f"« {model_id} » dépasse le budget VRAM net",
+            "activation_provisoire_hors_budget",
+            f"« {model_id} » demanderait {cible_vram} Go pour un budget net de "
+            f"{config.vram_budget_gb} Go. L'entrée reste désactivée.",
+            evidence={
+                "model_id": model_id,
+                "written": False,
+                "enabled": False,
+                "vram_gb_required": cible_vram,
+                "vram_budget_gb": config.vram_budget_gb,
+            },
+        )
+
+    if enabled_state is True:
+        return RegistryChange(
+            status=execution.STEP_ALREADY_SATISFIED,
+            summary=(
+                f"« {model_id} » était déjà activé ; la recette va renouveler sa preuve"
+            ),
+            evidence={
+                "model_id": model_id,
+                "written": False,
+                "enabled": True,
+                "provisional": False,
+                "preexisting_enabled": True,
+                "confirmation_after_smoke_required": True,
+                "vram_gb": entry.get("vram_gb"),
+                "vram_gb_required": cible_vram,
+                "calibration_measured_at": calibration.measured_at,
+                "registry_sha256": _registry_sha256(document),
+            },
+            findings=_budget_findings(document, model_id, cible_vram, config),
+        )
+
+    # Le diff reste publié pour que la simulation décrive la transition qui
+    # deviendra persistante après le smoke. Il n'est jamais écrit ici.
+    lignes = document.text.split("\n")
+    debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
+    lignes = _set_scalar_field(lignes, debut, fin, champ_indent, "enabled", "true")
+    debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
+    lignes = _set_scalar_field(
+        lignes, debut, fin, champ_indent, "vram_gb", _render_scalar(cible_vram)
+    )
+    candidat = "\n".join(lignes)
+    attendu = copy.deepcopy(document.data)
+    cible = dict(attendu["models"][index])
+    cible["enabled"] = True
+    cible["vram_gb"] = cible_vram
+    attendu["models"][index] = cible
+    _assert_candidate_matches(candidat, attendu, f"projection provisoire de « {model_id} »")
+
+    evidence: dict[str, Any] = {
+        "model_id": model_id,
+        "registry": str(config.registry_path),
+        "writer_version": REGISTRY_WRITER_VERSION,
+        "enabled": True,
+        "provisional": True,
+        "live_only": True,
+        "disk_enabled": False,
+        "rollback_required": mode is execution.ExecutionMode.APPLY,
+        "vram_gb": cible_vram,
+        "calibration_measured_at": calibration.measured_at,
+        "registry_sha256": _registry_sha256(document),
+        "diff": _diff(document.text, candidat, config.registry_path),
+        "written": False,
+    }
+    findings = _budget_findings(document, model_id, cible_vram, config)
+
+    if mode is execution.ExecutionMode.DRY_RUN:
+        evidence["models_after"] = _validate_candidate_without_writing(
+            config, candidat, _stamp(config)
+        )
+        return RegistryChange(
+            status=execution.STEP_WOULD_APPLY,
+            summary=f"activerait provisoirement « {model_id} » pour sa recette publique",
+            evidence=evidence,
+            findings=findings,
+        )
+
+    return RegistryChange(
+        status=execution.STEP_DONE,
+        summary=(
+            f"activation live provisoire de « {model_id} » autorisée pour sa recette"
+        ),
+        evidence=evidence,
+        findings=findings + (schema.Finding(
+            code="activation_provisoire",
+            level="info",
+            message=(
+                f"« {model_id} » peut être rendu temporairement visible en mémoire afin "
+                "de traverser le chemin public ; le disque reste enabled: false. Le smoke "
+                "test suivant doit confirmer la preuve complète (DEC-010)."
+            ),
+        ),),
+    )
+
+
+def rollback_provisional_model_entry(
+    config: WriterConfig,
+    model_id: str,
+    *,
+    mode: execution.ExecutionMode,
+    reason: str,
+) -> RegistryChange:
+    """Compensation DEC-010 : remet une activation provisoire à `enabled: false`."""
+    document = _read_document(config.registry_path)
+    index = document.index_of(model_id)
+    if index is None:
+        return _failure(
+            f"rollback impossible : « {model_id} » est absent du registre",
+            "rollback_activation_entree_absente",
+            f"La compensation de « {model_id} » n'a rien trouvé dans {config.registry_path}.",
+            evidence={"model_id": model_id, "written": False, "rollback": False},
+        )
+    entry = dict(document.models[index])
+    if entry.get("enabled") is False:
+        return RegistryChange(
+            status=execution.STEP_ALREADY_SATISFIED,
+            summary=f"« {model_id} » est déjà désactivé",
+            evidence={
+                "model_id": model_id,
+                "written": False,
+                "enabled": False,
+                "rollback": True,
+                "reason": reason,
+                "registry_sha256": _registry_sha256(document),
+            },
+        )
+
+    attendu = copy.deepcopy(document.data)
+    cible = dict(attendu["models"][index])
+    cible["enabled"] = False
+    attendu["models"][index] = cible
+    lignes = document.text.split("\n")
+    debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
+    candidat = "\n".join(
+        _set_scalar_field(lignes, debut, fin, champ_indent, "enabled", "false")
+    )
+    _assert_candidate_matches(candidat, attendu, f"rollback de « {model_id} »")
+    evidence: dict[str, Any] = {
+        "model_id": model_id,
+        "registry": str(config.registry_path),
+        "enabled": False,
+        "rollback": True,
+        "reason": reason,
+        "registry_sha256": hashlib.sha256(candidat.encode("utf-8")).hexdigest(),
+        "diff": _diff(document.text, candidat, config.registry_path),
+    }
+    if mode is execution.ExecutionMode.DRY_RUN:
+        evidence["written"] = False
+        evidence["models_after"] = _validate_candidate_without_writing(
+            config, candidat, _stamp(config)
+        )
+        return RegistryChange(
+            status=execution.STEP_WOULD_APPLY,
+            summary=f"désactiverait « {model_id} » par compensation",
+            evidence=evidence,
+        )
+
+    stamp = _stamp(config)
+    sauvegarde, purgees = _backup(config.registry_path, stamp, config.backup_retention)
+    evidence["backup"] = str(sauvegarde)
+    evidence["backups_purged"] = list(purgees)
+    evidence["models_after"] = _atomic_write(
+        config.registry_path, candidat, config.allowed_model_dirs, stamp
+    )
+    evidence["written"] = True
+    return RegistryChange(
+        status=execution.STEP_DONE,
+        summary=f"« {model_id} » remis à enabled: false ({reason})",
+        evidence=evidence,
+        findings=(schema.Finding(
+            code="activation_provisoire_annulee",
+            level="warn",
+            message=f"La recette de « {model_id} » n'a pas été confirmée : rollback appliqué.",
+        ),),
+    )
 
 
 def enable_model_entry(
@@ -1469,7 +1779,7 @@ def enable_model_entry(
     mode: execution.ExecutionMode,
 ) -> RegistryChange:
     """
-    Bascule une entrée en `enabled: true`, **et seulement sur preuve recoupée**.
+    Confirme une entrée en `enabled: true`, **et seulement sur preuve recoupée**.
 
     Sans preuve, avec une preuve d'un autre modèle, d'autres paramètres, d'un
     autre matériel, d'un autre runtime, périmée, ou dont la capacité dépasse le
@@ -1554,7 +1864,7 @@ def enable_model_entry(
             },
         )
 
-    deja_actif = bool(entry.get("enabled", True))
+    deja_actif = _enabled_state(entry, model_id)
     vram_courante = entry.get("vram_gb")
     if deja_actif and isinstance(vram_courante, (int, float)) and float(vram_courante) >= cible_vram:
         return RegistryChange(
@@ -1576,6 +1886,11 @@ def enable_model_entry(
         "vram_gb": cible_vram,
         "vram_budget_gb": config.vram_budget_gb,
         "proof": proof.digest(),
+        "registry_sha256": (
+            _registry_sha256(document)
+            if simule_sur_entree_projetee
+            else ""
+        ),
         "simulated_on_projected_entry": simule_sur_entree_projetee,
     }
     findings = _budget_findings(document, model_id, cible_vram, config)
@@ -1611,6 +1926,7 @@ def enable_model_entry(
     )
     candidat = "\n".join(lignes)
     _assert_candidate_matches(candidat, attendu, f"activation de « {model_id} »")
+    evidence["registry_sha256"] = hashlib.sha256(candidat.encode("utf-8")).hexdigest()
     evidence["diff"] = _diff(document.text, candidat, config.registry_path)
 
     if mode is execution.ExecutionMode.DRY_RUN:
@@ -1659,7 +1975,7 @@ def _budget_findings(
     for entry in document.models:
         if not isinstance(entry, Mapping) or entry.get("id") == model_id:
             continue
-        if not bool(entry.get("enabled", True)):
+        if not _enabled_state(entry):
             continue
         try:
             total += float(entry.get("vram_gb", 0.0))

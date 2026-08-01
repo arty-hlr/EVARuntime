@@ -145,19 +145,18 @@ import os
 import shutil
 import stat
 import tarfile
-import urllib.request
 import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import yaml
 
 from llama_version import LlamaVersion, probe_llama_version
 
-from . import execution, runtime_resolver, schema
+from . import execution, public_https, runtime_resolver, schema
 
 # ── Constantes d'installation ─────────────────────────────────────────────────
 
@@ -184,6 +183,8 @@ LICENSE_CANDIDATES: tuple[str, ...] = (
 USER_AGENT = "eva-bootstrap-apply/1"
 
 _CHUNK = 1024 * 1024
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+DEFAULT_MAX_REDIRECTS = 5
 
 # Codes de constat, exposés pour que les tests les nomment plutôt que de citer
 # des chaînes libres qui divergeraient en silence.
@@ -214,9 +215,9 @@ class ArchiveRefused(InstallError):
 
 def validate_artifact_url(url: Any) -> str:
     """
-    Refuse tout ce qui n'est pas un HTTPS sans identifiants. Fail-closed.
+    Refuse tout ce qui n'est pas un HTTPS sans identifiants vers une destination publique.
 
-    Trois refus, pour trois menaces distinctes du modèle de `AGENTS.md` :
+    Quatre refus, pour quatre menaces distinctes du modèle de `AGENTS.md` :
 
     - `http://`, `file://`, `ftp://` : un artefact récupéré en clair ou depuis le
       disque local n'est pas celui que la politique a épinglé, et `file://` est le
@@ -225,24 +226,14 @@ def validate_artifact_url(url: Any) -> str:
       URL finit dans un journal, dans un rapport d'exécution, et dans `argv` si
       quelqu'un délègue un jour à `curl` ;
     - autorité vide : `https:///chemin` ne désigne rien.
+    - adresse littérale non publique ou nom local : un téléchargement ne doit
+      jamais devenir une sonde du réseau de l'hôte. Les noms ordinaires sont
+      contrôlés après résolution par le transport.
     """
-    if not isinstance(url, str) or not url.strip():
-        raise InstallError("URL d'artefact absente : rien à télécharger")
-    parts = urlsplit(url.strip())
-    if parts.scheme != "https":
-        raise InstallError(
-            f"URL d'artefact refusée ({parts.scheme or 'sans schéma'}://…) : seul HTTPS est admis. "
-            "Un artefact récupéré en clair ou depuis le disque local n'est pas celui qu'épingle la "
-            "politique de release."
-        )
-    if not parts.hostname:
-        raise InstallError("URL d'artefact refusée : l'autorité est vide")
-    if parts.username or parts.password or "@" in parts.netloc:
-        raise InstallError(
-            "URL d'artefact refusée : elle porte des identifiants. Un secret dans une URL se "
-            "retrouve dans les journaux et les rapports d'exécution."
-        )
-    return url.strip()
+    try:
+        return public_https.validate_url(url)
+    except public_https.PublicHttpsError as exc:
+        raise InstallError(str(exc)) from exc
 
 
 def sanitize_url(url: str) -> str:
@@ -265,6 +256,25 @@ def sanitize_url(url: str) -> str:
 
 # ── Transport ─────────────────────────────────────────────────────────────────
 
+AddressInfo = public_https.AddressInfo
+Resolver = public_https.Resolver
+ConnectionFactory = public_https.ConnectionFactory
+_HTTPSConnectionLike = public_https.HTTPSConnectionLike
+_PinnedHTTPSConnection = public_https.PinnedHTTPSConnection
+_system_resolve = public_https.system_resolve
+_pinned_connection_factory = public_https.pinned_connection_factory
+# Compatibilité des tests historiques qui injectent la socket via ce module ;
+# les deux noms désignent le même module standard employé par le connecteur partagé.
+socket = public_https.socket
+
+
+def _resolve_public_addresses(host: str, port: int, resolver: Resolver) -> tuple[AddressInfo, ...]:
+    try:
+        return public_https.resolve_public_addresses(host, port, resolver)
+    except public_https.PublicHttpsError as exc:
+        raise InstallError(str(exc)) from exc
+
+
 class ArtifactTransport(Protocol):
     """
     Ce qui sait récupérer une archive. Injectable, pour que les tests ne touchent jamais le réseau.
@@ -282,43 +292,109 @@ class ArtifactTransport(Protocol):
 
 class UrllibTransport:
     """
-    Transport de production : `urllib` seul, aucune dépendance ajoutée.
+    Transport de production : bibliothèque standard seule, aucune dépendance ajoutée.
 
     `CLAUDE.md` interdit d'ajouter une dépendance sans gain opérationnel réel, et
     la vague 5 a écarté le paquet `gguf` officiel pour cette raison exacte. Un
     téléchargement borné avec contrôle d'empreinte en aval ne justifie pas
-    `httpx` : `urllib.request` suffit, et l'appel bloquant part dans un thread
-    pour que le module reste asynchrone de bout en bout.
+    `httpx` : `http.client` suffit, et l'appel bloquant part dans un thread pour
+    que le module reste asynchrone de bout en bout.
 
-    La redirection est recoupée : une URL HTTPS qui redirige vers `http://` ou
-    vers un `file://` serait sinon acceptée en silence.
+    Les redirections sont suivies manuellement et chaque destination est
+    validée puis résolue avant sa requête. La connexion TCP emploie exactement
+    l'adresse validée, tout en conservant le nom original pour SNI et le
+    certificat TLS : un second résultat DNS ne peut pas la faire rebondir vers
+    le réseau privé entre le contrôle et `connect()`.
     """
 
-    def __init__(self, *, timeout: float = 300.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = 300.0,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        resolver: Resolver | None = None,
+        connection_factory: ConnectionFactory | None = None,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout doit être > 0")
+        if (
+            not isinstance(max_redirects, int)
+            or isinstance(max_redirects, bool)
+            or max_redirects < 0
+        ):
+            raise ValueError("max_redirects doit être un entier >= 0")
         self._timeout = timeout
+        self._max_redirects = max_redirects
+        self._resolver = resolver if resolver is not None else _system_resolve
+        self._connection_factory = (
+            connection_factory if connection_factory is not None else _pinned_connection_factory
+        )
 
     async def fetch(self, url: str, destination: Path, *, max_bytes: int) -> int:
         validate_artifact_url(url)
         return await asyncio.to_thread(self._fetch_blocking, url, destination, max_bytes)
 
     def _fetch_blocking(self, url: str, destination: Path, max_bytes: int) -> int:
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        written = 0
-        with urllib.request.urlopen(request, timeout=self._timeout) as response:  # noqa: S310
-            validate_artifact_url(response.geturl())
-            with open(destination, "wb") as sink:
-                while True:
-                    chunk = response.read(_CHUNK)
-                    if not chunk:
-                        break
-                    written += len(chunk)
-                    if written > max_bytes:
+        current = validate_artifact_url(url)
+        redirects = 0
+        while True:
+            parts = urlsplit(current)
+            host = parts.hostname
+            if host is None:
+                raise InstallError(
+                    "URL d'artefact sans hôte après validation — téléchargement refusé"
+                )
+            port = parts.port or 443
+            addresses = _resolve_public_addresses(host, port, self._resolver)
+            connection = self._connection_factory(host, port, addresses, self._timeout)
+            response: Any | None = None
+            try:
+                target = urlunsplit(("", "", parts.path or "/", parts.query, ""))
+                connection.request("GET", target, headers={"User-Agent": USER_AGENT})
+                response = connection.getresponse()
+                status = int(response.status)
+
+                if status in _REDIRECT_STATUSES:
+                    location = response.getheader("Location")
+                    if not location:
                         raise InstallError(
-                            f"archive plus grande que la borne autorisée ({max_bytes} octets) : "
-                            "téléchargement interrompu"
+                            f"redirection HTTP {status} sans en-tête Location depuis "
+                            f"{sanitize_url(current)}"
                         )
-                    sink.write(chunk)
-        return written
+                    if redirects >= self._max_redirects:
+                        raise InstallError(
+                            f"trop de redirections pour l'artefact (borne {self._max_redirects})"
+                        )
+                    # Validation AVANT l'itération suivante, donc avant toute
+                    # résolution ou connexion vers la nouvelle destination.
+                    current = validate_artifact_url(urljoin(current, location))
+                    redirects += 1
+                    continue
+
+                if not 200 <= status < 300:
+                    raise InstallError(
+                        f"téléchargement refusé par la source d'artefact "
+                        f"{sanitize_url(current)} (HTTP {status})"
+                    )
+
+                written = 0
+                with open(destination, "wb") as sink:
+                    while True:
+                        chunk = response.read(_CHUNK)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise InstallError(
+                                f"archive plus grande que la borne autorisée ({max_bytes} octets) : "
+                                "téléchargement interrompu"
+                            )
+                        sink.write(chunk)
+                return written
+            finally:
+                if response is not None:
+                    response.close()
+                connection.close()
 
 
 VersionProbe = Callable[[Path], Awaitable[LlamaVersion]]

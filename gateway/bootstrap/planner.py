@@ -39,13 +39,14 @@ devra franchir, et c'est pour cela que `write_registry` écrit une entrée
 Ordre des étapes, et pourquoi celui-là
 --------------------------------------
     accept_license → download_model → verify_artifact → write_registry (désactivé)
-    → calibrate_model → enable_model → warmup_model → smoke_test
+    → calibrate_model → enable_model (provisoire) → smoke_test
+    → warmup_model
 
 Trois inversions seraient des défauts, pas des goûts : vérifier après avoir posé
 l'artefact ne protège de rien ; activer avant d'avoir calibré publie une capacité
-supposée ; préchauffer avant d'activer réchauffe un modèle que personne ne peut
-servir. Le smoke test est unique et final : il traverse le vrai chemin public
-(§10), il ne se réplique pas par modèle.
+supposée ; préchauffer avant la recette conserverait en mémoire un modèle dont
+aucun token n'a encore été prouvé. La recette est donc exécutée par modèle,
+pendant une activation provisoire explicitement réversible (DEC-010).
 """
 from __future__ import annotations
 
@@ -696,20 +697,6 @@ def _assemble_steps(
     for choice in selection.retained:
         steps.extend(_model_steps(choice, options))
 
-    if selection.retained:
-        steps.append(schema.PlanStep(
-            order=0,
-            action=schema.ACTION_SMOKE_TEST,
-            target="nginx → gateway → llama-server",
-            detail=(
-                "Recette du premier token à travers le chemin public réel (§10) : TTFT "
-                "mesuré, rapport sans secret. Unique et finale — elle valide la chaîne, "
-                "pas un modèle en particulier."
-            ),
-            requires_root=False,
-            reversible=True,
-        ))
-
     return tuple(replace(step, order=index + 1) for index, step in enumerate(steps))
 
 
@@ -790,10 +777,25 @@ def _model_steps(choice: ModelChoice, options: PlannerOptions) -> list[schema.Pl
         action=schema.ACTION_ENABLE_MODEL,
         target=entry.id,
         detail=(
-            "Basculer l'entrée en `enabled: true` avec la capacité issue de la "
-            "calibration. C'est ici, et pas avant, que le modèle devient servable."
+            "Publier `enabled: true` uniquement dans le registre vivant, avec la "
+            "capacité issue de la calibration, à titre PROVISOIRE. Le fichier reste "
+            "`enabled: false` jusqu'à la recette publique ; un échec ferme l'admission "
+            "live et décharge le modèle (DEC-010, COR-022)."
         ),
         requires_root=True,
+        reversible=True,
+    ))
+
+    steps.append(schema.PlanStep(
+        order=0,
+        action=schema.ACTION_SMOKE_TEST,
+        target=entry.id,
+        detail=(
+            "Recette du premier token pour CE modèle à travers le chemin public réel "
+            "nginx → gateway → llama-server (§10). Elle ferme l'activation provisoire : "
+            "succès = activation conservée ; échec = retour immédiat à `enabled: false`."
+        ),
+        requires_root=False,
         reversible=True,
     ))
 
