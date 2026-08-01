@@ -29,7 +29,8 @@ import tempfile
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from types import MappingProxyType
+from typing import Literal, Mapping
 
 import yaml
 
@@ -287,6 +288,21 @@ class ModelDefinition:
         return d
 
 
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    """Instantané validé issu d'une lecture unique de ``models.yaml``."""
+
+    path: Path
+    sha256: str
+    models: tuple[ModelDefinition, ...]
+
+    def get(self, model_id: str) -> ModelDefinition | None:
+        return next((model for model in self.models if model.id == model_id), None)
+
+    def by_id(self) -> Mapping[str, ModelDefinition]:
+        return MappingProxyType({model.id: model for model in self.models})
+
+
 class ModelRegistry:
     """
     Registre des modèles disponibles sur la gateway.
@@ -310,31 +326,88 @@ class ModelRegistry:
     # ── Chargement ────────────────────────────────────────────────────────────
 
     def _load(self) -> None:
+        snapshot = self.read_snapshot()
+        self.publish_snapshot(snapshot)
+        enabled_count = sum(1 for model in snapshot.models if model.enabled)
+        log.info(
+            "Registre chargé depuis %s — %d modèle(s), %d activé(s)",
+            self._path, len(snapshot.models), enabled_count,
+        )
+
+    def read_snapshot(self) -> RegistrySnapshot:
+        """Lit, hache et parse les mêmes octets, sans muter la mémoire."""
         if not self._path.exists():
             raise FileNotFoundError(
                 f"Fichier de registre des modèles introuvable : {self._path}\n"
                 f"Créez ce fichier ou définissez MODELS_CONFIG_PATH dans .env"
             )
 
-        with self._path.open(encoding="utf-8") as f:
-            data = yaml.safe_load(f)  # safe_load — jamais yaml.load()
+        raw = self._path.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Encodage UTF-8 invalide dans {self._path} : {exc}") from exc
+        data = yaml.safe_load(text)  # safe_load — jamais yaml.load()
 
         if not isinstance(data, dict) or "models" not in data:
             raise ValueError(f"Format invalide dans {self._path} : clé 'models' manquante")
+        if not isinstance(data["models"], list):
+            raise ValueError(
+                f"Format invalide dans {self._path} : 'models' doit être une liste"
+            )
 
         models: dict[str, ModelDefinition] = {}
         for entry in data["models"]:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"Format invalide dans {self._path} : chaque modèle doit être un objet"
+                )
             model = self._parse_entry(entry)
             if model.id in models:
                 raise ValueError(f"ID de modèle dupliqué dans {self._path} : '{model.id}'")
             models[model.id] = model
 
-        self._models = models
-        enabled_count = sum(1 for m in models.values() if m.enabled)
-        log.info(
-            "Registre chargé depuis %s — %d modèle(s), %d activé(s)",
-            self._path, len(models), enabled_count,
+        return RegistrySnapshot(
+            path=self._path.resolve(),
+            sha256=hashlib.sha256(raw).hexdigest(),
+            models=tuple(models.values()),
         )
+
+    def snapshot_is_current(self, snapshot: RegistrySnapshot) -> bool:
+        """Recoupe l'instantané contre les octets actuellement publiés."""
+        if snapshot.path != self._path.resolve():
+            return False
+        try:
+            current = hashlib.sha256(self._path.read_bytes()).hexdigest()
+        except OSError:
+            return False
+        return current == snapshot.sha256
+
+    def memory_models(self) -> Mapping[str, ModelDefinition]:
+        """Vue en lecture seule de la génération actuellement servie."""
+        return MappingProxyType(dict(self._models))
+
+    def publish_snapshot(
+        self,
+        snapshot: RegistrySnapshot,
+        *,
+        overrides: Mapping[str, ModelDefinition] | None = None,
+    ) -> None:
+        """Publie un snapshot en mémoire seulement ; n'écrit jamais le YAML."""
+        if snapshot.path != self._path.resolve():
+            raise ValueError(
+                f"snapshot issu de {snapshot.path}, registre courant {self._path.resolve()}"
+            )
+        models = {model.id: model for model in snapshot.models}
+        for model_id, model in (overrides or {}).items():
+            if model_id not in models:
+                raise ValueError(f"override inconnu dans le snapshot : '{model_id}'")
+            if model.id != model_id:
+                raise ValueError(
+                    f"override incohérent : clé '{model_id}', modèle '{model.id}'"
+                )
+            models[model_id] = model
+        self._models = models
 
     def _parse_entry(self, entry: dict) -> ModelDefinition:
         """Parse et valide une entrée du YAML. Lève ValueError si invalide."""
@@ -399,12 +472,19 @@ class ModelRegistry:
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"[{model_id}] speculative invalide : {exc}") from exc
 
+        enabled = entry.get("enabled", True)
+        if type(enabled) is not bool:
+            raise ValueError(
+                f"[{model_id}] enabled doit être un booléen YAML réel "
+                f"(true ou false non quoté), reçu : {enabled!r}"
+            )
+
         return ModelDefinition(
             id=model_id,
             path=path,
             description=str(entry.get("description", "")),
             vram_gb=vram_gb,
-            enabled=bool(entry.get("enabled", True)),
+            enabled=enabled,
             capabilities=capabilities,
             llama_params=llama_params,
             mmproj_path=mmproj_path,

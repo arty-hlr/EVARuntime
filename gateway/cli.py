@@ -683,5 +683,509 @@ def bootstrap_plan(
     raise typer.Exit(plan.exit_code(strict=strict))
 
 
+# ── Applicateur de bootstrap (AUT-006 → AUT-011, AUT-015) ─────────────────────
+
+@app.command("bootstrap-apply")
+def bootstrap_apply(
+    plan: str = typer.Argument(..., help="Plan JSON produit par `bootstrap-plan --json`"),
+    apply_for_real: bool = typer.Option(
+        False, "--apply",
+        help="APPLIQUER RÉELLEMENT. Sans ce drapeau, la commande se contente de simuler.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Rapport d'installation JSON au lieu du texte"
+    ),
+    allowed_root: Optional[list[str]] = typer.Option(
+        None, "--allowed-root",
+        help="Répertoire que l'application a le droit de toucher (répétable, obligatoire)",
+    ),
+    catalog: Optional[str] = typer.Option(
+        None, "--catalog", help="Catalogue de modèles approuvés (défaut : celui du dépôt)"
+    ),
+    models_dir: Optional[str] = typer.Option(
+        None, "--models-dir", help="Volume où atterrissent les GGUF"
+    ),
+    registry: Optional[str] = typer.Option(
+        None, "--registry", help="models.yaml à écrire — va avec --runtime-version, "
+        "--hardware-fingerprint et --vram-budget-gb",
+    ),
+    runtime_version: Optional[str] = typer.Option(
+        None, "--runtime-version", help="Build de llama-server en service (ex. « b6042 »)"
+    ),
+    hardware_fingerprint: Optional[str] = typer.Option(
+        None, "--hardware-fingerprint", help="Empreinte matérielle de l'hôte (§9)"
+    ),
+    vram_budget_gb: float = typer.Option(
+        0.0, "--vram-budget-gb", help="Budget VRAM net de l'hôte, en Go"
+    ),
+    runtime_root: Optional[str] = typer.Option(
+        None, "--runtime-root", help="Racine de releases du runtime (ex. /opt/llama.cpp)"
+    ),
+    llama_server_bin: Optional[str] = typer.Option(
+        None, "--llama-server-bin",
+        help="Binaire à employer pour la calibration (défaut : runtime installé ou config)",
+    ),
+    calibration_report_dir: Optional[str] = typer.Option(
+        None, "--calibration-report-dir", help="Répertoire des preuves de calibration"
+    ),
+    calibration_port: int = typer.Option(
+        19091, "--calibration-port", help="Port loopback réservé au llama-server de calibration"
+    ),
+    calibration_load_timeout: Optional[float] = typer.Option(
+        None, "--calibration-load-timeout",
+        help="Borne de chargement de calibration (défaut : MODEL_LOAD_TIMEOUT_SECONDS)",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None, "--base-url", help="URL publique traversée par la recette (nginx en production)"
+    ),
+    admin_url: Optional[str] = typer.Option(
+        None, "--admin-url", help="URL directe de la gateway pour /ready et /admin"
+    ),
+    admin_secret_file: Optional[str] = typer.Option(
+        None, "--admin-secret-file",
+        help="Fichier privé contenant ADMIN_SECRET (sinon variable ADMIN_SECRET ; jamais argv)",
+    ),
+    accept_license: Optional[list[str]] = typer.Option(
+        None, "--accept-license", help="ID de modèle dont la licence est acceptée (répétable)"
+    ),
+    license_reference: Optional[str] = typer.Option(
+        None, "--license-reference",
+        help="Référence technique commune aux acceptations (ticket/changement, jamais un nom)",
+    ),
+    ttft_threshold_ms: int = typer.Option(
+        0, "--ttft-threshold-ms", help="Seuil TTFT en ms (0 = mesure sans seuil)"
+    ),
+    ttft_gate: bool = typer.Option(
+        False, "--ttft-gate", help="Faire du dépassement TTFT un échec"
+    ),
+):
+    """
+    Applique un plan d'amorçage relu — EN SIMULATION PAR DÉFAUT.
+
+    La simulation est le défaut et l'application demande `--apply` : un mode
+    d'exécution ne s'obtient jamais par omission d'argument. Une simulation
+    complète sort en 3, jamais en 0 — rien n'a été appliqué, et un script
+    d'exploitation ne doit pas pouvoir confondre les deux.
+
+    Le plan est relu par `execution.load_plan_file()`, qui refuse un document
+    d'une autre version de schéma, incohérent, non applicable, porteur de
+    bloqueurs ou exposant un secret. Aucune de ces barrières n'est réimplémentée
+    ici.
+
+    Le câblage est explicite : ce que les options ne fournissent pas n'est pas
+    exécutable, et la commande refuse avant de commencer. Les secrets viennent
+    d'un fichier privé ou de l'environnement, jamais d'argv. La calibration
+    lance son propre llama-server sur loopback : elle ne rend pas publiquement
+    servable une entrée encore désactivée.
+
+    Exit codes : 0 installation complète, 1 échec ou plan inapplicable,
+    2 erreur d'usage / câblage incomplet, 3 partiel (dont toute simulation),
+    4 erreur interne de l'applicateur.
+    """
+    from pathlib import Path as _Path
+
+    from bootstrap import applier as applier_module
+    from bootstrap import catalog as _catalog
+    from bootstrap import downloader as _downloader
+    from bootstrap import execution as _execution
+    from bootstrap import install_report as _install_report
+    from bootstrap import production as _production
+    from bootstrap import registry_writer as _writer
+    from bootstrap import schema as _schema
+
+    roots = [r for r in (allowed_root or []) if r.strip()]
+    if not roots:
+        console.print(
+            "[red]--allowed-root est obligatoire :[/red] une liste vide n'autorise rien, et "
+            "elle ne signifie pas « pas de contrainte ». Déclarez explicitement les "
+            "répertoires que l'application a le droit de toucher."
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    if registry is None and any(
+        option is not None for option in (runtime_version, hardware_fingerprint)
+    ):
+        console.print(
+            "[red]--runtime-version et --hardware-fingerprint n'ont de sens "
+            "qu'avec --registry.[/red] Quand ils sont omis, le runtime et le matériel "
+            "sont dérivés puis recoupés depuis le plan relu."
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    try:
+        # Relecture avant le câblage : la configuration runtime est reconstruite
+        # depuis CE document validé, jamais depuis une seconde décision.
+        loaded_plan = _execution.load_plan_file(_Path(plan))
+    except _execution.PlanRefused as exc:
+        console.print("[red]Plan refusé :[/red] " + _execution.redact_for_log(str(exc)))
+        raise typer.Exit(_schema.EXIT_BLOCKED)
+
+    mode = (
+        _execution.ExecutionMode.APPLY if apply_for_real
+        else _execution.ExecutionMode.DRY_RUN
+    )
+
+    try:
+        config = _build_applier_config(
+            applier_module=applier_module,
+            catalog_module=_catalog,
+            downloader_module=_downloader,
+            production_module=_production,
+            writer_module=_writer,
+            loaded_plan=loaded_plan,
+            catalog_path=_Path(catalog) if catalog else None,
+            models_dir=_Path(models_dir) if models_dir else None,
+            registry_path=_Path(registry) if registry else None,
+            runtime_version=runtime_version,
+            hardware_fingerprint=hardware_fingerprint,
+            vram_budget_gb=vram_budget_gb,
+            runtime_root=_Path(runtime_root) if runtime_root else None,
+            llama_server_binary=_Path(llama_server_bin) if llama_server_bin else None,
+            calibration_report_dir=(
+                _Path(calibration_report_dir) if calibration_report_dir else None
+            ),
+            calibration_port=calibration_port,
+            calibration_load_timeout=calibration_load_timeout,
+            base_url=base_url,
+            admin_url=admin_url,
+            admin_secret_file=_Path(admin_secret_file) if admin_secret_file else None,
+            accepted_license_ids=tuple(accept_license or ()),
+            license_reference=license_reference,
+            ttft_threshold_ms=ttft_threshold_ms,
+            ttft_gate=ttft_gate,
+            dry_run=mode is _execution.ExecutionMode.DRY_RUN,
+        )
+    except (_schema.PlanError, OSError, ValueError) as exc:
+        console.print(
+            "[red]Câblage refusé :[/red] " + _execution.redact_for_log(str(exc))
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    try:
+        outcome = _run(applier_module.apply_loaded_plan(
+            loaded_plan, config, mode=mode, allowed_roots=[_Path(r) for r in roots],
+        ))
+        rendered = (
+            _install_report.render_install_json(outcome.install) if json_output
+            else _install_report.render_install_human(outcome.install)
+        )
+    except applier_module.ApplierUsageError as exc:
+        console.print(
+            "[red]Demande impossible à honorer :[/red] "
+            + _execution.redact_for_log(str(exc))
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+    except _execution.PlanRefused as exc:
+        # Expurgé, et ce n'est pas de la prudence de principe : `PlanRefused`
+        # porte l'ORIGINE du plan, c'est-à-dire un chemin de fichier fourni par
+        # l'opérateur. Un plan déposé sous un nom qui contient un jeton faisait
+        # ressortir ce jeton dans le message de refus.
+        console.print("[red]Plan refusé :[/red] " + _execution.redact_for_log(str(exc)))
+        raise typer.Exit(_schema.EXIT_BLOCKED)
+    except Exception as exc:
+        # Ni le message ni le type ne sont recopiés d'un objet susceptible de
+        # porter un secret : `redact_for_log` expurge avant que quoi que ce soit
+        # n'atteigne la sortie ou le journal.
+        console.print(
+            "[red]bootstrap-apply a échoué :[/red] "
+            + _execution.redact_for_log(f"{type(exc).__name__}: {exc}")
+        )
+        raise typer.Exit(_schema.EXIT_ERROR)
+
+    if json_output:
+        # Écriture brute : le rendu rich reformaterait le document JSON.
+        sys.stdout.write(rendered + "\n")
+    else:
+        console.print(rendered, markup=False, highlight=False, soft_wrap=True)
+        for finding in outcome.findings:
+            console.print(
+                f"  · {finding.level} [{finding.code}] {finding.message}",
+                markup=False, highlight=False, soft_wrap=True,
+            )
+
+    raise typer.Exit(outcome.exit_code())
+
+
+def _build_applier_config(
+    *,
+    applier_module,
+    catalog_module,
+    downloader_module,
+    production_module,
+    writer_module,
+    loaded_plan,
+    catalog_path,
+    models_dir,
+    registry_path,
+    runtime_version,
+    hardware_fingerprint,
+    vram_budget_gb,
+    runtime_root,
+    llama_server_binary,
+    calibration_report_dir,
+    calibration_port,
+    calibration_load_timeout,
+    base_url,
+    admin_url,
+    admin_secret_file,
+    accepted_license_ids,
+    license_reference,
+    ttft_threshold_ms,
+    ttft_gate,
+    dry_run,
+):
+    """
+    Construit le câblage à partir des options. Ce qui manque reste `None`.
+
+    Aucun repli : une option absente ne produit pas une configuration par défaut
+    qui ferait croire au câblage. C'est le contrôle de pré-vol de l'applicateur
+    qui refusera, en nommant les actions concernées.
+    """
+    from bootstrap import calibration as _calibration
+    from bootstrap import first_token as _first_token
+    from bootstrap import schema as _schema
+    from bootstrap import warmup as _warmup
+
+    actions = {step.action for step in loaded_plan.steps}
+    section_names = {
+        section.get("name") for section in loaded_plan.document.get("sections", ())
+        if isinstance(section, dict)
+    }
+    model_ids = tuple(dict.fromkeys(
+        step.target for step in loaded_plan.steps
+        if step.action == _schema.ACTION_CALIBRATE_MODEL
+    ))
+
+    runtime = None
+    if _schema.ACTION_INSTALL_RUNTIME in actions and runtime_root is not None:
+        runtime = production_module.runtime_installer_from_plan(
+            loaded_plan.document, runtime_root
+        )
+
+    download = None
+    catalog_entries: dict = {}
+    catalogue = None
+    if accepted_license_ids and models_dir is None:
+        raise production_module.ProductionWiringError(
+            "--accept-license exige --models-dir, où l'acceptation sera enregistrée"
+        )
+    if license_reference and not accepted_license_ids:
+        raise production_module.ProductionWiringError(
+            "--license-reference sans --accept-license n'accepte aucune licence"
+        )
+    if models_dir is not None:
+        catalogue = catalog_module.load_catalog(catalog_path)
+        catalog_entries = {e.id: e.to_dict() for e in catalogue.plannable_entries()}
+        required_acceptance_ids = tuple(dict.fromkeys(
+            downloader_module.resolve_entry(step, catalogue).id
+            for step in loaded_plan.steps
+            if step.action == _schema.ACTION_ACCEPT_LICENSE
+        ))
+        unexpected_acceptances = sorted(
+            set(accepted_license_ids) - set(required_acceptance_ids)
+        )
+        if unexpected_acceptances:
+            raise production_module.ProductionWiringError(
+                "--accept-license porte des acceptations hors plan : "
+                + ", ".join(unexpected_acceptances)
+            )
+        acceptances = production_module.license_acceptances(
+            catalogue,
+            accepted_license_ids,
+            operator_reference=license_reference or "",
+        ) if accepted_license_ids else ()
+        download = downloader_module.DownloadConfig(
+            catalog=catalogue, models_dir=models_dir, acceptances=acceptances
+        )
+
+    runtime_resolution = None
+    if (
+        _schema.ACTION_INSTALL_RUNTIME in actions
+        or (
+            _schema.ACTION_CALIBRATE_MODEL in actions
+            and _schema.SECTION_RUNTIME in section_names
+        )
+    ):
+        runtime_resolution = production_module.runtime_resolution_from_plan(
+            loaded_plan.document
+        )
+    planned_runtime_version = (
+        runtime_resolution.manifest.version
+        if runtime_resolution is not None and runtime_resolution.manifest is not None
+        else None
+    )
+    effective_runtime_version = runtime_version or planned_runtime_version
+    if (
+        runtime_version is not None
+        and planned_runtime_version is not None
+        and runtime_version != planned_runtime_version
+    ):
+        raise production_module.ProductionWiringError(
+            "--runtime-version diverge de la version publiée dans le plan"
+        )
+
+    planned_hardware_fingerprint = None
+    if (
+        _schema.ACTION_CALIBRATE_MODEL in actions
+        and _schema.SECTION_HARDWARE in section_names
+        and any(
+            isinstance(section, dict)
+            and section.get("name") == _schema.SECTION_HARDWARE
+            and isinstance(section.get("data"), dict)
+            and isinstance(section["data"].get("gpus"), list)
+            for section in loaded_plan.document.get("sections", ())
+        )
+    ):
+        planned_hardware_fingerprint = production_module.hardware_fingerprint_from_plan(
+            loaded_plan.document
+        )
+    effective_hardware_fingerprint = (
+        hardware_fingerprint or planned_hardware_fingerprint
+    )
+    if (
+        hardware_fingerprint is not None
+        and planned_hardware_fingerprint is not None
+        and hardware_fingerprint != planned_hardware_fingerprint
+    ):
+        raise production_module.ProductionWiringError(
+            "--hardware-fingerprint diverge de l'inventaire publié dans le plan"
+        )
+
+    writer = None
+    if registry_path is not None:
+        writer = writer_module.WriterConfig(
+            registry_path=registry_path,
+            models_dir=models_dir if models_dir is not None else registry_path.parent,
+            allowed_model_dirs=(
+                (models_dir,) if models_dir is not None else (registry_path.parent,)
+            ),
+            runtime_version=effective_runtime_version,
+            hardware_fingerprint=effective_hardware_fingerprint,
+            vram_budget_gb=vram_budget_gb,
+            catalog_entries=catalog_entries,
+        )
+
+    calibration_options = None
+    if (
+        _schema.ACTION_CALIBRATE_MODEL in actions
+        and catalogue is not None
+        and models_dir is not None
+        and calibration_report_dir is not None
+        and effective_runtime_version is not None
+        and effective_hardware_fingerprint is not None
+    ):
+        binary = llama_server_binary
+        if binary is None and runtime is not None:
+            binary = runtime.published_binary
+        if binary is None:
+            binary = settings.llama_server_bin
+        targets = production_module.calibration_targets(
+            catalogue, models_dir, model_ids
+        )
+        probe_host = production_module.LlamaServerCalibrationProbes(
+            binary=binary,
+            targets=targets,
+            port=calibration_port,
+            visible_gpu_indices=production_module.visible_gpu_indices_from_plan(
+                loaded_plan.document
+            ),
+            visible_gpu_uuids=production_module.visible_gpu_uuids_from_plan(
+                loaded_plan.document
+            ),
+            load_timeout_seconds=(
+                calibration_load_timeout
+                if calibration_load_timeout is not None
+                else settings.model_load_timeout_seconds
+            ),
+        )
+        calibration_options = _calibration.CalibrationOptions(
+            probes=probe_host.as_probes(),
+            runtime_version=effective_runtime_version,
+            hardware_fingerprint=effective_hardware_fingerprint,
+            report_dir=calibration_report_dir,
+            params={model_id: target.params for model_id, target in targets.items()},
+        )
+
+    needs_http = bool(actions & {
+        _schema.ACTION_SMOKE_TEST, _schema.ACTION_WARMUP_MODEL,
+    })
+    first_token_wiring = None
+    warmup_wiring = None
+    registry_sync_wiring = None
+    if needs_http and base_url and admin_url:
+        base_url, admin_url = production_module.validate_gateway_urls(
+            base_url=base_url, admin_url=admin_url
+        )
+        secret = (
+            "dry-run-secret-not-used"
+            if dry_run
+            else production_module.read_admin_secret(path=admin_secret_file)
+        )
+        smoke_settings = _first_token.FirstTokenSettings(
+            base_url=base_url,
+            admin_url=admin_url,
+            model_id=None,
+            ttft_threshold_ms=ttft_threshold_ms,
+            fail_on_ttft=ttft_gate,
+            load_timeout_s=float(settings.model_load_timeout_seconds + 10),
+        )
+        client = production_module.AsyncHttpClient()
+        sync_timeout_seconds = float(
+            settings.admin_unload_drain_timeout_seconds + 10
+        )
+        live_registry = production_module.LiveRegistrySyncClient(
+            admin_url=admin_url,
+            admin_secret=secret,
+            client=client,
+            timeout_seconds=sync_timeout_seconds,
+            lease_seconds=production_module.derive_live_registry_lease_seconds(
+                smoke_settings,
+                sync_timeout_seconds=sync_timeout_seconds,
+            ),
+        )
+        registry_sync_wiring = applier_module.RegistrySyncWiring(
+            activate=live_registry.activate,
+            rollback=live_registry.rollback,
+            confirm=live_registry.confirm,
+        )
+        first_token_wiring = applier_module.FirstTokenWiring(
+            settings=smoke_settings,
+            client=client,
+            admin_secret=secret,
+            sleep=asyncio.sleep,
+        )
+        if model_ids:
+            warmup_settings = _warmup.WarmupSettings(
+                admin_url=admin_url,
+                # L'applicateur AUT-015 remplace cette cible par step.target.
+                model_id=model_ids[0],
+                timeout_seconds=_warmup.derive_warmup_timeout_seconds(
+                    model_load_timeout_seconds=None,
+                    default_load_timeout_seconds=settings.model_load_timeout_seconds,
+                ),
+            )
+            warmup_wiring = applier_module.WarmupWiring(
+                settings=warmup_settings,
+                client=client,
+                admin_secret=secret,
+                generation_probe_factory=production_module.generation_probe_factory_from_recipe(
+                    settings=smoke_settings,
+                    client=client,
+                    admin_secret=secret,
+                ),
+                sleep=asyncio.sleep,
+            )
+
+    return applier_module.ApplierConfig(
+        runtime=runtime,
+        download=download,
+        writer=writer,
+        registry_sync=registry_sync_wiring,
+        calibration=calibration_options,
+        first_token=first_token_wiring,
+        warmup=warmup_wiring,
+    )
+
+
 if __name__ == "__main__":
     app()

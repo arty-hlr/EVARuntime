@@ -487,6 +487,34 @@ def test_un_booleen_de_presence_ne_fuit_pas():
     assert sc.find_secret_leaks({"source": {"hf_token": True, "api_key": None}}) == ()
 
 
+@pytest.mark.parametrize("champ", [
+    "token", "hf_token", "access_token", "auth_token", "refresh_token", "token_file",
+])
+def test_un_porteur_dauthentification_reste_une_fuite(champ):
+    """Le resserrage du motif ne doit rien laisser passer de ce qu'il attrapait."""
+    assert sc.find_secret_leaks({champ: "valeur-quelconque"}), champ
+
+
+@pytest.mark.parametrize("champ", [
+    "prompt_tokens", "completion_tokens", "total_tokens", "max_tokens",
+    "prompt_tokens_per_second", "generation_tokens_per_second", "tokens_per_second",
+    "first_token_ms", "time_to_first_token_ms", "token_count", "n_tokens",
+])
+def test_un_comptage_de_jetons_nest_pas_un_secret(champ):
+    """
+    Dans une passerelle LLM, un jeton est d'abord une unité de facturation.
+
+    Le motif `TOKEN` non ancré frappait ces noms en sous-chaîne, si bien que le
+    rapport de calibration prescrit par §9 — qui exige `prompt_tokens_per_second`
+    — était littéralement impubliable : `render_json()` refusait de le rendre.
+    Trois chantiers de la vague 6 ont buté dessus indépendamment et l'ont
+    contourné chacun de son côté avant qu'on corrige la cause.
+    """
+    # Contrôle positif : le détecteur voit toujours quelque chose sur ce document.
+    assert sc.find_secret_leaks({champ: 42, "hf_token": "x"}), champ
+    assert sc.find_secret_leaks({champ: 42}) == (), champ
+
+
 @pytest.mark.parametrize("valeur,motif", [
     ("hf_abcdefghijklmnopqrstuvwx", "hf_token"),
     ("sk-abcdefghijklmnopqrstuvwxyz", "openai_key"),

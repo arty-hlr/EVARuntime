@@ -225,3 +225,16 @@ def test_vram_gb_not_positive_raises(tmp_path, bad_vram):
     models = [_base_entry(vram_gb=bad_vram)]
     with pytest.raises(ValueError, match="vram_gb"):
         _write_registry(tmp_path, models)
+
+
+def test_enabled_false_entre_guillemets_est_refuse(tmp_path):
+    with pytest.raises(ValueError, match="enabled.*booléen YAML réel.*non quoté"):
+        _write_registry(tmp_path, [_base_entry(enabled="false")])
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_enabled_accepte_les_deux_booleens_yaml_reels(tmp_path, enabled):
+    registry = _write_registry(tmp_path, [_base_entry(enabled=enabled)])
+    model = registry.get("llama-3.3-70b")
+    assert model is not None
+    assert model.enabled is enabled

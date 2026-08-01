@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Utilisateurs ──────────────────────────────────────────────────────────────
@@ -193,6 +193,29 @@ class ModelEntryUpdate(BaseModel):
     vram_gb: Optional[float] = Field(None, gt=0.0)
     description: Optional[str] = Field(None, max_length=200)
     llama_params: Optional[LlamaParamsSchema] = None
+
+
+class BootstrapModelSync(BaseModel):
+    """Transition live étroite du bootstrap, sans aucune écriture YAML."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["activate", "rollback", "confirm"]
+    digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    vram_gb: Optional[float] = Field(None, gt=0.0, strict=True)
+    lease_seconds: Optional[int] = Field(None, ge=30, le=3600, strict=True)
+
+    @model_validator(mode="after")
+    def validate_action_fields(self):
+        if self.action == "activate" and self.vram_gb is None:
+            raise ValueError("vram_gb est obligatoire pour action=activate")
+        if self.action == "activate" and self.lease_seconds is None:
+            raise ValueError("lease_seconds est obligatoire pour action=activate")
+        if self.action != "activate" and self.vram_gb is not None:
+            raise ValueError("vram_gb n'est admis que pour action=activate")
+        if self.action != "activate" and self.lease_seconds is not None:
+            raise ValueError("lease_seconds n'est admis que pour action=activate")
+        return self
 
 
 # ── Statut système multi-modèles ──────────────────────────────────────────────

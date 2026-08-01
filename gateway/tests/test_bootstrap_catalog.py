@@ -21,6 +21,7 @@ Aucun test ne touche au réseau ni au disque hors `tmp_path`.
 """
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
 import json
@@ -169,10 +170,46 @@ def test_le_catalogue_livre_reste_petit_et_realiste() -> None:
 def test_le_catalogue_livre_distingue_la_licence_du_telechargeur() -> None:
     """§8 : la licence du logiciel de téléchargement est une donnée distincte."""
     loaded = catalog.load_catalog()
-    assert loaded.downloader.name == "huggingface_hub"
-    assert loaded.downloader.license_id == "apache-2.0"
+    assert loaded.downloader.name == "eva-bootstrap downloader"
+    assert loaded.downloader.license_id == "agpl-3.0"
     # Elle ne se confond pas avec celle des modèles : c'est un objet séparé.
     assert not hasattr(loaded.entries[0].license, "downloader")
+
+
+def test_le_telechargeur_declare_est_celui_reellement_employe() -> None:
+    """
+    Le bloc `downloader` déclare une licence : elle doit porter sur le logiciel
+    qui télécharge vraiment.
+
+    Ce test existe parce que la déclaration a été fausse : le catalogue annonçait
+    `huggingface_hub` sous apache-2.0 alors qu'AUT-006 a délibérément écarté
+    cette dépendance et téléchargé par la bibliothèque standard. Une déclaration
+    de licence fausse est pire qu'absente — elle a l'apparence d'une vérification.
+    """
+    source = (Path(__file__).resolve().parents[1] / "bootstrap" / "downloader.py").read_text()
+    imports = {
+        node.module.split(".")[0]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name.split(".")[0]
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+
+    # Contrôle positif : l'introspection voit bien quelque chose.
+    assert "hashlib" in imports, imports
+
+    declared = catalog.load_catalog().downloader.name
+    if "huggingface_hub" in declared:
+        assert "huggingface_hub" in imports, (
+            "le catalogue déclare huggingface_hub, que le téléchargeur n'importe pas"
+        )
+    else:
+        assert "huggingface_hub" not in imports, (
+            f"le téléchargeur importe huggingface_hub sans que {declared!r} le déclare"
+        )
 
 
 def test_le_catalogue_livre_est_distinct_du_registre_operationnel() -> None:

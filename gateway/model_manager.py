@@ -161,11 +161,15 @@ class LocalModelManager:
 
         self._capacity_cond = asyncio.Condition()
         self._capacity_waiters: deque[object] = deque()
+        self._model_locks: dict[str, asyncio.Lock] = {}
 
         # Modèles en quarantaine : un déchargement admin est en cours de drain.
         # Aucune NOUVELLE requête n'est admise sur ces modèles, sinon le drain
         # pourrait ne jamais converger. Toujours vidé dans un bloc finally.
         self._draining: set[str] = set()
+        # Gate fail-closed du bootstrap. Il survit à un unload en échec ; seul
+        # le protocole bootstrap explicite peut rouvrir l'admission.
+        self._bootstrap_blocked: set[str] = set()
 
         # Réconciliation VRAM (nvidia-smi) — additif dans status(). None tant
         # qu'aucune sonde réussie n'a eu lieu (cas des tests sans GPU).
@@ -176,6 +180,45 @@ class LocalModelManager:
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
     async def ensure_model_loaded(self, model_id: str) -> ServerManager:
+        """Sérialise admission/chargement avec le rollback du même modèle."""
+        # Rejet immédiat pendant un drain, sans attendre le lock détenu par
+        # l'unload. Le même contrôle est refait sous lock ci-dessous.
+        self._admitted_model(model_id)
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            return await self._ensure_model_loaded_locked(model_id)
+
+    def block_bootstrap_admission(self, model_id: str) -> None:
+        """Ferme l'admission synchroniquement, avant tout await de rollback."""
+        self._bootstrap_blocked.add(model_id)
+        self._notify_capacity_changed()
+
+    def unblock_bootstrap_admission(self, model_id: str) -> None:
+        self._bootstrap_blocked.discard(model_id)
+        self._notify_capacity_changed()
+
+    def is_model_loaded(self, model_id: str) -> bool:
+        manager = self._managers.get(model_id)
+        return manager is not None and manager.state in {
+            ModelState.LOADING, ModelState.READY, ModelState.UNLOADING,
+        }
+
+    def _admitted_model(self, model_id: str) -> ModelDefinition:
+        if model_id in self._bootstrap_blocked or model_id in self._draining:
+            raise ModelDrainingError(
+                f"Le modèle '{model_id}' est fermé par une transition administrative."
+            )
+        model = self._registry.get(model_id)
+        if model is None:
+            raise LookupError(f"Modèle inconnu : '{model_id}'. Consultez GET /admin/models.")
+        if not model.enabled:
+            raise PermissionError(
+                f"Le modèle '{model_id}' est désactivé dans le registre. "
+                f"Activez-le via PATCH /admin/models/{model_id}."
+            )
+        return model
+
+    async def _ensure_model_loaded_locked(self, model_id: str) -> ServerManager:
         """
         Garantit qu'un modèle est chargé et retourne son ServerManager.
 
@@ -185,30 +228,17 @@ class LocalModelManager:
            alloue un port et crée le ServerManager.
         4. Attend le chargement hors du lock.
         """
-        model = self._registry.get(model_id)
-        if model is None:
-            raise LookupError(f"Modèle inconnu : '{model_id}'. Consultez GET /admin/models.")
-        if not model.enabled:
-            raise PermissionError(
-                f"Le modèle '{model_id}' est désactivé dans le registre. "
-                f"Activez-le via PATCH /admin/models/{model_id}."
-            )
+        model = self._admitted_model(model_id)
 
         force_extra_eviction = False
         last_error: Exception | None = None
         for attempt in range(2):
-            # Quarantaine : un déchargement admin drain ce modèle. Admettre une
-            # nouvelle requête ici repousserait indéfiniment la fin du drain (et
-            # la requête serait de toute façon coupée par le déchargement).
-            if model_id in self._draining:
-                raise ModelDrainingError(
-                    f"Le modèle '{model_id}' est en cours de déchargement "
-                    f"administratif — réessayez dans quelques secondes."
-                )
+            model = self._admitted_model(model_id)
 
             manager = self._managers.get(model_id)
             if manager and manager.state == ModelState.READY:
                 await manager.ensure_loaded()
+                self._admitted_model(model_id)
                 return manager
 
             async with self._capacity_cond:
@@ -217,6 +247,7 @@ class LocalModelManager:
                     pass
                 else:
                     await self._ensure_capacity(model, force_extra_eviction=force_extra_eviction)
+                    model = self._admitted_model(model_id)
 
                     port = self._port_pool.pop(0)
                     self._allocated_ports[model_id] = port
@@ -237,6 +268,7 @@ class LocalModelManager:
 
             try:
                 await manager.ensure_loaded()
+                self._admitted_model(model_id)
                 return manager
             except Exception as exc:
                 last_error = exc
@@ -291,6 +323,7 @@ class LocalModelManager:
         deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
         try:
             while True:
+                self._admitted_model(model.id)
                 is_turn = ticket is None and not self._capacity_waiters
                 is_turn = is_turn or (
                     ticket is not None
@@ -493,6 +526,21 @@ class LocalModelManager:
     # ── Actions admin ─────────────────────────────────────────────────────────
 
     async def unload_model(
+        self,
+        model_id: str,
+        *,
+        force: bool = False,
+        drain_timeout: float | None = None,
+    ) -> None:
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            await self._unload_model_locked(
+                model_id,
+                force=force,
+                drain_timeout=drain_timeout,
+            )
+
+    async def _unload_model_locked(
         self,
         model_id: str,
         *,

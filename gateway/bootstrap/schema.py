@@ -136,9 +136,39 @@ PLAN_ACTIONS: frozenset[str] = frozenset({
 # attrape une valeur sensible rangée sous un nom innocent.
 
 _SECRET_KEY_RE = re.compile(
-    r"(SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE_?KEY|_KEY$|^KEY$)",
+    r"(SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE_?KEY|_KEY$|^KEY$)",
     re.IGNORECASE,
 )
+
+# `token` a besoin d'un filet à lui, et ancré. Dans une passerelle LLM, un jeton
+# est d'abord une unité de facturation : §9 exige de publier
+# `prompt_tokens_per_second`, §11 des compteurs de jetons, §10 un temps jusqu'au
+# premier jeton. Le motif non ancré d'origine frappait `completion_tokens`,
+# `max_tokens` et `tokens_per_second` en sous-chaîne, si bien que le rapport de
+# §9 était littéralement impubliable : `render_*()` refusait de le rendre.
+# Défaut trouvé indépendamment par AUT-007, AUT-008 et AUT-011 — trois chantiers
+# qui ont chacun dû le contourner avant qu'on le corrige ici.
+#
+# L'ancrage sur les frontières de composant laisse passer le pluriel (un compte)
+# et retient le singulier (un porteur d'authentification) : `access_token`,
+# `hf_token`, `token_file` restent des fuites.
+_TOKEN_KEY_RE = re.compile(r"(^|_)TOKEN(_|$)", re.IGNORECASE)
+
+# Les mesures dont le nom porte « token » au singulier. Ce sont des durées et
+# des comptages, pas des porteurs d'authentification. Cette liste est volontaire :
+# un nom qu'elle ne prévoit pas bloque la publication au lieu de fuir — le mode
+# de dégradation est bruyant, jamais silencieux.
+_TOKEN_METRIC_RE = re.compile(
+    r"(^|_)(FIRST_TOKEN|TOKEN_COUNT|TOKEN_USAGE|TOKEN_LATENCY)(_|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive_field_name(name: str) -> bool:
+    """Le nom de champ annonce-t-il un secret ? Voir les trois motifs ci-dessus."""
+    if _SECRET_KEY_RE.search(name):
+        return True
+    return bool(_TOKEN_KEY_RE.search(name)) and not _TOKEN_METRIC_RE.search(name)
 
 # Champs dont le nom déclenche `_SECRET_KEY_RE` mais qui ne portent, par
 # construction, aucune valeur : un booléen de présence est la façon RECOMMANDÉE
@@ -746,7 +776,7 @@ def _walk_for_secrets(node: Any, path: str, leaks: list[str]) -> None:
     if isinstance(node, dict):
         for key, value in node.items():
             child = f"{path}.{key}" if path else str(key)
-            if _SECRET_KEY_RE.search(str(key)) and not isinstance(value, _SECRET_KEY_ALLOWED_TYPES):
+            if _is_sensitive_field_name(str(key)) and not isinstance(value, _SECRET_KEY_ALLOWED_TYPES):
                 leaks.append(
                     f"{child} : champ au nom sensible portant une valeur "
                     f"({type(value).__name__}) — n'exposer qu'un booléen de présence"

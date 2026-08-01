@@ -8,9 +8,12 @@ avec l'API OpenAI.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -18,6 +21,7 @@ from fastapi.responses import JSONResponse
 import database as db
 from auth import require_admin
 from config import settings
+from model_registry import ModelDefinition, ModelRegistry, RegistrySnapshot
 from model_manager import (
     CapacityQueueFull,
     CapacityQueueTimeout,
@@ -25,6 +29,7 @@ from model_manager import (
     model_manager,
 )
 from schemas import (
+    BootstrapModelSync,
     GatewayStatus,
     KeyCreate,
     KeyCreateResponse,
@@ -44,6 +49,27 @@ from schemas import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@dataclass
+class _BootstrapLiveState:
+    """État volontairement local au worker d'une activation provisoire."""
+
+    manager: object
+    registry: ModelRegistry
+    baseline: RegistrySnapshot
+    live_model: ModelDefinition
+    activate_digest: str
+    vram_gb: float
+    lease_seconds: int
+    phase: str = "active"
+    terminal_digest: str | None = None
+    watchdog: asyncio.Task[None] | None = None
+
+
+_bootstrap_sync_locks: dict[tuple[int, str], asyncio.Lock] = {}
+_bootstrap_sync_states: dict[tuple[int, str], _BootstrapLiveState] = {}
+_bootstrap_lease_sleep = asyncio.sleep
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -103,7 +129,12 @@ def _unload_conflict_detail(exc: Exception) -> str | None:
     return None
 
 
-async def _unload_for_admin(model_id: str, *, force: bool = False) -> None:
+async def _unload_for_admin(
+    model_id: str,
+    *,
+    force: bool = False,
+    manager: object | None = None,
+) -> None:
     """
     Décharge un modèle pour le compte d'une route admin.
 
@@ -112,17 +143,18 @@ async def _unload_for_admin(model_id: str, *, force: bool = False) -> None:
     déchargement. Le corps d'erreur reste au format admin habituel
     (`{"detail": "<message actionnable>"}`), pas au format OpenAI des routes /v1.
     """
-    supports_force = getattr(model_manager, "supports_unload_force", False)
+    target_manager = model_manager if manager is None else manager
+    supports_force = getattr(target_manager, "supports_unload_force", False)
 
     try:
         if supports_force:
-            await model_manager.unload_model(model_id, force=force)
+            await target_manager.unload_model(model_id, force=force)
         else:
             # Mode cluster : aucun chemin de forçage n'existe (les node-agents
             # refusent tout modèle avec des requêtes actives). On tente le
             # déchargement normal — force=true n'a de conséquence que sur un
             # modèle occupé, cas traité ci-dessous.
-            await model_manager.unload_model(model_id)
+            await target_manager.unload_model(model_id)
     except RuntimeError as exc:
         detail = _unload_conflict_detail(exc)
         if detail is None:
@@ -156,6 +188,164 @@ def _max_model_capacity_gb() -> float | None:
     return max(capacities, default=None)
 
 
+def _bootstrap_key(model_id: str) -> tuple[int, str]:
+    return id(model_manager), model_id
+
+
+def _reject_detectable_multi_worker() -> None:
+    """Refuse le protocole si un environnement multi-worker est détectable."""
+    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        try:
+            workers = int(raw)
+        except ValueError:
+            continue
+        if workers > 1:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "bootstrap-sync exige exactement un worker gateway : son état "
+                    f"provisoire est en mémoire, mais {name}={workers}. Utilisez "
+                    "l'unité systemd officielle (--workers 1)."
+                ),
+            )
+
+
+def _read_bootstrap_snapshot(
+    registry: ModelRegistry,
+    expected_digest: str,
+) -> RegistrySnapshot:
+    try:
+        snapshot = registry.read_snapshot()
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Registre models.yaml illisible ou invalide : {exc}",
+        ) from exc
+    if snapshot.sha256 != expected_digest:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Digest models.yaml divergent : "
+                f"attendu {expected_digest}, publié {snapshot.sha256}."
+            ),
+        )
+    return snapshot
+
+
+def _require_current_snapshot(
+    registry: ModelRegistry,
+    snapshot: RegistrySnapshot,
+) -> None:
+    if not registry.snapshot_is_current(snapshot):
+        raise HTTPException(
+            status_code=409,
+            detail="models.yaml a muté concurremment pendant bootstrap-sync.",
+        )
+
+
+def _require_same_non_target_models(
+    left: Mapping[str, ModelDefinition],
+    right: Mapping[str, ModelDefinition],
+    model_id: str,
+) -> None:
+    left_other = {key: value for key, value in left.items() if key != model_id}
+    right_other = {key: value for key, value in right.items() if key != model_id}
+    if left_other != right_other:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Transition refusée : divergence concurrente sur une entrée "
+                "models.yaml non ciblée."
+            ),
+        )
+
+
+def _cancel_bootstrap_watchdog(state: _BootstrapLiveState) -> None:
+    task = state.watchdog
+    state.watchdog = None
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    if task is not None and task is not current:
+        task.cancel()
+
+
+async def _bootstrap_lease_watchdog(
+    key: tuple[int, str],
+    model_id: str,
+    state: _BootstrapLiveState,
+) -> None:
+    """Expire une activation orpheline en fermant l'admission avant le drain."""
+    try:
+        await _bootstrap_lease_sleep(state.lease_seconds)
+    except asyncio.CancelledError:
+        return
+
+    lock = _bootstrap_sync_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        if _bootstrap_sync_states.get(key) is not state or state.phase != "active":
+            return
+
+        manager = state.manager
+        manager.block_bootstrap_admission(model_id)
+        state.registry.publish_snapshot(state.baseline)
+        state.phase = "rolling_back"
+        state.watchdog = None
+        try:
+            # Le gate et enabled=false sont déjà publiés : même si le drain
+            # échoue, aucune nouvelle requête ne peut entrer.
+            await _unload_for_admin(model_id, manager=manager)
+        except HTTPException as exc:
+            log.error(
+                "Lease bootstrap expirée pour '%s' : admission fermée, "
+                "déchargement à retenter (%s).",
+                model_id,
+                exc.detail,
+            )
+            return
+
+        state.phase = "rolled_back"
+        state.terminal_digest = state.baseline.sha256
+        manager.unblock_bootstrap_admission(model_id)
+        log.warning(
+            "Lease bootstrap expirée pour '%s' : activation mémoire annulée.",
+            model_id,
+        )
+
+
+def _refuse_provisional_mutation(model_id: str) -> None:
+    state = _bootstrap_sync_states.get(_bootstrap_key(model_id))
+    if state is not None and state.phase in {"active", "rolling_back"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Le modèle '{model_id}' est dans une transition bootstrap "
+                f"provisoire ({state.phase}); utilisez bootstrap-sync."
+            ),
+        )
+
+
+def _refuse_registry_mutation_during_bootstrap() -> None:
+    manager_id = id(model_manager)
+    active = [
+        model_id
+        for (state_manager_id, model_id), state in _bootstrap_sync_states.items()
+        if state_manager_id == manager_id and state.phase in {"active", "rolling_back"}
+    ]
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Mutation du registre refusée pendant une transition bootstrap "
+                f"provisoire : {', '.join(sorted(active))}."
+            ),
+        )
+
+
 # ── Statut système multi-modèles ──────────────────────────────────────────────
 
 @router.get("/status", response_model=GatewayStatus)
@@ -176,6 +366,277 @@ async def list_models(_: None = Depends(require_admin)) -> list[dict]:
     return model_manager.status()["models"]
 
 
+@router.post("/models/{model_id}/bootstrap-sync")
+async def bootstrap_sync_model(
+    model_id: str,
+    body: BootstrapModelSync,
+    _: None = Depends(require_admin),
+) -> dict:
+    """
+    Synchronise l'activation live provisoire du bootstrap, sans écrire le YAML.
+
+    Cette machine d'état est strictement mono-worker : l'activation provisoire,
+    son lock et sa lease vivent dans la mémoire du processus. Les unités systemd
+    officielles lancent donc uvicorn avec ``--workers 1``. Un crash gateway reste
+    fail-closed, car le disque conserve ``enabled: false`` jusqu'à ``confirm``.
+    """
+    _reject_detectable_multi_worker()
+    registry = model_manager.registry
+    key = _bootstrap_key(model_id)
+    lock = _bootstrap_sync_locks.setdefault(key, asyncio.Lock())
+
+    async with lock:
+        snapshot = _read_bootstrap_snapshot(registry, body.digest)
+        disk_models = snapshot.by_id()
+        disk_model = disk_models.get(model_id)
+        if disk_model is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Le snapshot publié ne contient pas le modèle cible '{model_id}'.",
+            )
+
+        state = _bootstrap_sync_states.get(key)
+
+        if body.action == "activate":
+            if body.vram_gb is None or body.lease_seconds is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="activate exige vram_gb et lease_seconds.",
+                )
+
+            if state is not None and state.phase == "active":
+                if (
+                    state.activate_digest != body.digest
+                    or state.vram_gb != body.vram_gb
+                    or state.lease_seconds != body.lease_seconds
+                    or disk_model != state.baseline.get(model_id)
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Activation provisoire déjà ouverte avec un digest, "
+                            "une VRAM ou une lease différents."
+                        ),
+                    )
+                _require_same_non_target_models(
+                    state.baseline.by_id(), disk_models, model_id,
+                )
+                memory = registry.memory_models()
+                _require_same_non_target_models(
+                    state.baseline.by_id(), memory, model_id,
+                )
+                if memory.get(model_id) != state.live_model:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="L'état mémoire provisoire du modèle cible a divergé.",
+                    )
+                _require_current_snapshot(registry, snapshot)
+                return {
+                    "model_id": model_id,
+                    "phase": "active",
+                    "digest": body.digest,
+                    "lease_seconds": state.lease_seconds,
+                    "idempotent": True,
+                }
+
+            if state is not None and state.phase not in {"rolled_back", "confirmed"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Transition activate interdite depuis l'état '{state.phase}'.",
+                )
+            if disk_model.enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="activate exige que l'entrée disque cible soit enabled: false.",
+                )
+
+            memory = registry.memory_models()
+            _require_same_non_target_models(memory, disk_models, model_id)
+            memory_target = memory.get(model_id)
+            if memory_target is not None and memory_target != disk_model:
+                raise HTTPException(
+                    status_code=409,
+                    detail="L'entrée mémoire cible a divergé du snapshot disque désactivé.",
+                )
+            if model_manager.is_model_loaded(model_id):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Le modèle cible est déjà chargé hors transition provisoire.",
+                )
+
+            budget = _max_model_capacity_gb()
+            if budget is not None and body.vram_gb > budget:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"vram_gb ({body.vram_gb:.1f} GB) dépasse la capacité "
+                        f"effective maximale ({budget:.1f} GB)."
+                    ),
+                )
+
+            _require_current_snapshot(registry, snapshot)
+            live_model = replace(
+                disk_model,
+                enabled=True,
+                vram_gb=body.vram_gb,
+            )
+            registry.publish_snapshot(snapshot, overrides={model_id: live_model})
+            if not registry.snapshot_is_current(snapshot):
+                # Une publication concurrente a gagné dans l'étroite fenêtre
+                # contrôle/publication : revenir immédiatement à disabled.
+                registry.publish_snapshot(snapshot)
+                raise HTTPException(
+                    status_code=409,
+                    detail="models.yaml a muté pendant la publication mémoire.",
+                )
+
+            model_manager.unblock_bootstrap_admission(model_id)
+            state = _BootstrapLiveState(
+                manager=model_manager,
+                registry=registry,
+                baseline=snapshot,
+                live_model=live_model,
+                activate_digest=body.digest,
+                vram_gb=body.vram_gb,
+                lease_seconds=body.lease_seconds,
+            )
+            _bootstrap_sync_states[key] = state
+            state.watchdog = asyncio.create_task(
+                _bootstrap_lease_watchdog(key, model_id, state),
+                name=f"bootstrap-lease-{model_id}",
+            )
+            return {
+                "model_id": model_id,
+                "phase": "active",
+                "digest": body.digest,
+                "lease_seconds": body.lease_seconds,
+                "idempotent": False,
+            }
+
+        if state is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Aucune activation provisoire connue pour '{model_id}'.",
+            )
+
+        if body.action == "rollback":
+            if state.phase == "rolled_back":
+                if state.terminal_digest != body.digest:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Rollback déjà terminé avec un autre digest.",
+                    )
+                if disk_model != state.baseline.get(model_id):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Le modèle disque ne correspond plus au rollback terminé.",
+                    )
+                _require_same_non_target_models(
+                    state.baseline.by_id(), disk_models, model_id,
+                )
+                _require_current_snapshot(registry, snapshot)
+                return {
+                    "model_id": model_id,
+                    "phase": "rolled_back",
+                    "digest": body.digest,
+                    "idempotent": True,
+                }
+            if state.phase not in {"active", "rolling_back", "confirmed"}:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Transition rollback interdite depuis l'état '{state.phase}'.",
+                )
+            if disk_model != state.baseline.get(model_id) or disk_model.enabled:
+                raise HTTPException(
+                    status_code=409,
+                    detail="rollback exige exactement l'entrée disque initiale disabled.",
+                )
+            _require_same_non_target_models(
+                state.baseline.by_id(), disk_models, model_id,
+            )
+            _require_same_non_target_models(
+                state.baseline.by_id(), registry.memory_models(), model_id,
+            )
+            _require_current_snapshot(registry, snapshot)
+
+            _cancel_bootstrap_watchdog(state)
+            # Ordre critique : fermer le gate ET publier enabled=false avant le
+            # premier await du drain. Une requête déjà pin reste intacte.
+            model_manager.block_bootstrap_admission(model_id)
+            registry.publish_snapshot(snapshot)
+            state.phase = "rolling_back"
+            try:
+                await _unload_for_admin(model_id, manager=model_manager)
+            except HTTPException:
+                # Fail-closed : le gate reste fermé jusqu'à un retry explicite.
+                raise
+            _require_current_snapshot(registry, snapshot)
+            state.phase = "rolled_back"
+            state.terminal_digest = body.digest
+            model_manager.unblock_bootstrap_admission(model_id)
+            return {
+                "model_id": model_id,
+                "phase": "rolled_back",
+                "digest": body.digest,
+                "idempotent": False,
+            }
+
+        if state.phase == "confirmed":
+            if state.terminal_digest != body.digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Confirmation déjà terminée avec un autre digest.",
+                )
+            if disk_model != state.live_model:
+                raise HTTPException(
+                    status_code=409,
+                    detail="L'entrée disque ne correspond plus à la confirmation terminée.",
+                )
+            _require_same_non_target_models(
+                state.baseline.by_id(), disk_models, model_id,
+            )
+            _require_current_snapshot(registry, snapshot)
+            return {
+                "model_id": model_id,
+                "phase": "confirmed",
+                "digest": body.digest,
+                "idempotent": True,
+            }
+        if state.phase != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Transition confirm interdite depuis l'état '{state.phase}'.",
+            )
+        if not disk_model.enabled or disk_model != state.live_model:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "confirm exige une entrée disque enabled: true exactement "
+                    "cohérente avec l'activation provisoire calibrée."
+                ),
+            )
+        _require_same_non_target_models(state.baseline.by_id(), disk_models, model_id)
+        memory = registry.memory_models()
+        _require_same_non_target_models(state.baseline.by_id(), memory, model_id)
+        if memory.get(model_id) != state.live_model:
+            raise HTTPException(
+                status_code=409,
+                detail="L'état mémoire cible a divergé avant confirmation.",
+            )
+        _require_current_snapshot(registry, snapshot)
+        _cancel_bootstrap_watchdog(state)
+        registry.publish_snapshot(snapshot)
+        state.phase = "confirmed"
+        state.terminal_digest = body.digest
+        model_manager.unblock_bootstrap_admission(model_id)
+        return {
+            "model_id": model_id,
+            "phase": "confirmed",
+            "digest": body.digest,
+            "idempotent": False,
+        }
+
+
 @router.post("/models", response_model=ModelStatusResponse, status_code=201)
 async def register_model(
     body: ModelEntryCreate,
@@ -192,6 +653,7 @@ async def register_model(
     - vram_gb doit tenir sur au moins un hôte d'inférence connu
     - Le modèle n'est PAS chargé automatiquement après enregistrement
     """
+    _refuse_registry_mutation_during_bootstrap()
     # En cluster les GGUF vivent sur les nœuds, pas nécessairement sur
     # l'orchestrateur. Le node-agent valide existence, lisibilité et intégrité
     # avant de réserver un port ou de lancer llama-server.
@@ -269,6 +731,7 @@ async def update_model(
     requêtes sont encore actives après le drain, et le registre n'est alors PAS
     modifié (jamais de `enabled: false` persisté sur un modèle qui sert encore).
     """
+    _refuse_registry_mutation_during_bootstrap()
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
 
@@ -305,6 +768,9 @@ async def update_model(
     if unload_reason:
         await _unload_for_admin(model_id, force=force)
 
+    # L'unload contient des await : une activation provisoire a pu démarrer
+    # entre le premier contrôle et la mutation persistante.
+    _refuse_registry_mutation_during_bootstrap()
     try:
         model = model_manager.registry.update(model_id, **updates)
     except (KeyError, ValueError) as exc:
@@ -341,6 +807,7 @@ async def delete_model(
     Refusé en 409 si le modèle traite encore des requêtes après le drain : dans
     ce cas le modèle reste dans le registre et continue de servir.
     """
+    _refuse_registry_mutation_during_bootstrap()
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
 
@@ -348,6 +815,9 @@ async def delete_model(
     # Un refus lève une 409 ici même : le registre n'est pas touché.
     await _unload_for_admin(model_id, force=force)
 
+    # Même recheck qu'au PATCH : ne jamais supprimer le YAML sous une
+    # activation qui aurait gagné pendant l'await du drain.
+    _refuse_registry_mutation_during_bootstrap()
     try:
         model_manager.registry.remove(model_id)
     except KeyError as exc:
@@ -401,6 +871,7 @@ async def unload_model(
     requêtes à l'expiration, la route répond 409 et le modèle reste chargé et
     utilisable — aucune génération n'est interrompue en silence.
     """
+    _refuse_provisional_mutation(model_id)
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
 
@@ -418,6 +889,7 @@ async def unload_all(_: None = Depends(require_admin)) -> dict:
     modèle n'est déchargé dans ce cas. Il n'y a pas de forçage global : utiliser
     POST /admin/models/{id}/unload?force=true modèle par modèle.
     """
+    _refuse_registry_mutation_during_bootstrap()
     try:
         await model_manager.unload_all_models()
     except RuntimeError as exc:
