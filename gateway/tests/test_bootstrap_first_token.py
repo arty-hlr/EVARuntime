@@ -26,6 +26,7 @@ import pytest
 
 from bootstrap import execution as ex
 from bootstrap import first_token as ft
+from bootstrap import registry_writer as rw
 from bootstrap import schema
 from bootstrap import warmup as wu
 
@@ -770,6 +771,27 @@ def test_l_application_reelle_exige_un_admin_secret():
 def _preuve_valide() -> dict:
     horloge = FakeClock()
     return run_recipe(FakeGateway(horloge), make_settings(), horloge).proof()
+
+
+def test_la_preuve_satisfait_le_contrat_du_consommateur():
+    """
+    La recette n'a qu'un consommateur : `registry_writer.SmokeTestProof`.
+
+    Le jeu de clés vient de LUI, pas d'une liste recopiée ici : c'est la seule
+    forme de ce test qui tombe le jour où la preuve reperd un champ. `endpoint`
+    en particulier — sans lui, AUT-007 ne peut pas vérifier que la génération a
+    traversé le chemin public, et rien dans ce fichier ne le signalait.
+    """
+    preuve = _preuve_valide()
+    assert rw.SMOKE_TEST_PROOF_KEYS <= set(preuve), sorted(
+        rw.SMOKE_TEST_PROOF_KEYS - set(preuve)
+    )
+    assert rw.SMOKE_TEST_PROOF_KEYS                                # contrôle positif
+    volet = rw.SmokeTestProof.from_mapping(
+        {k: preuve[k] for k in rw.SMOKE_TEST_PROOF_KEYS}
+    )
+    assert volet.endpoint == ft.GENERATION_PATH
+    assert volet.http_status == 200
 
 
 def test_preuve_valide_autorise_le_modele_exerce():

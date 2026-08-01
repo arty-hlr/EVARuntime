@@ -38,6 +38,7 @@ import pytest
 
 from bootstrap import calibration as cal
 from bootstrap import execution as ex
+from bootstrap import registry_writer as rw
 from bootstrap import schema as sc
 
 GIB = 1024 ** 3
@@ -279,6 +280,31 @@ def _executer(sondes: Sondes, tmp_path: Path, *, mode=ex.ExecutionMode.APPLY,
 def _calibrer(sondes: Sondes, tmp_path: Path, **kwargs) -> cal.CalibrationReport:
     options = _options(sondes, tmp_path / "rapports", **kwargs)
     return asyncio.run(cal.calibrate(MODELE, options, _contexte(tmp_path, horloge=sondes.horloge)))
+
+
+# ══ Contrat consommateur ══════════════════════════════════════════════════════
+
+def test_le_bloc_de_preuve_satisfait_le_contrat_du_consommateur(tmp_path):
+    """
+    AUT-007 n'active un modèle que sur `ActivationProof`, et son volet de
+    calibration déclare les clés qu'il exige. Ce test-ci ne compare pas deux
+    listes écrites à la main : il prend le jeu de clés du CONSOMMATEUR et le
+    confronte à ce que ce module publie RÉELLEMENT.
+
+    Sans lui, retirer une clé du bloc ne faisait tomber aucun test ici — le
+    défaut ne serait apparu qu'à l'activation, sur un hôte de production.
+    """
+    bloc = _calibrer(Sondes(), tmp_path).to_dict()["calibration"]
+    assert rw.CALIBRATION_PROOF_KEYS <= set(bloc), sorted(
+        rw.CALIBRATION_PROOF_KEYS - set(bloc)
+    )
+    # Contrôle positif : le jeu de clés du consommateur n'est pas vide, et la
+    # preuve construite depuis la projection est acceptée telle quelle.
+    assert rw.CALIBRATION_PROOF_KEYS
+    preuve = rw.CalibrationProof.from_mapping(
+        {k: bloc[k] for k in rw.CALIBRATION_PROOF_KEYS}
+    )
+    assert preuve.model_id == MODELE
 
 
 # ══ Empreintes ════════════════════════════════════════════════════════════════

@@ -729,6 +729,24 @@ def _step_matches(step: schema.PlanStep, request: RuntimeInstallRequest) -> str 
     return None
 
 
+def covers_step(request: RuntimeInstallRequest, step: schema.PlanStep) -> bool:
+    """
+    Cette étape désigne-t-elle l'artefact de CETTE décision de runtime ?
+
+    Existe parce que `verify_artifact` est une action à DEUX domaines : le
+    planificateur l'émet une fois pour l'archive de `llama-server` et une fois
+    par ensemble de GGUF, avec deux grammaires de cible incompatibles. Un
+    registre n'admettant qu'un exécuteur par action, l'applicateur doit trancher
+    lui-même, et il doit le faire sur une question posée par le module qui
+    possède la décision — pas en devinant la forme d'une chaîne chez lui.
+
+    Fail-closed : une décision sans manifeste ni variante ne couvre rien.
+    """
+    if request.resolution.manifest is None or request.resolution.variant is None:
+        return False
+    return _step_matches(step, request) is None
+
+
 # ── Exécuteur ─────────────────────────────────────────────────────────────────
 
 class RuntimeInstaller:

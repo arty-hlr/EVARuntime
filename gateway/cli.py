@@ -683,5 +683,210 @@ def bootstrap_plan(
     raise typer.Exit(plan.exit_code(strict=strict))
 
 
+# ── Applicateur de bootstrap (AUT-006 → AUT-011, AUT-014) ─────────────────────
+
+@app.command("bootstrap-apply")
+def bootstrap_apply(
+    plan: str = typer.Argument(..., help="Plan JSON produit par `bootstrap-plan --json`"),
+    apply_for_real: bool = typer.Option(
+        False, "--apply",
+        help="APPLIQUER RÉELLEMENT. Sans ce drapeau, la commande se contente de simuler.",
+    ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Rapport d'installation JSON au lieu du texte"
+    ),
+    allowed_root: Optional[list[str]] = typer.Option(
+        None, "--allowed-root",
+        help="Répertoire que l'application a le droit de toucher (répétable, obligatoire)",
+    ),
+    catalog: Optional[str] = typer.Option(
+        None, "--catalog", help="Catalogue de modèles approuvés (défaut : celui du dépôt)"
+    ),
+    models_dir: Optional[str] = typer.Option(
+        None, "--models-dir", help="Volume où atterrissent les GGUF"
+    ),
+    registry: Optional[str] = typer.Option(
+        None, "--registry", help="models.yaml à écrire — va avec --runtime-version, "
+        "--hardware-fingerprint et --vram-budget-gb",
+    ),
+    runtime_version: Optional[str] = typer.Option(
+        None, "--runtime-version", help="Build de llama-server en service (ex. « b6042 »)"
+    ),
+    hardware_fingerprint: Optional[str] = typer.Option(
+        None, "--hardware-fingerprint", help="Empreinte matérielle de l'hôte (§9)"
+    ),
+    vram_budget_gb: float = typer.Option(
+        0.0, "--vram-budget-gb", help="Budget VRAM net de l'hôte, en Go"
+    ),
+):
+    """
+    Applique un plan d'amorçage relu — EN SIMULATION PAR DÉFAUT.
+
+    La simulation est le défaut et l'application demande `--apply` : un mode
+    d'exécution ne s'obtient jamais par omission d'argument. Une simulation
+    complète sort en 3, jamais en 0 — rien n'a été appliqué, et un script
+    d'exploitation ne doit pas pouvoir confondre les deux.
+
+    Le plan est relu par `execution.load_plan_file()`, qui refuse un document
+    d'une autre version de schéma, incohérent, non applicable, porteur de
+    bloqueurs ou exposant un secret. Aucune de ces barrières n'est réimplémentée
+    ici.
+
+    Le câblage est explicite : ce que les options ne fournissent pas n'est pas
+    exécutable, et la commande **refuse avant de commencer** plutôt que
+    d'abandonner le plan à mi-parcours. Trois actions n'ont aujourd'hui aucun
+    câblage possible depuis cette CLI — `install_runtime` (décision de runtime
+    non reconstituable depuis le document), `calibrate_model` (aucune sonde de
+    chargement n'existe dans le dépôt) et `smoke_test`/`warmup_model` (aucun
+    client HTTP concret n'est fourni pour leur contrat) : un plan qui les
+    contient est refusé en 2, avec la liste.
+
+    Exit codes : 0 installation complète, 1 échec ou plan inapplicable,
+    2 erreur d'usage / câblage incomplet, 3 partiel (dont toute simulation),
+    4 erreur interne de l'applicateur.
+    """
+    from pathlib import Path as _Path
+
+    from bootstrap import applier as applier_module
+    from bootstrap import catalog as _catalog
+    from bootstrap import downloader as _downloader
+    from bootstrap import execution as _execution
+    from bootstrap import install_report as _install_report
+    from bootstrap import registry_writer as _writer
+    from bootstrap import schema as _schema
+
+    roots = [r for r in (allowed_root or []) if r.strip()]
+    if not roots:
+        console.print(
+            "[red]--allowed-root est obligatoire :[/red] une liste vide n'autorise rien, et "
+            "elle ne signifie pas « pas de contrainte ». Déclarez explicitement les "
+            "répertoires que l'application a le droit de toucher."
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    registry_options = (registry, runtime_version, hardware_fingerprint)
+    if any(o is not None for o in registry_options) and not all(
+        o is not None for o in registry_options
+    ):
+        console.print(
+            "[red]--registry, --runtime-version et --hardware-fingerprint vont ensemble :[/red] "
+            "une entrée de registre écrite sans savoir quel build ni quel matériel la sert "
+            "ne pourra jamais être activée sur preuve."
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    try:
+        config = _build_applier_config(
+            applier_module=applier_module,
+            catalog_module=_catalog,
+            downloader_module=_downloader,
+            writer_module=_writer,
+            catalog_path=_Path(catalog) if catalog else None,
+            models_dir=_Path(models_dir) if models_dir else None,
+            registry_path=_Path(registry) if registry else None,
+            runtime_version=runtime_version,
+            hardware_fingerprint=hardware_fingerprint,
+            vram_budget_gb=vram_budget_gb,
+        )
+    except (_schema.PlanError, OSError, ValueError) as exc:
+        console.print(f"[red]Câblage refusé :[/red] {exc}")
+        raise typer.Exit(_schema.EXIT_USAGE)
+
+    mode = (
+        _execution.ExecutionMode.APPLY if apply_for_real
+        else _execution.ExecutionMode.DRY_RUN
+    )
+
+    try:
+        outcome = _run(applier_module.apply_plan_file(
+            _Path(plan), config, mode=mode, allowed_roots=[_Path(r) for r in roots],
+        ))
+        rendered = (
+            _install_report.render_install_json(outcome.install) if json_output
+            else _install_report.render_install_human(outcome.install)
+        )
+    except applier_module.ApplierUsageError as exc:
+        console.print(
+            "[red]Demande impossible à honorer :[/red] "
+            + _execution.redact_for_log(str(exc))
+        )
+        raise typer.Exit(_schema.EXIT_USAGE)
+    except _execution.PlanRefused as exc:
+        # Expurgé, et ce n'est pas de la prudence de principe : `PlanRefused`
+        # porte l'ORIGINE du plan, c'est-à-dire un chemin de fichier fourni par
+        # l'opérateur. Un plan déposé sous un nom qui contient un jeton faisait
+        # ressortir ce jeton dans le message de refus.
+        console.print("[red]Plan refusé :[/red] " + _execution.redact_for_log(str(exc)))
+        raise typer.Exit(_schema.EXIT_BLOCKED)
+    except Exception as exc:
+        # Ni le message ni le type ne sont recopiés d'un objet susceptible de
+        # porter un secret : `redact_for_log` expurge avant que quoi que ce soit
+        # n'atteigne la sortie ou le journal.
+        console.print(
+            "[red]bootstrap-apply a échoué :[/red] "
+            + _execution.redact_for_log(f"{type(exc).__name__}: {exc}")
+        )
+        raise typer.Exit(_schema.EXIT_ERROR)
+
+    if json_output:
+        # Écriture brute : le rendu rich reformaterait le document JSON.
+        sys.stdout.write(rendered + "\n")
+    else:
+        console.print(rendered, markup=False, highlight=False, soft_wrap=True)
+        for finding in outcome.findings:
+            console.print(
+                f"  · {finding.level} [{finding.code}] {finding.message}",
+                markup=False, highlight=False, soft_wrap=True,
+            )
+
+    raise typer.Exit(outcome.exit_code())
+
+
+def _build_applier_config(
+    *,
+    applier_module,
+    catalog_module,
+    downloader_module,
+    writer_module,
+    catalog_path,
+    models_dir,
+    registry_path,
+    runtime_version,
+    hardware_fingerprint,
+    vram_budget_gb,
+):
+    """
+    Construit le câblage à partir des options. Ce qui manque reste `None`.
+
+    Aucun repli : une option absente ne produit pas une configuration par défaut
+    qui ferait croire au câblage. C'est le contrôle de pré-vol de l'applicateur
+    qui refusera, en nommant les actions concernées.
+    """
+    download = None
+    catalog_entries: dict = {}
+    if models_dir is not None:
+        catalogue = catalog_module.load_catalog(catalog_path)
+        catalog_entries = {e.id: e.to_dict() for e in catalogue.plannable_entries()}
+        download = downloader_module.DownloadConfig(
+            catalog=catalogue, models_dir=models_dir
+        )
+
+    writer = None
+    if registry_path is not None:
+        writer = writer_module.WriterConfig(
+            registry_path=registry_path,
+            models_dir=models_dir if models_dir is not None else registry_path.parent,
+            allowed_model_dirs=(
+                (models_dir,) if models_dir is not None else (registry_path.parent,)
+            ),
+            runtime_version=runtime_version,
+            hardware_fingerprint=hardware_fingerprint,
+            vram_budget_gb=vram_budget_gb,
+            catalog_entries=catalog_entries,
+        )
+
+    return applier_module.ApplierConfig(download=download, writer=writer)
+
+
 if __name__ == "__main__":
     app()
