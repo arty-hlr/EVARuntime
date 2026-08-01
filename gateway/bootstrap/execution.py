@@ -334,7 +334,11 @@ class StepResult:
     target: str
     status: StepStatus
     summary: str
-    duration_ms: int = 0
+    # `None` signifie « l'exécuteur n'a rien mesuré » et laisse le lanceur
+    # renseigner la durée. C'est distinct de `0`, qui est une mesure honnête
+    # d'étape sub-milliseconde — la confusion des deux rendait indistinguables
+    # un exécuteur muet et un exécuteur rapide.
+    duration_ms: int | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
     findings: tuple[schema.Finding, ...] = ()
     error: str | None = None
@@ -354,7 +358,7 @@ class StepResult:
                 f"étape {self.order} : summary est obligatoire — un résultat sans "
                 "phrase française n'est pas lisible par l'opérateur"
             )
-        if (
+        if self.duration_ms is not None and (
             not isinstance(self.duration_ms, int)
             or isinstance(self.duration_ms, bool)
             or self.duration_ms < 0
@@ -393,7 +397,7 @@ class StepResult:
         *,
         status: StepStatus,
         summary: str,
-        duration_ms: int = 0,
+        duration_ms: int | None = None,
         evidence: dict[str, Any] | None = None,
         findings: tuple[schema.Finding, ...] = (),
         error: str | None = None,
@@ -428,7 +432,7 @@ class StepResult:
             "target": self.target,
             "status": self.status,
             "summary": self.summary,
-            "duration_ms": self.duration_ms,
+            "duration_ms": 0 if self.duration_ms is None else self.duration_ms,
             "evidence": self.evidence,
             "findings": [f.to_dict() for f in self.findings],
             "error": self.error,
@@ -569,6 +573,18 @@ class ExecutionReport:
                 for r in self.failures()
             ],
         }
+
+
+# Jeu de clés racine du rapport, fermé dans les deux sens : ce que `to_dict()`
+# émet est exactement ce que la validation accepte. Sans cette fermeture, un
+# rapport enrichi d'un « conclusion: tout est vert » que rien ne recoupe passait
+# la validation — même classe de trou que celle fermée en trois passes sur le
+# contrat du plan en vague 5.
+_DOCUMENT_KEYS: frozenset[str] = frozenset({
+    "tool", "schema_version", "plan_schema_version", "started_at", "finished_at",
+    "mode", "applied", "plan_fingerprint", "plan_generated_at", "verdict",
+    "exit_code", "counts", "results", "failures",
+})
 
 
 # ── Empreinte du plan ─────────────────────────────────────────────────────────
@@ -979,7 +995,7 @@ def _guard_result(
             step,
             status=STEP_FAILED,
             summary="l'exécuteur déclare avoir agi alors que le mode est la simulation",
-            duration_ms=result.duration_ms or mesure_ms,
+            duration_ms=mesure_ms if result.duration_ms is None else result.duration_ms,
             findings=(schema.Finding(
                 code="mutation_en_simulation",
                 level="fail",
@@ -997,7 +1013,7 @@ def _guard_result(
             step,
             status=STEP_FAILED,
             summary="l'exécuteur n'a fait que simuler alors que le mode est l'application",
-            duration_ms=result.duration_ms or mesure_ms,
+            duration_ms=mesure_ms if result.duration_ms is None else result.duration_ms,
             findings=(schema.Finding(
                 code="simulation_en_application",
                 level="fail",
@@ -1010,7 +1026,7 @@ def _guard_result(
             error="statut « would_apply » rendu en mode application",
         )
 
-    if result.duration_ms:
+    if result.duration_ms is not None:
         return result
     return StepResult(
         order=result.order,
@@ -1047,6 +1063,13 @@ def validate_execution_document(document: Any) -> tuple[str, ...]:
             f"tool doit valoir « {EXECUTION_TOOL_NAME} », reçu {document.get('tool')!r}"
         )
 
+    unknown = sorted(set(document) - _DOCUMENT_KEYS)
+    if unknown:
+        errors.append(
+            "clés inconnues à la racine du rapport : " + ", ".join(unknown)
+            + " — un champ que personne ne recoupe se lit comme une conclusion"
+        )
+
     version = document.get("schema_version")
     if not isinstance(version, int) or isinstance(version, bool):
         errors.append(f"schema_version doit être un entier, reçu {version!r}")
@@ -1054,6 +1077,21 @@ def validate_execution_document(document: Any) -> tuple[str, ...]:
         errors.append(
             f"schema_version {version} n'est pas celle de cet applicateur "
             f"({EXECUTION_SCHEMA_VERSION})"
+        )
+
+    # Le rapport atteste contre QUEL contrat de plan l'exécution a eu lieu.
+    # Le champ était émis mais jamais relu : un journal archivé annonçant une
+    # version de plan arbitraire validait sans une erreur, ce qui vidait
+    # l'attestation de son sens.
+    plan_version = document.get("plan_schema_version")
+    if not isinstance(plan_version, int) or isinstance(plan_version, bool):
+        errors.append(
+            f"plan_schema_version doit être un entier, reçu {plan_version!r}"
+        )
+    elif plan_version != schema.PLAN_SCHEMA_VERSION:
+        errors.append(
+            f"plan_schema_version {plan_version} n'est pas celle de ce contrat "
+            f"({schema.PLAN_SCHEMA_VERSION})"
         )
 
     for key in ("started_at", "finished_at", "plan_generated_at"):

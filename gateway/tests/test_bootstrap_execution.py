@@ -1056,3 +1056,72 @@ def test_redact_for_log_expurge_les_formes_de_secret_connues():
         assert valeur not in ex.redact_for_log(f"trace : {valeur}")
     # Contrôle positif : un message anodin traverse intact.
     assert ex.redact_for_log("téléchargement à 42 %") == "téléchargement à 42 %"
+
+
+# ── Trois trous fermés après revue des chantiers de la vague 6 ────────────────
+#
+# Les trois ont été trouvés par des chantiers qui consommaient ce contrat, pas
+# par ses propres tests. C'est la limite d'un contrat écrit avant ses usagers.
+
+def test_la_version_de_contrat_du_plan_est_recoupee():
+    """
+    Le rapport atteste contre QUEL contrat de plan l'exécution a eu lieu.
+
+    Le champ était émis mais jamais relu : un journal archivé annonçant
+    `plan_schema_version: 99` validait sans une erreur, ce qui vidait
+    l'attestation de son sens. Trouvé par le chantier AUT-011.
+    """
+    document = _rendu()
+    # Contrôle positif : le document de référence est bien valide.
+    assert ex.validate_execution_document(document) == ()
+
+    for version in (sc.PLAN_SCHEMA_VERSION + 1, sc.PLAN_SCHEMA_VERSION - 1, "1", True, None):
+        falsifie = {**document, "plan_schema_version": version}
+        erreurs = ex.validate_execution_document(falsifie)
+        assert any("plan_schema_version" in e for e in erreurs), version
+
+
+def test_une_cle_racine_inconnue_est_refusee():
+    """
+    Un champ que personne ne recoupe se lit comme une conclusion.
+
+    Un rapport enrichi d'un « conclusion: tout est vert » passait la validation :
+    même classe de trou que celle fermée en trois passes sur le contrat du plan
+    en vague 5. Trouvé par le chantier AUT-011.
+    """
+    document = _rendu()
+    assert ex.validate_execution_document(document) == ()
+
+    erreurs = ex.validate_execution_document({**document, "conclusion": "tout est vert"})
+    assert any("conclusion" in e for e in erreurs), erreurs
+
+
+def test_une_duree_nulle_mesuree_nest_pas_ecrasee_par_le_lanceur():
+    """
+    `0 ms` est une mesure honnête d'étape sub-milliseconde ; « rien mesuré » ne
+    l'est pas. Les confondre rendait indistinguables un exécuteur muet et un
+    exécuteur rapide. Trouvé par le chantier AUT-008.
+    """
+    step = _steps(1)[0]
+
+    async def rapide(step, context):
+        return ex.StepResult.for_step(
+            step, status=ex.STEP_DONE, summary="immédiat", duration_ms=0
+        )
+
+    async def muet(step, context):
+        return ex.StepResult.for_step(step, status=ex.STEP_DONE, summary="sans mesure")
+
+    horloge = iter([0.0, 0.25, 0.0, 0.25])
+    context = _context(monotonic=lambda: next(horloge))
+
+    registre = ex.ExecutorRegistry()
+    registre.register(step.action, rapide)
+    plan = ex.load_plan_document(_text(_document(steps=(step,))))
+    assert _executer(plan, registre, context).results[0].duration_ms == 0
+
+    horloge2 = iter([0.0, 0.25])
+    registre2 = ex.ExecutorRegistry()
+    registre2.register(step.action, muet)
+    resultat = _executer(plan, registre2, _context(monotonic=lambda: next(horloge2)))
+    assert resultat.results[0].duration_ms == 250
