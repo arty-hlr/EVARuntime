@@ -19,11 +19,11 @@
 
 | | |
 |---|---|
-| **Où en est-on** | Jalon **M1 atteint** (§0.12). Le système sait désormais **expliquer ce qu'il installerait et pourquoi**, sans rien appliquer : `python cli.py bootstrap-plan` rend un plan versionné, validé, sans secret et lisible avant application. M0 était atteint, le premier déploiement réel sur deux VMs avait révélé 6 défauts invisibles en CI (§0.10), tous fermés (§0.11) |
+| **Où en est-on** | Jalon **M1 atteint** (§0.12), puis **second déploiement réel sur deux VMs** joué de bout en bout (§0.13) — il a exercé la vague 5 sur une vraie machine et produit 2 défauts neufs, plus 4 confirmations terrain d'items déjà ouverts. Le système sait désormais **expliquer ce qu'il installerait et pourquoi**, sans rien appliquer : `python cli.py bootstrap-plan` rend un plan versionné, validé, sans secret et lisible avant application. M0 était atteint, le premier déploiement réel sur deux VMs avait révélé 6 défauts invisibles en CI (§0.10), tous fermés (§0.11) |
 | **Ce qui vient ensuite** | Jalon **M2 — installation jusqu'au premier token** (§13) : c'est l'exécution du plan que M1 sait maintenant écrire. Lot D sécurité reste l'alternative selon arbitrage. **Plus aucun P0 ouvert dans les Lots A et B** |
 | **Santé des tests** | **1257 tests verts** (1194 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
-| **Reste à faire** | 36 items sur 63 (§0.3). Aucun P0 ouvert hors Lots C, D et E |
-| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10), pas sur GPU. Le plan de bootstrap n'a **jamais été appliqué** — c'est M2, pas M1 |
+| **Reste à faire** | 41 items sur 68 (§0.3). Aucun P0 ouvert hors Lots C, D et E |
+| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste déclarative. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), pas sur GPU. Le plan de bootstrap n'a **jamais été appliqué** — c'est M2, pas M1 |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
 décisions tranchées, §0.7 le journal des livraisons, §0.8, §0.10 et §0.12 les
@@ -34,8 +34,8 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir.
 
 | Champ | Valeur |
 |---|---|
-| Dernière mise à jour | 2026-07-31 |
-| Phase | **Vague 5 livrée** — le planificateur de bootstrap existe et est verrouillé par ses régressions (§0.12) |
+| Dernière mise à jour | 2026-07-31 (second déploiement réel) |
+| Phase | **Vague 5 livrée et déployée** — le planificateur existe, est verrouillé par ses régressions (§0.12) et a été exercé sur deux VMs réelles (§0.13) |
 | Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
 | Jalon visé | **M2 — installation jusqu'au premier token** (§13) |
 | Branche de travail | `feat/lot-b-vague5-planificateur-bootstrap` (créée depuis `feat/lot-a-vague4-retours-deploiement` @ `9af8172`) |
@@ -72,28 +72,30 @@ vérifiée par `bash -n`, à compléter avec EVA-044.
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[–]` Annulé |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 17 | 11 | 0 | 5 | 1 |
-| B — bootstrap automatisé | 13 | 7 | 0 | 6 | 0 |
+| A — bloqueurs et invariants | 19 | 11 | 0 | 7 | 1 |
+| B — bootstrap automatisé | 14 | 7 | 0 | 7 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
 | D — sécurité et supply-chain | 9 | 1 | 0 | 8 | 0 |
-| E — tests et exploitation | 16 | 4 | 1 | 9 | 2 |
-| **Total** | **63** | **23** | **1** | **36** | **3** |
+| E — tests et exploitation | 18 | 4 | 1 | 11 | 2 |
+| **Total** | **68** | **23** | **1** | **41** | **3** |
 
-Dix items ont été **ajoutés au backlog** après coup, d'où 63 au lieu de 53 :
+Quinze items ont été **ajoutés au backlog** après coup, d'où 68 au lieu de 53 :
 COR-014 (Lot A) et SEC-008 (Lot D) pendant l'implémentation (§0.8), puis
 COR-015 à COR-017 (Lot A) et TST-006, OPS-008, OPS-009 (Lot E) lors du premier
 déploiement réel sur deux VMs (§0.10), **OPS-010** (Lot E) né de la vague 4,
-enfin **SEC-009** (Lot D) né de la vague 5 (§0.12).
+**SEC-009** (Lot D) né de la vague 5 (§0.12), enfin **COR-018**, **COR-019**
+(Lot A), **AUT-014** (Lot B), **OPS-011** et **OPS-012** (Lot E) issus du second
+déploiement réel (§0.13).
 
 Les **8 items du jalon M0**, les **7 de la vague 4** et les **6 de la vague 5**
 sont terminés et vérifiés. Le seul `[~]` restant est **OPS-010**, dont la part
 venvs est livrée et testée mais dont la borne sur les sauvegardes
 `*.pre-migration.*.bak` reste à poser, sous OPS-002.
 
-**Il ne reste aucun P0 ouvert dans les Lots A et B.** Les 5 items restants du
-Lot A (COR-003, COR-008, COR-010, COR-012, COR-013) sont en P1/P2 ; les 6 du
-Lot B (AUT-006 → AUT-011) relèvent du jalon M2, c'est-à-dire de l'**exécution**
-du plan que la vague 5 sait désormais écrire.
+**Il ne reste aucun P0 ouvert dans les Lots A et B.** Les 7 items restants du
+Lot A (COR-003, COR-008, COR-010, COR-012, COR-013, COR-018, COR-019) sont en
+P1/P2 ; les 7 du Lot B (AUT-006 → AUT-011, AUT-014) relèvent du jalon M2,
+c'est-à-dire de l'**exécution** du plan que la vague 5 sait désormais écrire.
 
 ### 0.4 Vagues 1 à 3 — jalon M0 (historique)
 
@@ -188,6 +190,7 @@ M0 et seront tranchées à l'entrée des lots concernés.
 | 2026-07-31 | **M1** | `8e25616` | Les 2 suites + `ruff` sur les deux composants | **1243 réussis** (1180 / 63), jalon atteint 🔬 |
 | 2026-07-31 | AUT-001 | `c7a25c6` | `pytest tests -q` (gateway) + reproduction ciblée | 1193 réussis ; les six compteurs refusent booléens, flottants, valeurs négatives et clés hors contrat 🔬 |
 | 2026-07-31 | AUT-004 | `3fe1413` | Suite complète sous `GITHUB_ACTIONS=true`, puis sous Python 3.11 | **1194 réussis** ; échec CI-only fermé, un seul test dépendait de la colorisation 🔬 |
+| 2026-07-31 | — | `6e576a8` | **Second déploiement réel sur deux VMs Debian 13** (§0.13) | Vague 5 exercée sur machine réelle ; SHA-256 du catalogue conformes, premier token en local et en cluster, COR-004 et panne de nœud vérifiés ; 2 défauts neufs, 4 confirmations 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -594,6 +597,70 @@ Conditions de §13 et leur état :
 **Décision de sortie prononcée** : le système sait expliquer ce qu'il
 installerait et pourquoi. Le travail d'exécution (M2 : AUT-006 → AUT-011) peut
 démarrer sur une base qui décrit correctement son intention.
+
+### 0.13 Second déploiement réel sur deux VMs (2026-07-31)
+
+Second parcours complet joué hors CI, sur deux VM **Debian 13** neuves
+(4 vCPU, 3 Go de RAM, **sans GPU**, 26 Go libres) : `install.sh --mode local` sur
+EvR-A, `install-agent.sh` sur EvR-B, puis migration `update.sh --mode cluster
+--allow-mode-change`. `llama-server` **réellement compilé** (CPU, `GGML_CUDA=OFF`,
+clone complet → build **10210**, version lisible) et les **deux GGUF du catalogue
+d'amorçage** téléchargés à leur révision épinglée.
+
+Ce que ce run ajoute au précédent (§0.10) : il exerce pour la première fois la
+**vague 5** sur une machine réelle — `bootstrap-plan`, le catalogue, le résolveur
+de runtime et le lecteur de header GGUF n'avaient jamais tourné hors des tests.
+
+#### Ce que le run a validé 🔬
+
+| Objet | Résultat observé |
+|---|---|
+| **Empreintes du catalogue (AUT-005)** | Les deux GGUF téléchargés correspondent **au bit près** aux SHA-256 épinglés. Première vérification terrain — c'était la revendication la plus risquée de la vague |
+| **`bootstrap-plan` sans épinglage** | Bloqué, exit 1, **zéro étape** proposée |
+| **`bootstrap-plan` épinglé + `--llama-bin`** | Reconnaît le binaire en place (build 10210 ≥ plancher), 15 étapes, **837,1 Mio annoncés = 838 Mo réellement présents** |
+| **Lecture du header GGUF (AUT-013)** | Sur fichiers réels : `qwen2`, 24 blocs, 896 d'embedding, 14/2 têtes GQA, ctx 32768, 291 tenseurs, vocab 151936 |
+| **Refus du mode cluster (vague 5)** | Exit 2 avec la conduite à tenir |
+| Premier token via nginx + TLS | HTTP 200 en **5,09 s** à froid, réponse correcte |
+| SSE réellement non bufferisé | deltas espacés de ~70 ms |
+| Éviction LRU | chargement du second modèle → premier évincé |
+| **COR-004** | **409 après 5 s de drain borné, aucun modèle déchargé, flux survivant jusqu'au bout** (2004 deltas + `DONE`) |
+| OPS-009 | `nginx -t` silencieux ; `http2 on;` rendu **automatiquement** sur nginx 1.26.3 |
+| COR-009 | timeouts nginx dérivés du registre à 900 s |
+| OPS-008 | timer `active` et présent dans `list-timers` |
+| SEC-008 | 0 occurrence du nom d'utilisateur sur 105 lignes de journal, contrôle positif inclus |
+| OPS-010 | `venv` est un symlink, 1 release conservée |
+| Panne de nœud | offline après 3 heartbeats, **503 au format OpenAI**, `/ready` 503, retour en ligne et rechargement transparents |
+| Bascule cluster | `update.sh --allow-mode-change` : doctor avant/après + recette du premier token, exit 0 |
+| Recette autonome | SUCCÈS, TTFT 4 ms à chaud |
+
+Deux garde-fous se sont déclenchés **d'eux-mêmes, contre l'opérateur** : `doctor`
+a refusé de valider une clé TLS posée en 0640 au lieu de 0600, et `update.sh` a
+refusé un checkout git modifié.
+
+#### Défauts trouvés — deux nouveaux, quatre confirmés
+
+| Découverte | Preuve | Item |
+|---|---|---|
+| **`install-agent.sh` exige `rsync`, absent des prérequis documentés.** Le préflight le réclame et le script s'en sert deux fois, mais le mot n'apparaît **nulle part** dans `docs/deployment.md`. Sur une Debian 13 minimale il n'est pas installé : l'installation d'un nœud neuf échoue au premier écran. | Reproduit : `[ERREUR] Commande requise absente : rsync`, exit 1 🔬 | **OPS-011** |
+| **Le plan propose de télécharger des artefacts qu'il a lui-même détectés comme présents.** L'inspection GGUF locale est rattachée à chaque modèle retenu (`local_inspection` non nulle, header lu), et pourtant les étapes `download_model` sont émises avec leur volume complet. Un opérateur qui applique le plan re-télécharge 837 Mio pour rien. | Reproduit sur EvR-A, GGUF déjà présents et vérifiés 🔬 | **AUT-014** |
+| **`install.sh --mode local` exige toujours `nvidia-smi` sans échappatoire.** Deuxième run réel bloqué par ce préflight. Le §0.10 l'avait laissé « à trancher » ; deux bancs CPU s'y sont heurtés depuis. | Reproduit : le run a dû relâcher la ligne 149 du script pour installer 🔬 | **OPS-012** |
+| **La queue d'admission reste inerte en mode cluster.** `/v1/capacity` renvoie `enabled: false, status: unavailable` alors que `CAPACITY_QUEUE_ENABLED=true`. Contredit l'invariant annoncé par `AGENTS.md` : « le mode cluster garde le même comportement public que le mode local ». Déjà relevé au §0.10, toujours vrai. | Reproduit sur l'orchestrateur en cluster 🔬 | **COR-019** |
+| **`/admin/cluster` affiche encore les modèles d'un nœud hors ligne.** Pendant la panne, `online: false` et `consecutive_failures: 3` sont corrects, mais `loaded_models` continue d'annoncer un modèle chargé. Induit en erreur dans un diagnostic d'incident. Déjà relevé au §0.10. | Reproduit pendant la coupure du nœud 🔬 | **COR-018** |
+| **COR-008 confirmé** : le corps du 429 est `{"detail":{"error":{…}}}` — double enveloppe. Le 503 cluster, lui, est correctement `{"error":{…}}`. La divergence annoncée par l'item est donc bien réelle et visible côté client. | Reproduit avec un quota abaissé à 3 req/min 🔬 | COR-008 (existant) |
+| **SEC-001 confirmé** : le dashboard charge `cdn.jsdelivr.net` (chart.js) et `fonts.googleapis.com`. Il ne fonctionne pas hors ligne et adresse deux tiers à chaque ouverture. | Reproduit : 4 références externes dans le HTML servi 🔬 | SEC-001 (existant) |
+| **Debian 13 reste hors matrice de support.** Les deux runs réels ont eu lieu dessus ; `docs/deployment.md` §1 ne cite qu'Ubuntu 22.04/24.04. | Constat 📖 | Décision produit, toujours ouverte (§0.8) |
+
+#### Ce que ce run ne prétend pas avoir démontré
+
+- **Le rollback n'a pas été rejoué.** L'injection d'une régression volontaire a
+  été refusée par le garde-fou de l'environnement d'exécution, et le contournement
+  n'a pas été tenté. Le rollback reste validé par le run du 30/07 (§0.10), pas par
+  celui-ci.
+- **Toujours aucun GPU** : la VRAM reste déclarative, et le préflight `nvidia-smi`
+  a dû être relâché localement pour installer en mode local (voir OPS-012). Le
+  checkout a été remis en état avant la bascule cluster — `update.sh` l'a d'ailleurs
+  exigé.
+- **`update-agent.sh` n'a pas été exercé** : le nœud a été installé, pas mis à jour.
 
 ---
 
@@ -1462,7 +1529,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-005 | `[x]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
 | COR-006 | `[x]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
 | COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
-| COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
+| COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. **Reproduit sur hôte réel le 2026-07-31** (§0.13) : un 429 de quota rend `{"detail":{"error":{…}}}` alors qu'un 503 cluster rend correctement `{"error":{…}}`. La divergence est visible côté client, sur deux chemins d'erreur du même service. |
 | COR-009 | `[x]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. **Livré le 2026-07-30** : `/ready` et `/completion` étaient documentés sur l'URL publique mais retombaient en 404 côté nginx ; les timeouts sont désormais dérivés du `load_timeout_seconds` maximal du registre (900 s) au lieu des 30 s qui faisaient échouer tout pré-chargement admin en 504. |
 | COR-010 | `[ ]` | P1 | Corriger `revoke_key()` | `%` et `_` sont littéraux ou rejetés ; seconde révocation a un comportement défini. |
 | COR-011 | `[–]` | — | ~~Corriger le slot student abandonné~~ | Annulé : composant supprimé (DEC-009). |
@@ -1472,6 +1539,9 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-015 | `[x]` | P0 | Réparer le démarrage en mode cluster | `CLUSTER_MODE=cluster` démarre et sert ; la régression est verrouillée par TST-006. **Item ajouté le 2026-07-30** (§0.10). Correctif d'une ligne appliqué et vérifié sur VM (`n.node_id` → `n.id` dans `model_manager._build_manager()`), puis **verrouillé par TST-006** le 2026-07-30 : réintroduire `n.node_id` fait échouer 2 tests sur `AttributeError`. |
 | COR-016 | `[x]` | P0 | Rendre `update-agent.sh` capable de réussir | Une mise à jour de node-agent aboutit sans rollback, et la stratégie de venv est la même que celle de `update.sh` (construction à l'emplacement final, bascule par symlink) plutôt qu'un déplacement de venv. **Item ajouté le 2026-07-30** (§0.10). Contournement appliqué et vérifié sur VM (`ExecStart` via `python -m uvicorn`, conservé en défense en profondeur), puis **correctif structurel livré** le 2026-07-30 : le venv est construit à son emplacement définitif et `venv-agent` devient un symlink que l'on bascule, comme dans `update.sh`. Un agent installé par l'ancien script est migré en place, sans action opérateur. Test de non-régression : un exécutable de `bin/` doit rester lançable après la bascule. |
 | COR-017 | `[x]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10), **livré le même jour** : `reset-failed` avant chaque démarrage dans les 4 scripts de déploiement, et l'échec de redémarrage d'un rollback sort désormais en code 9 « INDISPONIBILITÉ », distinct du code 1 « version précédente restaurée et en service ». |
+
+| COR-018 | `[ ]` | P2 | Cesser d'annoncer les modèles d'un nœud hors ligne | Pendant qu'un nœud est `online: false`, `/admin/cluster` ne présente plus ses `loaded_models` comme chargés : la liste est vidée ou explicitement marquée `unavailable`, et un test le verrouille avec un contrôle positif prouvant qu'elle sait afficher des modèles quand le nœud est en ligne. **Item ajouté le 2026-07-31** (§0.13), relevé une première fois au §0.10 et reproduit depuis : `online: false`, `consecutive_failures: 3`, et pourtant un modèle encore annoncé chargé. Le drapeau est juste, la liste ment — et c'est la liste qu'on lit en incident. |
+| COR-019 | `[ ]` | P1 | Rendre la queue d'admission cohérente entre local et cluster | Soit la queue est portée en mode cluster et `/v1/capacity` y répond comme en local, soit son indisponibilité devient une **limite documentée** dans `docs/api.md` et `AGENTS.md`, dont la phrase « le mode cluster garde le même comportement public que le mode local » est alors amendée. Un test doit verrouiller le choix retenu. **Item ajouté le 2026-07-31** (§0.13) : `/v1/capacity` renvoie `enabled: false, status: unavailable` en cluster **malgré** `CAPACITY_QUEUE_ENABLED=true`. Un client qui interroge la capacité reçoit donc deux contrats publics différents selon une topologie qu'il ne connaît pas. |
 
 ### Lot B — bootstrap automatisé
 
@@ -1491,6 +1561,8 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | AUT-012 | `[x]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
 | AUT-013 | `[x]` | P1 | Inspecter les métadonnées GGUF | Architecture, tenseurs, contexte et KV alimentent une estimation conservatrice sans être présentés comme une mesure exacte. **Livré le 2026-07-31** : parseur maison en bibliothèque standard, bornes explicites sur chaque champ de longueur venu du fichier (un GGUF est une entrée non fiable), validé contre deux vrais headers récupérés par requête `Range`. Le mot « estimation » figure dans le nom des types, dans le rendu et dans la liste des facteurs ignorés. Paquet `gguf` officiel évalué puis écarté (`numpy` sur une machine vierge), conclusion écrite dans le docstring. |
 
+| AUT-014 | `[ ]` | P1 | Reconnaître un artefact déjà présent et vérifié | Quand un fichier du catalogue est **déjà présent** au chemin cible et que son SHA-256 correspond à l'entrée épinglée, le plan ne propose plus son téléchargement : l'étape devient une `verify_artifact` seule, le volume annoncé est décompté, et le motif est écrit dans le détail de l'étape. Un test doit couvrir les trois cas — absent, présent et conforme, présent mais **empreinte divergente** (qui doit rester bloquant, jamais silencieusement réutilisé). **Item ajouté le 2026-07-31** (§0.13), reproduit sur un hôte réel : le planificateur avait bien lu le header des deux GGUF présents — `local_inspection` non nulle — et proposait pourtant 837,1 Mio de téléchargement. L'information manquait au raisonnement, pas à la collecte. |
+
 ### Lot C — performance
 
 | ID | État | Priorité | Action | Critère d'acceptation |
@@ -1508,7 +1580,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
-| SEC-001 | `[ ]` | P0 | Vendoriser les assets admin et ajouter CSP | Dashboard fonctionnel hors ligne, aucune ressource tierce, CSP testée. |
+| SEC-001 | `[ ]` | P0 | Vendoriser les assets admin et ajouter CSP | Dashboard fonctionnel hors ligne, aucune ressource tierce, CSP testée. **Reproduit sur hôte réel le 2026-07-31** (§0.13) : le HTML servi porte 4 références externes — `cdn.jsdelivr.net` pour chart.js et `fonts.googleapis.com` pour deux polices. Sur un réseau sans sortie Internet, le dashboard d'administration est donc inutilisable au moment précis où l'on en a besoin. |
 | SEC-002 | `[ ]` | P0 | Durcir l'environnement généré | Allowlist modèle, CORS explicite et build minimum visibles dans le fichier généré. |
 | SEC-003 | `[ ]` | P0 | Verrouiller les dépendances | Installation reproductible, dépendances dev séparées, hashes ou artefacts contrôlés. |
 | SEC-004 | `[ ]` | P0 | Rendre l'audit CVE bloquant | Politique d'exception documentée avec expiration. |
@@ -1537,6 +1609,8 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-008 | `[x]` | P1 | Armer réellement le timer de sauvegarde | Après `install.sh` puis après `update.sh`, `systemctl is-active llm-gateway-backup.timer` retourne `active` et le timer apparaît dans `list-timers`, sans reboot et sans déclencher de sauvegarde immédiate avant l'initialisation de la base. **Item ajouté le 2026-07-30** (§0.10) : `enable` sans `--now` laissait la sauvegarde quotidienne inerte jusqu'au prochain redémarrage. |
 | OPS-009 | `[x]` | P2 | Moderniser les directives nginx livrées | `nginx -t` ne produit aucun avertissement de dépréciation sur les versions supportées (`http2 on;` au lieu de `listen … ssl http2`). **Item ajouté le 2026-07-30** (§0.10) : le bruit à chaque reload masque les avertissements utiles. |
 | OPS-010 | `[~]` | P1 | Borner la rétention des venvs de release | Après N mises à jour successives, `gateway/deploy/update.sh` et `node_agent/deploy/update-agent.sh` laissent au plus 2 arborescences de venv (l'active et la précédente) et la cible du symlink n'est jamais supprimée. **Item ajouté le 2026-07-30** : sans purge, chaque mise à jour ajoutait ~200 Mo au disque du nœud, en silence. Rétention livrée et testée dans les deux scripts (`EVA_GATEWAY_VENV_KEEP` / `EVA_AGENT_VENV_KEEP`, défaut 2). **Reste à faire** : la même borne pour les sauvegardes `*.pre-migration.*.bak` d'OPS-006, suivie sous OPS-002. |
+| OPS-011 | `[ ]` | P1 | Aligner les prérequis documentés sur ce que les scripts exigent réellement | `docs/deployment.md` §1 liste **toutes** les commandes réclamées par les préflights d'`install.sh` et d'`install-agent.sh`, et un test dérive la liste attendue du code des scripts plutôt que de la recopier — sans quoi il rate la prochaine dépendance ajoutée. **Item ajouté le 2026-07-31** (§0.13) : `install-agent.sh` exige `rsync` (préflight ligne 76, usage lignes 122 et 126), le mot n'apparaît nulle part dans la documentation, et une Debian 13 minimale ne l'installe pas — l'installation d'un nœud neuf échoue au premier écran, sur une dépendance que rien n'annonce. |
+| OPS-012 | `[ ]` | P1 | Donner une échappatoire explicite au préflight GPU d'`install.sh` | `install.sh --mode local` accepte un hôte sans GPU via une option **explicite** (`--allow-no-gpu`), qui inscrit ce choix dans l'environnement généré et le fait remonter par `doctor` ; sans l'option, le refus actuel est conservé et son message dit quoi faire. Un test couvre les deux branches. **Item ajouté le 2026-07-31** (§0.13) : le préflight `command -v nvidia-smi` a bloqué **les deux** déploiements réels sur banc CPU (§0.10 puis §0.13), et les deux ont dû contourner le script. Un garde-fou que tout le monde contourne ne protège plus personne — il apprend seulement à passer outre. |
 | TST-006 | `[x]` | P0 | Couvrir la construction du manager en mode cluster | Un test construit `model_manager._build_manager()` avec `CLUSTER_MODE=cluster` et un `nodes.yaml` minimal ; il échoue sur le code d'avant COR-015 et passe après. **Item ajouté le 2026-07-30** (§0.10) : 633 tests passaient alors que le mode cluster ne démarrait pas. Complète TST-005, qui vise le parcours E2E et non la construction à l'import. |
 
 ## 13. Jalons
