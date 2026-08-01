@@ -26,10 +26,10 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 | | |
 |---|---|
 | **Où en est-on** | Jalons **M0 et M1 atteints**. La **vague 6 (M2) a livré ses sept modules d'exécution** et son applicateur : le système sait installer un runtime vérifié, télécharger des modèles à empreinte contrôlée, écrire un registre désactivé, calibrer, activer sur preuve, pré-chauffer, jouer la recette du premier token et produire un rapport d'installation (§0.13) |
-| **Ce qui bloque** | **COR-020**, découvert à l'assemblage : le plan ordonne `enable_model` **avant** le `smoke_test` dont l'activation exige la preuve, et la recette a besoin d'un modèle activé. Aucun plan produit par `bootstrap-plan` ne peut aller à son terme. L'applicateur le constate et refuse au lieu d'entamer. **Décision requise : DEC-010** (§0.5) |
-| **Ce qui vient ensuite** | Trancher **DEC-010**, puis **AUT-016** — les contrats de sonde sont définis, le dépôt n'en contient aucune implémentation. Ces deux items sont ce qui sépare « la mécanique est écrite » de « la machine peut s'installer » |
+| **Ce qui bloque** | **COR-020**, découvert à l'assemblage : le plan ordonne `enable_model` **avant** le `smoke_test` dont l'activation exige la preuve, et la recette a besoin d'un modèle activé. Aucun plan produit par `bootstrap-plan` ne peut aller à son terme. L'applicateur le constate et refuse au lieu d'entamer. **DEC-010 tranchée le 2026-08-01 — voie A**, activation provisoire puis retour arrière ; reste à implémenter |
+| **Ce qui vient ensuite** | Implémenter **COR-020** selon la voie A, puis **AUT-016** — les contrats de sonde sont définis, le dépôt n'en contient aucune implémentation. Ces deux items sont exactement ce qui sépare « la mécanique est écrite » de « la machine peut s'installer » |
 | **Santé des tests** | **1929 tests verts** (1866 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
-| **Reste à faire** | 36 items sur 69 (§0.3). Deux P0 ouverts, tous deux dans le Lot B : COR-020 et AUT-016 |
+| **Reste à faire** | 37 items sur 70 (§0.3). Deux P0 ouverts : COR-020 (décidé, à implémenter) et AUT-016 |
 | **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste entièrement déclarative, y compris pour le module qui prétend la mesurer. Aucun nginx réel dans un test automatisé — le point n° 1 de §10 est **codé, pas démontré**. Aucun réseau réel, aucun dépôt Hugging Face réel. Le plan n'a **jamais été appliqué de bout en bout** |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
@@ -59,7 +59,7 @@ ce que l'exploitation doit savoir.
 | Base de référence | `6e576a8` — 1257 tests verts, `ruff` propre |
 | Périmètre livré à ce jour | AUT-001 → AUT-007, AUT-011 → AUT-015, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
 | Périmètre de la vague 6 | AUT-006 → AUT-011 et AUT-015, plus AUT-014 né du besoin de contrat — **9 items** : 5 `[x]`, 3 `[~]`, plus COR-018 à COR-020, SEC-010 et AUT-016, tous nés de la vague (§0.13) |
-| Ce qui bloque la sortie de M2 | **COR-020** (décision DEC-010) et **AUT-016** — les deux seuls P0 ouverts du dépôt |
+| Ce qui bloque la sortie de M2 | **COR-020** (DEC-010 tranchée, implémentation à faire) et **AUT-016** — les deux seuls P0 ouverts du dépôt |
 
 ### 0.2 Base de référence des tests et état courant
 
@@ -96,12 +96,12 @@ vérifiée par `bash -n`, à compléter avec EVA-044.
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Décision | `[–]` Annulé |
 |---|---:|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 20 | 11 | 0 | 7 | 1 | 1 |
+| A — bloqueurs et invariants | 20 | 11 | 0 | 8 | 0 | 1 |
 | B — bootstrap automatisé | 16 | 10 | 3 | 3 | 0 | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 | 0 |
 | D — sécurité et supply-chain | 10 | 1 | 0 | 9 | 0 | 0 |
 | E — tests et exploitation | 16 | 4 | 1 | 9 | 0 | 2 |
-| **Total** | **70** | **26** | **4** | **36** | **1** | **3** |
+| **Total** | **70** | **26** | **4** | **37** | **0** | **3** |
 
 **Dix-sept items ont été ajoutés au backlog après coup**, d'où 70 au lieu de 53.
 Aucun ne figurait dans les deux audits initiaux : tous sont nés de
@@ -129,8 +129,8 @@ jamais été mesuré, aucun token n'a jamais été servi par ce chemin. Les pass
 `[x]` reviendrait à écrire que la machine peut s'installer ; c'est AUT-016 qui
 le décidera.
 
-**Deux P0 restent ouverts, tous deux dans le Lot B** : **COR-020**, qui attend
-la décision DEC-010, et **AUT-016**. Les 7 items restants du Lot A sont en
+**Deux P0 restent ouverts** : **COR-020**, dont la décision DEC-010 est prise et
+l'implémentation à faire, et **AUT-016**. Les 7 items restants du Lot A sont en
 P1/P2.
 
 ### 0.4 Vagues 1 à 3 — jalon M0 (historique)
@@ -167,12 +167,13 @@ tests de régression, qui doivent échouer avant le correctif et passer après.
 | ID | Décision | Retenu le |
 |---|---|---|
 | DEC-001 | **Anonymisation** pour la suppression d'utilisateur : la ligne `users` est conservée, les données personnelles sont effacées, `is_active = 0`, les clés sont révoquées. L'historique d'usage agrégé reste exploitable, la personne n'est plus ré-identifiable. Écarté : `ON DELETE CASCADE` (perte de traçabilité de facturation) et `SET NULL` (casse les jointures des rapports). | 2026-07-30 |
+| DEC-010 | **Activation provisoire avec retour arrière** pour dénouer la chaîne de preuve du plan d'amorçage (COR-020). L'ordre devient `calibrate → enable → smoke_test → (échec : retour à `disabled`) → warmup`. Assumé : une fenêtre pendant laquelle un modèle non encore validé est servable, bornée par le fait que l'amorçage précède l'ouverture du trafic. Écarté : aligner l'activation sur la seule calibration (contredit le critère d'acceptation d'AUT-007 — un modèle activé sans qu'aucun token n'ait été produit par lui) ; valider par un chemin d'admission interne (contredit §10, dont le point n° 1 exige le vrai chemin public). | 2026-08-01 |
 | DEC-009 | **Suppression du composant `gateway-student`** : jamais déployé, aucun consommateur. Code, tests, documentation, unités systemd/nginx/nftables et job CI retirés du dépôt. Vérifié sans effet fonctionnel — ni `gateway` ni `node_agent` n'en dépendaient (aucun import, aucune clé `llmstu-*`, aucune route ni base partagée). Les items de backlog exclusivement student (**COR-011**, **OPS-005**, **OPS-007**) sont annulés, ainsi que **EVA-006** et **EVA-023** côté `claude-analyse-projet.md`. Écarté : garder le composant en l'état (surface de maintenance, CI et audit de dépendances pour du code mort). | 2026-07-30 |
 
 Les décisions DEC-002 à DEC-008 restent `[!]` : elles ne bloquent pas le jalon
 M0 et seront tranchées à l'entrée des lots concernés.
 
-**DEC-010 — `[!]` décision requise, elle bloque le jalon M2.** Comment un modèle
+**DEC-010 — tranchée le 2026-08-01, voie A.** Comment un modèle
 peut-il être validé par la recette du premier token alors que cette recette
 exige qu'il soit déjà activé, et que l'activation exige la recette (COR-020) ?
 Trois voies, aucune gratuite :
@@ -183,12 +184,14 @@ Trois voies, aucune gratuite :
 | **B — la recette valide la chaîne, pas le modèle** | On aligne `registry_writer` sur le planificateur : l'activation se contente de la calibration, et le `smoke_test` final atteste la chaîne complète. Aucun réordonnancement. | **Contredit le critère d'acceptation d'AUT-007**, qui est le garde-fou central du lot. Un modèle serait activé sans qu'aucun token n'ait jamais été produit par lui. |
 | **C — la recette n'emprunte pas `/v1` pour valider** | Le smoke test par modèle passe par un chemin d'admission interne, l'activation suit, et le `smoke_test` public final reste. | **Contredit §10**, dont le point n° 1 est que la recette doit traverser le vrai chemin public — « un simple `/health` ou `/ready` ne suffit pas ». |
 
-**Recommandation : A**, bornée. C'est la seule voie qui ne renonce ni au
-garde-fou d'AUT-007 ni au chemin public de §10. Le coût — une fenêtre où un
-modèle non validé est servable — est réel mais bornable : l'amorçage se fait
-avant ouverture du trafic, et le retour arrière est déjà un mécanisme éprouvé du
-dépôt. À trancher explicitement, parce que la fenêtre doit être assumée par
-écrit plutôt que découverte.
+**Voie A retenue le 2026-08-01.** C'est la seule qui ne renonce ni au garde-fou
+d'AUT-007 ni au chemin public de §10. Le coût est réel et assumé par écrit : une
+fenêtre pendant laquelle un modèle non encore validé est servable. Elle est
+bornable — l'amorçage précède l'ouverture du trafic, et le retour arrière est
+déjà un mécanisme éprouvé du dépôt (§0.10). L'implémentation est suivie sous
+COR-020, et devra faire de cette fenêtre une propriété **testée**, pas une
+intention : un smoke test en échec doit reposer l'entrée en `enabled: false`, et
+un test doit échouer si ce n'est pas le cas.
 
 ### 0.6 Conventions d'implémentation appliquées
 
@@ -888,8 +891,9 @@ matérielle :
 
 1. **COR-020** — la chaîne de preuve du plan est nouée sur elle-même. Aucun plan
    produit par `bootstrap-plan` ne peut être appliqué jusqu'au bout. Tant que
-   DEC-010 n'est pas tranchée, la condition « appel E2E réussi » est
-   inatteignable par construction, pas par manque de code.
+   COR-020 n'est pas implémenté — DEC-010 tranche pour la voie A —, la
+   condition « appel E2E réussi » est inatteignable par construction, pas par
+   manque de code.
 2. **AUT-016** — trois modules définissent le contrat de leurs sondes et le
    dépôt n'en contient aucune implémentation. `bootstrap-apply` ne câble que 5
    des 9 actions et refuse tout plan réel en code 2.
@@ -1783,7 +1787,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-017 | `[x]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10), **livré le même jour** : `reset-failed` avant chaque démarrage dans les 4 scripts de déploiement, et l'échec de redémarrage d'un rollback sort désormais en code 9 « INDISPONIBILITÉ », distinct du code 1 « version précédente restaurée et en service ». |
 
 | COR-018 | `[ ]` | P1 | Préserver `models.yaml` lors des mutations admin | Une mutation par l'API admin ou le dashboard conserve les commentaires du fichier, produit une sauvegarde, écrit atomiquement avec `fsync`, et laisse les permissions inchangées. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-007 : `ModelRegistry._save()` réécrit le fichier entier par `yaml.dump`, ce qui efface les 55 lignes d'en-tête opérationnel du fichier livré — budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7` — et tous les commentaires d'entrée. Il ne sauvegarde pas, ne synchronise pas, et `NamedTemporaryFile` fait basculer le fichier en 0600 sans restaurer les permissions d'origine. Perte de données en production, aujourd'hui, sur un chemin emprunté par le dashboard. `bootstrap/registry_writer.py` montre la forme attendue : ajout textuel, reparse comparatif, refus plutôt que réécriture globale. |
-| COR-020 | `[!]` | **P0** | Dénouer la chaîne de preuve du plan d'amorçage | Un plan produit par `bootstrap-plan` peut être appliqué **jusqu'à son terme** : aucune étape n'exige une preuve qu'une étape ultérieure produit. **Item ajouté le 2026-08-01** (§0.13), découvert à l'assemblage de la vague 6 — aucun chantier ne pouvait le voir seul. Le planificateur (vague 5) ordonne, par modèle, `download → write_registry → calibrate → enable_model → warmup`, puis ajoute **un seul** `smoke_test` final, décrit comme « unique et finale — elle valide la chaîne, pas un modèle en particulier ». Or le critère d'acceptation d'AUT-007 exige l'inverse : « entrée désactivée tant que la calibration **et le smoke test** n'ont pas réussi », donc une preuve **par modèle**, **avant** l'activation. Et la recette de §10 passe par `/v1/chat/completions`, qui refuse un modèle `enabled: false` (`model_disabled`). Les trois contraintes ne peuvent pas être vraies ensemble. **Bloque la sortie du jalon M2.** Décision requise : voir DEC-010. |
+| COR-020 | `[ ]` | **P0** | Dénouer la chaîne de preuve du plan d'amorçage | Un plan produit par `bootstrap-plan` peut être appliqué **jusqu'à son terme** : aucune étape n'exige une preuve qu'une étape ultérieure produit. **Item ajouté le 2026-08-01** (§0.13), découvert à l'assemblage de la vague 6 — aucun chantier ne pouvait le voir seul. Le planificateur (vague 5) ordonne, par modèle, `download → write_registry → calibrate → enable_model → warmup`, puis ajoute **un seul** `smoke_test` final, décrit comme « unique et finale — elle valide la chaîne, pas un modèle en particulier ». Or le critère d'acceptation d'AUT-007 exige l'inverse : « entrée désactivée tant que la calibration **et le smoke test** n'ont pas réussi », donc une preuve **par modèle**, **avant** l'activation. Et la recette de §10 passe par `/v1/chat/completions`, qui refuse un modèle `enabled: false` (`model_disabled`). Les trois contraintes ne peuvent pas être vraies ensemble. **Bloque la sortie du jalon M2.** **Décision prise le 2026-08-01 — voie A** (DEC-010) : activation provisoire puis retour arrière si la recette échoue. Reste à implémenter, et la fenêtre d'exposition doit être une propriété **testée** : un smoke test en échec repose l'entrée en `enabled: false`, et un test échoue si ce n'est pas le cas. |
 | COR-019 | `[ ]` | P2 | Ne pas porter d'invariant de production par `assert` | Aucun `assert` ne garde un invariant dont la violation doit produire une erreur nommée. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-015 : `runtime_resolver.ProvenanceManifest.build_number` et `to_decision()` s'appuient sur `assert match is not None` / `assert variant is not None`. Sous `python -O`, que rien n'interdit dans une unité systemd, ces gardes disparaissent et le refus explicite devient un `AttributeError` opaque. À rechercher ailleurs dans le dépôt avant de conclure. |
 
 ### Lot B — bootstrap automatisé
