@@ -71,11 +71,18 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 
 ### Source de vérité
 
-Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité unique pour tous les modèles
-disponibles sur la gateway. Il est lu au démarrage et peut être modifié en
+Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité
+**persistante** pour tous les modèles disponibles sur la gateway. Il est lu au
+démarrage et peut être modifié en
 direct via l'API admin (écriture atomique : temp + rename). Il vit sous
 `/var/lib`, writable par `llmservice`, tandis que secrets et topologie restent
 sous `/etc/llm-gateway`, non writable par le service.
+
+La seule superposition à cette vérité est l'activation provisoire de
+`bootstrap-apply` : un snapshot validé peut être publié **en mémoire** dans le
+worker unique, sous un bail borné, pendant la recette du premier token. Le YAML
+reste désactivé jusqu'à la confirmation ; un redémarrage ou l'expiration du bail
+revient donc à l'état persistant sûr.
 
 ```yaml
 models:
@@ -142,8 +149,11 @@ binaire `llama-server` de chaque node doit supporter `--spec-type` (vérifier av
 3. `path` doit être absolu (`path.is_absolute()`) et pointer vers un `.gguf`
 4. `mmproj_path`, si présent, subit les mêmes validations que `path`
 5. Si `ALLOWED_MODEL_DIRS` est configuré : `path` et `mmproj_path` doivent être sous un répertoire autorisé
-6. `vram_gb > 0` et `ubatch_size ≤ batch_size`
-7. Warning si `vision` ∈ capabilities mais `mmproj_path` absent (HTTP 500 garanti sinon)
+6. `enabled`, s'il est présent, doit être un vrai booléen YAML (`true` ou
+   `false`) ; les chaînes telles que `"false"` sont refusées au lieu d'être
+   coercées en vrai
+7. `vram_gb > 0` et `ubatch_size ≤ batch_size`
+8. Warning si `vision` ∈ capabilities mais `mmproj_path` absent (HTTP 500 garanti sinon)
 
 ---
 
@@ -158,12 +168,19 @@ un **plan** — un document — et n'applique rien.
 
 | Couche | Artefact | Privilèges | Écrit sur l'hôte |
 |---|---|---|---|
-| Installation | `gateway/deploy/install.sh` | `root` | oui — utilisateur système, venv, systemd, nginx, secrets |
+| Installation du socle | `gateway/deploy/install.sh` | `root` | oui — utilisateur système, venv, systemd, nginx, secrets |
 | Planification | `python cli.py bootstrap-plan` | aucun | **non** |
+| Application relue | `python cli.py bootstrap-apply … --apply` | selon les chemins du plan | oui — runtime, modèles, registre et preuves |
 
-`install.sh` reste la couche privilégiée et la seule voie d'installation
-supportée : c'est un artefact de production, idempotent, qui ne remplace ni `env`
-ni `models.yaml` (cf. [guide de déploiement](deployment.md#4-installation-du-gateway)).
+`install.sh` reste la voie supportée pour poser le **service** : utilisateur,
+venv, systemd, nginx et secrets. Il ne remplace ni `env` ni `models.yaml` (cf.
+[guide de déploiement](deployment.md#4-installation-du-gateway)). Une fois cette
+gateway mono-worker joignable sur loopback, `bootstrap-apply` exécute le plan
+relu pour poser le runtime et les modèles puis prouver le premier token.
+Le caractère mono-worker est un invariant du protocole : le snapshot
+provisoire, son verrou et son bail vivent dans la mémoire du processus. L'unité
+systemd officielle respecte cet invariant (`--workers 1`) ; un lancement manuel
+avec plusieurs workers n'est pas supporté.
 
 `bootstrap-plan` est la couche non privilégiée. Elle inventorie, calcule, explique
 — et s'arrête là. Aucun téléchargement, aucune compilation, aucune écriture de
@@ -238,11 +255,27 @@ Deux filets indépendants, parce qu'aucun ne suffit seul :
 Le message de refus cite le **chemin** et le motif, jamais la valeur : un rapport
 de fuite qui recopie le secret est lui-même une fuite.
 
+### Téléchargements sortants
+
+Les artefacts runtime et modèles partagent `bootstrap/public_https.py`. Cette
+frontière refuse tout schéma autre que HTTPS, les identifiants dans l'URL, les
+noms locaux et les adresses littérales non publiques. Pour chaque requête et
+chaque redirection, le hostname est résolu une seule fois ; une réponse vide,
+invalide, privée ou mixte est refusée en bloc. La connexion TCP utilise ensuite
+exactement les adresses validées, tandis que le certificat et SNI restent liés
+au hostname initial. Il n'existe donc pas de seconde résolution exploitable par
+DNS rebinding, et `http.client` n'hérite pas des proxies d'environnement.
+
+Ce contrôle ne remplace pas la preuve supply-chain : l'archive runtime et chaque
+fichier du catalogue sont toujours confrontés à leur SHA-256 avant promotion.
+Inversement, le SHA ne suffirait pas à fermer un SSRF, car une requête vers le
+réseau privé a déjà produit son effet même si son corps est ensuite rejeté.
+
 ### Ordre des étapes
 
 ```text
 accept_license → download_model → verify_artifact → write_registry (désactivé)
-  → calibrate_model → enable_model → warmup_model → smoke_test
+  → calibrate_model → enable_model (provisoire) → smoke_test → warmup_model
 ```
 
 Trois inversions seraient des défauts, pas des goûts :
@@ -251,15 +284,45 @@ Trois inversions seraient des défauts, pas des goûts :
   SHA-256 précède la mise en service, jamais l'inverse ;
 - **activer avant d'avoir calibré** publie une capacité supposée : `write_registry`
   écrit délibérément `enabled: false`, et `enable_model` est la seule étape qui
-  rend le modèle servable ;
-- **préchauffer avant d'activer** réchauffe un modèle que personne ne peut servir.
+  rend le modèle servable — provisoirement dans la mémoire de la gateway, pas
+  encore dans le fichier ;
+- **séparer l'activation provisoire de sa recette** rend le plan non compensable :
+  le pré-vol exige le triplet adjacent `calibrate_model → enable_model → smoke_test`
+  pour le même modèle ;
+- **préchauffer avant la recette** conserverait en mémoire un modèle dont aucun
+  token n'a encore été prouvé.
 
-`smoke_test` est unique et finale : elle traverse le chemin public réel
-(nginx → gateway → `llama-server`) et valide la chaîne, pas un modèle en
-particulier — elle ne se réplique donc pas par modèle. Elle désigne la recette du
-premier token déjà outillée par
+`smoke_test` est exécutée **pour chaque modèle**, immédiatement après son
+activation provisoire. Elle traverse le chemin public réel (nginx → gateway →
+`llama-server`) et ferme la transition DEC-010 : succès, la preuve complète
+persiste `enabled: true` ; échec, preuve illisible, exception ou annulation,
+l'applicateur ferme l'admission live puis décharge sans forcer les requêtes déjà
+actives. Pendant toute cette fenêtre, le fichier reste `enabled: false` : un
+redémarrage revient donc à l'état sûr. L'état live porte en plus un bail borné :
+si l'applicateur est tué sans pouvoir compenser, la gateway expire elle-même
+l'activation provisoire, ferme l'admission et tente le déchargement. Une entrée qui
+était déjà active avant l'exécution n'est jamais qualifiée de provisoire et ne
+peut donc pas être désactivée par cette compensation. La recette reprend le
+parcours du premier token déjà outillé par
 [`smoke_test.sh`](deployment.md#recette-du-premier-token-smoke_testsh) : TTFT
 mesuré, rapport sans secret.
+
+Le bail n'est pas `MODEL_LOAD_TIMEOUT + constante` : il additionne le pire
+chemin séquentiel autorisé par les timeouts de readiness, d'identité, de load,
+de stream, de log d'usage, de nettoyage et de confirmation, puis une marge. Une
+configuration qui demanderait plus que le maximum contractuel de 3600 s est
+refusée ; elle n'est jamais tronquée silencieusement.
+
+Le raccord passe par `POST /admin/models/{id}/bootstrap-sync`, uniquement sur
+l'origin admin loopback et sous `ADMIN_SECRET`. Les trois transitions
+`activate`, `confirm` et `rollback` portent l'empreinte SHA-256 exacte du YAML ;
+`activate` porte aussi la VRAM calibrée et la durée du bail. Une mutation
+concurrente du fichier, d'un autre modèle ou de l'état mémoire est refusée. Les
+mutations admin ordinaires du registre sont également refusées tant que la
+transition est ouverte. Les mutations disque déportées par `asyncio.to_thread`
+sont attendues jusqu'à leur terminaison même sous annulation : la compensation
+ne peut donc pas être doublée par un thread qui republierait `enabled: true`
+après le rollback.
 
 ### Estimé contre mesuré
 

@@ -1775,11 +1775,11 @@ constats ; seule la séquence est reproduite ici, et le chemin du volume de test
    5. [calibrate_model] qwen2.5-0.5b-instruct-q4_k_m
       Chargement réel de calibration : relever les pics RAM/VRAM, la durée de chargement et le TTFT, puis PROPOSER un `vram_gb` — sans l'appliquer silencieusement (§9).
    6. [enable_model] qwen2.5-0.5b-instruct-q4_k_m  (root)
-      Basculer l'entrée en `enabled: true` avec la capacité issue de la calibration. C'est ici, et pas avant, que le modèle devient servable.
-   7. [warmup_model] qwen2.5-0.5b-instruct-q4_k_m
+      Publier `enabled: true` uniquement dans le registre vivant, avec la capacité issue de la calibration, à titre PROVISOIRE. Le fichier reste `enabled: false` jusqu'au succès de la recette.
+   7. [smoke_test] qwen2.5-0.5b-instruct-q4_k_m
+      Recette du premier token pour ce modèle à travers nginx → gateway → llama-server. Succès : activation confirmée ; échec : retour immédiat à `enabled: false`.
+   8. [warmup_model] qwen2.5-0.5b-instruct-q4_k_m
       Préchauffer le modèle pour que le premier utilisateur ne paie pas le chargement après un déploiement réussi (AUT-010).
-   8. [smoke_test] nginx → gateway → llama-server
-      Recette du premier token à travers le chemin public réel (§10) : TTFT mesuré, rapport sans secret. Unique et finale — elle valide la chaîne, pas un modèle en particulier.
 ```
 
 Chaque étape annonce si elle exige `root` et si elle est réversible : ce sont les
@@ -1790,8 +1790,9 @@ négociable — le
 dans le document d'architecture.
 
 > **Aucune de ces étapes n'est exécutée par `bootstrap-plan`.** Le document
-> décrit ce qui *serait* fait ; l'application appartient à `install.sh` et aux
-> procédures de ce guide.
+> décrit ce qui *serait* fait ; `bootstrap-apply` l'exécute seulement après
+> relecture et avec `--apply`. `install.sh` reste chargé de poser le socle
+> système (utilisateur, venv, systemd, nginx et secrets).
 
 ### Sortie JSON
 
@@ -1916,36 +1917,74 @@ ce plan** : installation du runtime, téléchargement des modèles, écriture du
 registre, calibration, activation, pré-chauffage, recette du premier token, puis
 rapport d'installation.
 
-> **État au 2026-08-01 — lisez ceci avant d'essayer.** La commande existe,
-> refuse correctement, et son parcours complet est testé de bout en bout contre
-> des doubles. Elle **ne peut pas encore mener un plan réel à son terme**, pour
-> deux raisons distinctes, l'une et l'autre volontairement bruyantes :
+> **État au 2026-08-01 — lisez ceci avant d'essayer.** Les neuf actions ont un
+> câblage de production depuis la CLI : décision runtime reconstruite depuis le
+> plan relu, téléchargement, acceptation explicite de licence, sondes réelles
+> RAM/VRAM et `llama-server` isolé sur loopback, client HTTP asynchrone pour la
+> recette et le pré-chauffage. COR-022 est fermé par DEC-010 : chaque modèle suit
+> `calibrate → enable` provisoire `→ smoke_test → warmup`, avec retour immédiat à
+> l'état désactivé si la recette ou sa preuve échoue. La fenêtre provisoire est
+> uniquement en mémoire : `models.yaml` ne passe à `enabled: true` qu'après le
+> premier token prouvé.
 >
-> 1. **Trois familles d'actions n'ont aucun câblage possible depuis la CLI** —
->    `install_runtime` (la décision de runtime n'est pas reconstituable depuis
->    le document de plan), `calibrate_model` (aucune sonde de chargement
->    n'existe encore dans le dépôt) et `smoke_test`/`warmup_model` (aucun client
->    HTTP concret n'est fourni). Un plan qui les contient est refusé **avant de
->    commencer**, en code 2, avec la liste.
-> 2. **L'ordre du plan rend la chaîne de preuve impossible** : le planificateur
->    place `enable_model` avant le `smoke_test` dont l'activation exige la
->    preuve. Le constat `chaine_de_preuve_impossible` est émis avant toute
->    exécution. Voir COR-022 dans `codex-analyse.md` §0.14.
->
-> Ce qui est garanti dès aujourd'hui : la commande **ne fait jamais à moitié**.
-> Elle refuse en bloc plutôt que d'entamer un plan qu'elle ne peut pas finir.
+> Cette livraison reste une **capacité codée et testée contre des doubles**. Le
+> parcours `bootstrap-apply --apply` n'a encore été exécuté ni sur un GPU réel,
+> ni à travers un nginx réel ; le jalon M2 n'est donc pas prononcé. En outre, les
+> variantes runtime par défaut sans SHA-256 restent volontairement
+> ininstallables : fournissez une décision épinglée dans le plan.
+
+Les deux téléchargements sortants — archive du runtime et fichiers GGUF/mmproj —
+emploient la même politique HTTPS publique. L'endpoint initial et chaque
+redirection sont validés avant émission ; identifiants dans l'URL, loopback,
+link-local, réseaux privés, adresses non globales et réponses DNS mixtes sont
+refusés. La connexion TCP est épinglée sur la résolution contrôlée tout en
+gardant le hostname d'origine pour SNI et le certificat TLS. Le transport ne
+consulte pas les variables de proxy de l'environnement. Une empreinte SHA-256
+reste obligatoire en aval : le contrôle réseau et l'intégrité de l'artefact
+protègent deux risques distincts.
+
+> **Précondition d'exploitation : un seul worker gateway.** L'activation
+> provisoire, son verrou et son bail sont locaux au processus FastAPI. L'unité
+> systemd officielle lance bien `--workers 1`. N'exécutez pas cette commande
+> contre une gateway lancée manuellement avec plusieurs workers ; certaines
+> variables usuelles (`WEB_CONCURRENCY`, `UVICORN_WORKERS`) sont refusées si
+> elles annoncent une valeur supérieure à 1, mais elles ne peuvent pas détecter
+> toutes les topologies improvisées.
 
 ### La simulation est le défaut
 
 ```bash
 # Simule — n'écrit rien, ne télécharge rien, ne charge aucun modèle
 ./venv/bin/python cli.py bootstrap-apply /tmp/plan.json \
-    --allowed-root /models --allowed-root /opt/llm-gateway
+    --allowed-root /models --allowed-root /opt/llama.cpp \
+    --allowed-root /var/lib/llm-gateway --allowed-root /etc/llm-gateway \
+    --models-dir /models --registry /etc/llm-gateway/models.yaml \
+    --runtime-root /opt/llama.cpp \
+    --calibration-report-dir /var/lib/llm-gateway/calibration \
+    --base-url https://eva.example.edu --admin-url http://127.0.0.1:8000 \
+    --vram-budget-gb 43.6 \
+    --accept-license qwen2.5-0.5b-instruct-q4_k_m \
+    --license-reference CHG-2026-081
 
 # Applique réellement — le drapeau est obligatoire et il n'a pas d'équivalent court
 ./venv/bin/python cli.py bootstrap-apply /tmp/plan.json --apply \
-    --allowed-root /models --allowed-root /opt/llm-gateway
+    --allowed-root /models --allowed-root /opt/llama.cpp \
+    --allowed-root /var/lib/llm-gateway --allowed-root /etc/llm-gateway \
+    --models-dir /models --registry /etc/llm-gateway/models.yaml \
+    --runtime-root /opt/llama.cpp \
+    --calibration-report-dir /var/lib/llm-gateway/calibration \
+    --base-url https://eva.example.edu --admin-url http://127.0.0.1:8000 \
+    --admin-secret-file /etc/llm-gateway/admin.secret \
+    --vram-budget-gb 43.6 \
+    --accept-license qwen2.5-0.5b-instruct-q4_k_m \
+    --license-reference CHG-2026-081
 ```
+
+La simulation n'exige aucun secret : ses raccords HTTP sont décrits mais jamais
+appelés. En application, préférez `--admin-secret-file` ; le fichier doit être
+régulier, non symlink, appartenir à root ou à l'utilisateur courant et être en
+mode 0600. La variable d'environnement `ADMIN_SECRET` reste le repli, jamais un
+argument de CLI.
 
 Un mode d'exécution ne s'obtient **jamais** par omission d'argument. Une
 simulation complète sort en **3**, jamais en 0 : rien n'a été appliqué, et un
@@ -1961,15 +2000,31 @@ problème » et « la machine est installée ».
 | `--allowed-root` | Répertoire que l'application a le droit de toucher. **Répétable et obligatoire** : une liste vide n'autorise rien. |
 | `--catalog` | Catalogue de modèles approuvés (défaut : celui du dépôt). |
 | `--models-dir` | Volume où atterrissent les GGUF. |
-| `--registry` | `models.yaml` à écrire. Va avec les trois options suivantes. |
-| `--runtime-version` | Build de `llama-server` en service (ex. `b6042`). |
-| `--hardware-fingerprint` | Empreinte matérielle de l'hôte (§9 de `codex-analyse.md`). |
+| `--registry` | `models.yaml` à écrire. |
+| `--runtime-root` | Racine versionnée où installer les releases de `llama-server`. |
+| `--llama-server-bin` | Binaire à employer pour la calibration ; sinon release installée ou configuration de la gateway. |
+| `--calibration-report-dir` | Répertoire des preuves JSON de calibration. |
+| `--calibration-port` | Port loopback du `llama-server` isolé de calibration (défaut : `19091`). |
+| `--calibration-load-timeout` | Borne de chargement ; sinon `MODEL_LOAD_TIMEOUT_SECONDS`. |
+| `--base-url` | **Origin** publique de recette, nginx compris (sans chemin, query ni fragment). HTTPS est exigé hors loopback. |
+| `--admin-url` | Origin directe de la gateway pour `/ready` et `/admin`, sans chemin/query/fragment et limitée à loopback afin que `ADMIN_SECRET` ne quitte pas l'hôte. |
+| `--admin-secret-file` | Fichier régulier privé, non symlink, mode 0600 et propriétaire attendu ; sinon `ADMIN_SECRET` vient de l'environnement. La valeur n'est jamais acceptée en argv. |
+| `--accept-license` | ID dont l'opérateur accepte explicitement la licence. Répétable. |
+| `--license-reference` | Référence technique de changement/ticket associée aux acceptations ; n'y placez ni nom ni email. |
+| `--ttft-threshold-ms` | Seuil de TTFT en millisecondes ; `0` mesure sans seuil. |
+| `--ttft-gate` | Transforme le dépassement du seuil TTFT en échec. |
+| `--runtime-version` | Build servi (ex. `b6042`). S'il est aussi déductible du plan, toute divergence est refusée. |
+| `--hardware-fingerprint` | Empreinte matérielle (§9). Si l'inventaire du plan permet de la recalculer, toute divergence est refusée. |
 | `--vram-budget-gb` | Budget VRAM net de l'hôte, en Go. |
 
-Les trois dernières sont **déclarées par l'opérateur** et ne sont recoupées
-contre rien sur l'hôte. Elles servent à décider si une preuve de calibration est
-réutilisable : une preuve prise sur un autre GPU ou un autre build est refusée,
-et le message dit laquelle des empreintes diverge.
+La version runtime et l'empreinte matérielle servent à décider si une preuve de
+calibration est réutilisable. Quand le plan les porte, la CLI les reconstruit
+depuis le document validé ; une valeur explicitement fournie qui diverge est un
+refus, jamais un remplacement silencieux. Avant de réutiliser une preuve — et
+avant toute nouvelle mesure — l'applicateur sonde à nouveau le binaire courant,
+les UUID GPU visibles, leur modèle, VRAM, pilote et compute capability. Un plan
+ancien ne peut donc pas étiqueter le matériel ou le runtime courant avec son
+ancien état.
 
 ### Grille des exit codes
 
@@ -1988,19 +2043,50 @@ distinguer.
 
 ### Ce que l'applicateur garantit
 
-- **Rien n'est entamé à moitié.** Si une action du plan n'a pas d'exécuteur, la
-  commande refuse avant de démarrer plutôt que d'abandonner le plan au milieu.
-- **Une preuve n'est jamais présumée.** L'activation d'un modèle exige une
-  calibration ET une recette du premier token réussies, chacune produite par
-  l'étape correspondante de cette exécution. Si l'étape n'a pas eu lieu ou a
-  échoué, l'activation échoue — aucune valeur par défaut, aucun équivalent
-  approchant.
+- **Les impossibilités prévisibles sont refusées avant toute mutation.** Une
+  action sans exécuteur ou un triplet d'activation non compensable arrête la
+  commande au pré-vol.
+- **Un échec métier peut laisser les étapes antérieures appliquées.** Runtime,
+  téléchargements et registre sont idempotents et restent en place pour une
+  reprise ; le journal les distingue des étapes non tentées. Ce n'est pas une
+  transaction globale, et la documentation ne prétend plus le contraire.
+- **L'activation provisoire, elle, est compensée et résistante au crash.** Le
+  fichier reste `enabled: false` pendant la recette ; seule la gateway
+  mono-worker voit temporairement le modèle, sous un bail borné que la gateway
+  annule automatiquement si l'applicateur disparaît. Un échec ferme d'abord l'admission
+  en mémoire, laisse terminer les requêtes déjà actives, puis décharge sans
+  forçage. Un redémarrage avant confirmation relit donc l'état désactivé. Un
+  modèle actif avant le run n'est jamais désactivé sous couvert de rollback.
+  La durée du bail additionne les pires bornes séquentielles de readiness,
+  identité, chargement, stream, log d'usage, nettoyage et confirmation, plus
+  une marge ; si le total dépasse 3600 s, la commande refuse au lieu de le
+  tronquer et d'expirer pendant une recette encore valide.
+- **La synchronisation live recoupe chaque snapshot.** Le client loopback
+  appelle `POST /admin/models/{id}/bootstrap-sync` sous `ADMIN_SECRET` pour
+  `activate`, `confirm` ou `rollback`. Chaque transition porte le SHA-256 exact
+  de `models.yaml`; la gateway refuse un fichier ou un autre modèle modifié
+  concurremment. Une réponse de confirmation perdue reste compensable et un
+  rollback arrivé après l'expiration du bail est idempotent.
+- **Une annulation n'abandonne pas un thread d'écriture.** La persistance du
+  registre doit terminer avant que l'annulation soit propagée ; le rollback lit
+  ainsi l'état final réel, jamais un `enabled: false` qui serait remplacé juste
+  après par un thread encore actif.
+- **Une preuve n'est jamais présumée.** La calibration autorise seulement la
+  fenêtre provisoire ; seule la calibration ET la recette du premier token
+  réussies confirment l'activation. Aucune valeur par défaut ni équivalent
+  approchant n'est accepté.
 - **Le journal distingue « sauté » de « non tenté ».** Les étapes qui suivent un
   échec n'ont pas été atteintes ; ce n'est pas la même information pour qui
   diagnostique.
 - **Le plan relu est revalidé intégralement.** Version de schéma, cohérence des
   champs dérivés, bloqueurs recalculés depuis les sections, numérotation des
   étapes, absence de secret : un document retouché à la main est refusé.
+- **Le même instantané de plan est câblé puis exécuté.** La CLI ne relit pas le
+  chemin après avoir dérivé runtime, modèles et matériel ; remplacer le fichier
+  pendant l'exécution ne peut pas substituer un second plan.
+- **Le serveur de calibration est identifié.** Un port déjà occupé est refusé
+  avant lancement ; le processus est encore vivant après `/health` et doit
+  annoncer l'alias exact du modèle via `/v1/models`.
 - **Aucun secret dans la sortie**, y compris dans un message d'erreur, y compris
   le chemin du fichier de plan.
 
