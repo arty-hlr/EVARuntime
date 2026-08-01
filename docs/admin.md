@@ -21,6 +21,7 @@ Trois interfaces sont disponibles :
 7. [Référence API REST admin](#7-référence-api-rest-admin)
 8. [Diagnostic préflight — `doctor`](#8-diagnostic-préflight--doctor)
 9. [Planificateur d'amorçage — `bootstrap-plan`](#9-planificateur-damorçage--bootstrap-plan)
+10. [Applicateur d'amorçage — `bootstrap-apply`](#10-applicateur-damorçage--bootstrap-apply)
 
 ---
 
@@ -1905,6 +1906,123 @@ esac
 
 Un plan bloqué ne doit être appliqué par personne, **jamais partiellement** : le
 champ `applicable` du document le dit aussi explicitement que l'exit code.
+
+---
+
+## 10. Applicateur d'amorçage — `bootstrap-apply`
+
+`bootstrap-plan` décrit ce qu'il faudrait installer. `bootstrap-apply` **exécute
+ce plan** : installation du runtime, téléchargement des modèles, écriture du
+registre, calibration, activation, pré-chauffage, recette du premier token, puis
+rapport d'installation.
+
+> **État au 2026-08-01 — lisez ceci avant d'essayer.** La commande existe,
+> refuse correctement, et son parcours complet est testé de bout en bout contre
+> des doubles. Elle **ne peut pas encore mener un plan réel à son terme**, pour
+> deux raisons distinctes, l'une et l'autre volontairement bruyantes :
+>
+> 1. **Trois familles d'actions n'ont aucun câblage possible depuis la CLI** —
+>    `install_runtime` (la décision de runtime n'est pas reconstituable depuis
+>    le document de plan), `calibrate_model` (aucune sonde de chargement
+>    n'existe encore dans le dépôt) et `smoke_test`/`warmup_model` (aucun client
+>    HTTP concret n'est fourni). Un plan qui les contient est refusé **avant de
+>    commencer**, en code 2, avec la liste.
+> 2. **L'ordre du plan rend la chaîne de preuve impossible** : le planificateur
+>    place `enable_model` avant le `smoke_test` dont l'activation exige la
+>    preuve. Le constat `chaine_de_preuve_impossible` est émis avant toute
+>    exécution. Voir COR-020 dans `codex-analyse.md` §0.13.
+>
+> Ce qui est garanti dès aujourd'hui : la commande **ne fait jamais à moitié**.
+> Elle refuse en bloc plutôt que d'entamer un plan qu'elle ne peut pas finir.
+
+### La simulation est le défaut
+
+```bash
+# Simule — n'écrit rien, ne télécharge rien, ne charge aucun modèle
+./venv/bin/python cli.py bootstrap-apply /tmp/plan.json \
+    --allowed-root /models --allowed-root /opt/llm-gateway
+
+# Applique réellement — le drapeau est obligatoire et il n'a pas d'équivalent court
+./venv/bin/python cli.py bootstrap-apply /tmp/plan.json --apply \
+    --allowed-root /models --allowed-root /opt/llm-gateway
+```
+
+Un mode d'exécution ne s'obtient **jamais** par omission d'argument. Une
+simulation complète sort en **3**, jamais en 0 : rien n'a été appliqué, et un
+script d'exploitation ne doit pas pouvoir confondre « j'ai simulé sans
+problème » et « la machine est installée ».
+
+### Options
+
+| Option | Rôle |
+|---|---|
+| `--apply` | Appliquer réellement. Sans lui, la commande simule. |
+| `--json` | Rapport d'installation JSON au lieu du rendu français. |
+| `--allowed-root` | Répertoire que l'application a le droit de toucher. **Répétable et obligatoire** : une liste vide n'autorise rien. |
+| `--catalog` | Catalogue de modèles approuvés (défaut : celui du dépôt). |
+| `--models-dir` | Volume où atterrissent les GGUF. |
+| `--registry` | `models.yaml` à écrire. Va avec les trois options suivantes. |
+| `--runtime-version` | Build de `llama-server` en service (ex. `b6042`). |
+| `--hardware-fingerprint` | Empreinte matérielle de l'hôte (§9 de `codex-analyse.md`). |
+| `--vram-budget-gb` | Budget VRAM net de l'hôte, en Go. |
+
+Les trois dernières sont **déclarées par l'opérateur** et ne sont recoupées
+contre rien sur l'hôte. Elles servent à décider si une preuve de calibration est
+réutilisable : une preuve prise sur un autre GPU ou un autre build est refusée,
+et le message dit laquelle des empreintes diverge.
+
+### Grille des exit codes
+
+| Code | Signification | Conduite à tenir |
+|---:|---|---|
+| 0 | Installation complète et prouvée | Rien — le rapport est archivable en l'état. |
+| 1 | Échec, ou plan inapplicable | Lire les échecs du rapport. Le plan a pu être refusé à la relecture. |
+| 2 | Commande mal formée, ou câblage incomplet | Corriger les options. **Rien n'a été entamé.** |
+| 3 | Partiel — dont **toute simulation** | Normal après une simulation. Après un `--apply`, lire ce qui n'a pas été tenté. |
+| 4 | L'applicateur lui-même a cassé | Ce n'est pas un diagnostic sur l'hôte. À remonter comme un défaut. |
+
+La séparation 1 / 2 / 4 est la même que pour `bootstrap-plan` : « l'hôte est
+bloqué », « la commande est mal formée », « l'outil a cassé » sont trois
+conséquences différentes, et un script d'exploitation doit pouvoir les
+distinguer.
+
+### Ce que l'applicateur garantit
+
+- **Rien n'est entamé à moitié.** Si une action du plan n'a pas d'exécuteur, la
+  commande refuse avant de démarrer plutôt que d'abandonner le plan au milieu.
+- **Une preuve n'est jamais présumée.** L'activation d'un modèle exige une
+  calibration ET une recette du premier token réussies, chacune produite par
+  l'étape correspondante de cette exécution. Si l'étape n'a pas eu lieu ou a
+  échoué, l'activation échoue — aucune valeur par défaut, aucun équivalent
+  approchant.
+- **Le journal distingue « sauté » de « non tenté ».** Les étapes qui suivent un
+  échec n'ont pas été atteintes ; ce n'est pas la même information pour qui
+  diagnostique.
+- **Le plan relu est revalidé intégralement.** Version de schéma, cohérence des
+  champs dérivés, bloqueurs recalculés depuis les sections, numérotation des
+  étapes, absence de secret : un document retouché à la main est refusé.
+- **Aucun secret dans la sortie**, y compris dans un message d'erreur, y compris
+  le chemin du fichier de plan.
+
+### Le rapport d'installation
+
+Chaque exécution produit le document qu'un opérateur archive : versions,
+empreintes, licences, matériel, modèle, performances et contrôles, plus l'état
+des **sept conditions du jalon M2** et la preuve de chacune.
+
+Deux propriétés à connaître :
+
+- il **ne prétend jamais plus que ce qui a été fait**. Une installation
+  partielle se lit comme telle au premier coup d'œil ;
+- il **distingue le constat de l'hypothèse**. Certaines variantes d'artefact
+  `llama-server` sont retenues sur hypothèse et non sur constat ; le rapport le
+  dit, parce que c'est exactement ce qu'un lecteur pressé prendrait pour un fait
+  vérifié six mois plus tard.
+
+`bootstrap-apply` ne remplace pas `doctor` (§8). `doctor` répond à « cet hôte
+peut-il démarrer **maintenant** ? » en sondant le système vivant ; le rapport
+d'installation répond à « qu'a produit **cette** installation, et qu'est-ce qui
+reste à faire ? » et ne périme pas. Les deux sont nécessaires.
 
 ---
 
