@@ -139,22 +139,19 @@ LIMITES_MESURE: tuple[str, ...] = (
 
 _ABSENT = object()
 
-# Écart ASSUMÉ avec la nomenclature littérale de §9, et sa raison.
+# Les débits portent les noms LITTÉRAUX de §9.
 #
-# §9 nomme les débits `prompt_tokens_per_second` et `generation_tokens_per_second`.
-# Ces deux noms sont IMPUBLIABLES : `schema._SECRET_KEY_RE` traite toute clé
-# contenant « TOKEN » comme un champ sensible, et `schema.assert_no_secrets()`
-# refuse alors de publier le document — y compris le journal d'exécution qui
-# transporte l'`evidence` de cette étape, dont le rendu ne nous appartient pas.
-# Suivre §9 à la lettre produirait donc un rapport que rien ne peut publier.
-#
-# Les débits sont publiés sous `prompt_tps` / `generation_tps`, avec `debit_unite`
-# pour lever l'ambiguïté. La correspondance est déclarée ici pour qu'un
-# consommateur qui a lu §9 retrouve ses champs sans lire ce code.
-SECTION9_KEY_ALIASES: dict[str, str] = {
-    "prompt_tokens_per_second": "prompt_tps",
-    "generation_tokens_per_second": "generation_tps",
-}
+# Ils ont d'abord été publiés sous les alias `prompt_tps` / `generation_tps` :
+# `schema._SECRET_KEY_RE` traitait alors toute clé contenant « TOKEN » comme
+# sensible, si bien que le rapport prescrit par §9 était impubliable — le rendu
+# le refusait, y compris à travers le journal d'exécution qui transporte
+# l'`evidence` de cette étape. Trois chantiers de la vague 6 ont buté sur ce
+# défaut indépendamment ; il est corrigé à sa source, dans `schema`, et les
+# alias ont disparu avec lui. `debit_unite` reste, il lève une ambiguïté réelle.
+SECTION9_DEBIT_KEYS: tuple[str, ...] = (
+    "prompt_tokens_per_second",
+    "generation_tokens_per_second",
+)
 
 DEBIT_UNITE = "jetons par seconde"
 
@@ -648,10 +645,8 @@ class PassMeasurement:
             "peak_ram_gb": _gib(self.peak_ram_bytes),
             "vram_total_bytes": self.vram_total_bytes,
             "ttft_ms": self.ttft_ms,
-            # Cf. SECTION9_KEY_ALIASES : les noms de §9 contiennent « token » et
-            # sont refusés par le détecteur de secrets.
-            "prompt_tps": self.prompt_tokens_per_second,
-            "generation_tps": self.generation_tokens_per_second,
+            "prompt_tokens_per_second": self.prompt_tokens_per_second,
+            "generation_tokens_per_second": self.generation_tokens_per_second,
             "sample_rounds": self.sample_rounds,
             "probe_failures": list(self.probe_failures),
         }
@@ -817,16 +812,9 @@ class CalibrationReport:
             "idle_ram_gb": _gib(self.idle_ram_bytes),
             "load_seconds": round(cible.load_seconds, 3),
             "ttft_ms": cible.ttft_ms,
-            "prompt_tps": cible.prompt_tokens_per_second,
-            "generation_tps": cible.generation_tokens_per_second,
+            "prompt_tokens_per_second": cible.prompt_tokens_per_second,
+            "generation_tokens_per_second": cible.generation_tokens_per_second,
             "debit_unite": DEBIT_UNITE,
-            # Publiée comme une LISTE de paires, pas comme un objet : le nom de
-            # §9 en position de clé déclencherait le détecteur de secrets, qui
-            # est exactement ce que cette table documente.
-            "section9_key_aliases": [
-                {"section9": origine, "publie": alias}
-                for origine, alias in SECTION9_KEY_ALIASES.items()
-            ],
             "sample_interval_seconds": self.sample_interval_seconds,
             "sequence": list(SEQUENCE_CALIBRATION),
             "passes": [p.to_dict() for p in self.passes],

@@ -526,7 +526,7 @@ def test_ttft_et_debits_viennent_de_la_passe_cible(tmp_path):
     assert rapport.target_pass.phase == cal.PHASE_TARGET
     document = rapport.to_dict()
     assert document["ttft_ms"] == rapport.target_pass.ttft_ms
-    assert document["generation_tps"] == 40.0
+    assert document["generation_tokens_per_second"] == 40.0
 
 
 def test_le_rapport_porte_toutes_les_empreintes_de_la_section_9(tmp_path):
@@ -538,30 +538,29 @@ def test_le_rapport_porte_toutes_les_empreintes_de_la_section_9(tmp_path):
         "idle_vram_gb", "peak_vram_gb", "peak_ram_gb", "tested_at",
     ):
         assert cle in calibration, cle
-    for cle in ("load_seconds", "ttft_ms", "prompt_tps", "generation_tps"):
+    for cle in ("load_seconds", "ttft_ms",
+                "prompt_tokens_per_second", "generation_tokens_per_second"):
         assert cle in document, cle
     assert document["kind"] == cal.CALIBRATION_KIND
     assert calibration["tested_at"] == "2026-08-01T10:00:00Z"
 
 
-def test_les_noms_de_debits_de_la_section_9_sont_impubliables_et_sont_donc_alias(tmp_path):
+def test_le_rapport_publie_les_noms_de_debits_litteraux_de_la_section_9(tmp_path):
     """
-    Défaut réel du contrat de §9, contourné ici et documenté par `SECTION9_KEY_ALIASES`.
+    §9 prescrit `prompt_tokens_per_second` et `generation_tokens_per_second`.
 
-    `schema._SECRET_KEY_RE` traite toute clé contenant « TOKEN » comme sensible.
-    Les noms `prompt_tokens_per_second` / `generation_tokens_per_second` prescrits
-    par §9 rendent donc le document IMPUBLIABLE : `assert_no_secrets()` le refuse,
-    y compris via le journal d'exécution dont le rendu ne nous appartient pas.
+    Ces noms ont été un temps impubliables : `schema._SECRET_KEY_RE` traitait
+    toute clé contenant « TOKEN » comme sensible, et le rendu refusait alors le
+    document. Le défaut est corrigé à sa source ; le rapport suit désormais §9
+    à la lettre, sans alias. Ce test verrouille les deux faces — les noms sont
+    présents ET le document reste publiable.
     """
     document = _document(tmp_path)
+    assert document["prompt_tokens_per_second"] == 200.0
+    assert document["generation_tokens_per_second"] == 40.0
     assert sc.find_secret_leaks(document) == ()
-    assert document["section9_key_aliases"] == [
-        {"section9": "prompt_tokens_per_second", "publie": "prompt_tps"},
-        {"section9": "generation_tokens_per_second", "publie": "generation_tps"},
-    ]
-    # Contrôle positif : ce sont bien ces noms-là qui déclenchent le détecteur.
-    fautif = {"prompt_tokens_per_second": 200.0}
-    assert sc.find_secret_leaks(fautif) != ()
+    # Contrôle positif : le détecteur voit toujours une vraie fuite ici.
+    assert sc.find_secret_leaks({**document, "hf_token": "x"}) != ()
 
 
 def test_le_rapport_publie_la_sequence_litterale_des_neuf_etapes(tmp_path):

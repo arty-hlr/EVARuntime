@@ -1369,15 +1369,18 @@ def test_en_application_une_entree_absente_reste_un_echec(atelier):
     assert [f.code for f in change.findings] == ["activation_entree_absente"]
 
 
-def test_le_resume_de_preuve_ne_contient_aucune_cle_piegee():
+def test_la_preuve_est_publiable_sous_ses_deux_formes():
     """
-    `find_secret_leaks()` refuse tout champ dont le NOM contient « token » —
-    `completion_tokens` suffirait donc à rendre un rapport impubliable. Le résumé
-    d'étape doit rester publiable ; le test vérifie les deux faces.
+    Le résumé d'étape ET la sérialisation complète doivent rester publiables.
+
+    La seconde ne l'était pas : `find_secret_leaks()` refusait alors tout champ
+    dont le NOM contenait « token », et `completion_tokens` suffisait à rendre
+    un rapport impubliable. Le défaut est corrigé dans `schema` ; `digest()`
+    subsiste comme résumé compact, plus comme contournement.
     """
     preuve = _preuve()
     assert sc.find_secret_leaks(preuve.digest()) == ()
     assert preuve.digest()["smoke_produced_output"] is True
-    # Contrôle positif : la sérialisation COMPLÈTE, elle, est bien refusée — c'est
-    # la raison d'être du résumé.
-    assert sc.find_secret_leaks(preuve.to_dict()) != ()
+    assert sc.find_secret_leaks(preuve.to_dict()) == ()
+    # Contrôle positif : le détecteur voit toujours une vraie fuite dans ce document.
+    assert sc.find_secret_leaks({**preuve.to_dict(), "hf_token": "x"}) != ()
