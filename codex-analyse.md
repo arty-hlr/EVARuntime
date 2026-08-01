@@ -20,21 +20,21 @@
 ```text
 M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 perf  ──  M4 pilote  ──  M5 prod
    [x] 30 juil.        [x] 31 juil.         [~] EN COURS         [ ]          [ ]           [ ]
-                                          bloqué par COR-020
+                                          bloqué par COR-022
 ```
 
 | | |
 |---|---|
-| **Où en est-on** | Jalons **M0 et M1 atteints**. La **vague 6 (M2) a livré ses sept modules d'exécution** et son applicateur : le système sait installer un runtime vérifié, télécharger des modèles à empreinte contrôlée, écrire un registre désactivé, calibrer, activer sur preuve, pré-chauffer, jouer la recette du premier token et produire un rapport d'installation (§0.13) |
-| **Ce qui bloque** | **COR-020**, découvert à l'assemblage : le plan ordonne `enable_model` **avant** le `smoke_test` dont l'activation exige la preuve, et la recette a besoin d'un modèle activé. Aucun plan produit par `bootstrap-plan` ne peut aller à son terme. L'applicateur le constate et refuse au lieu d'entamer. **DEC-010 tranchée le 2026-08-01 — voie A**, activation provisoire puis retour arrière ; reste à implémenter |
-| **Ce qui vient ensuite** | Implémenter **COR-020** selon la voie A, puis **AUT-016** — les contrats de sonde sont définis, le dépôt n'en contient aucune implémentation. Ces deux items sont exactement ce qui sépare « la mécanique est écrite » de « la machine peut s'installer » |
+| **Où en est-on** | Jalons **M0 et M1 atteints**, M1 ayant été **exercé sur deux VMs réelles** lors du second déploiement (§0.13). La **vague 6 (M2) a livré ses sept modules d'exécution** et son applicateur : le système sait installer un runtime vérifié, télécharger des modèles à empreinte contrôlée, écrire un registre désactivé, calibrer, activer sur preuve, pré-chauffer, jouer la recette du premier token et produire un rapport d'installation (§0.14) |
+| **Ce qui bloque** | **COR-022**, découvert à l'assemblage : le plan ordonne `enable_model` **avant** le `smoke_test` dont l'activation exige la preuve, et la recette a besoin d'un modèle activé. Aucun plan produit par `bootstrap-plan` ne peut aller à son terme. L'applicateur le constate et refuse au lieu d'entamer. **DEC-010 tranchée le 2026-08-01 — voie A**, activation provisoire puis retour arrière ; reste à implémenter |
+| **Ce qui vient ensuite** | Implémenter **COR-022** selon la voie A, puis **AUT-017** — les contrats de sonde sont définis, le dépôt n'en contient aucune implémentation. Ces deux items sont exactement ce qui sépare « la mécanique est écrite » de « la machine peut s'installer » |
 | **Santé des tests** | **1929 tests verts** (1866 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
-| **Reste à faire** | 37 items sur 70 (§0.3). Deux P0 ouverts : COR-020 (décidé, à implémenter) et AUT-016 |
-| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste entièrement déclarative, y compris pour le module qui prétend la mesurer. Aucun nginx réel dans un test automatisé — le point n° 1 de §10 est **codé, pas démontré**. Aucun réseau réel, aucun dépôt Hugging Face réel. Le plan n'a **jamais été appliqué de bout en bout** |
+| **Reste à faire** | 40 items sur 75 (§0.3). Deux P0 ouverts : COR-022 (décidé, à implémenter) et AUT-017 |
+| **Ce qui n'est toujours pas démontré** | Aucun test contre un **GPU réel** : la VRAM reste entièrement déclarative, y compris pour le module qui prétend la mesurer. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais sur GPU. Aucun nginx réel dans un test automatisé — le point n° 1 de §10 est **codé, pas démontré**. Le plan n'a **jamais été appliqué de bout en bout** |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
 décisions tranchées **et celle qui reste à prendre**, §0.7 le journal des
-livraisons, §0.8, §0.10, §0.12 et §0.13 les défauts trouvés en implémentant, en
+livraisons, §0.8, §0.10, §0.12, §0.13 et §0.14 les défauts trouvés en implémentant, en
 déployant et en assemblant — ceux qu'aucun des deux audits n'avait vus —, §0.9
 ce que l'exploitation doit savoir.
 
@@ -52,14 +52,14 @@ ce que l'exploitation doit savoir.
 | Champ | Valeur |
 |---|---|
 | Dernière mise à jour | 2026-08-01 |
-| Phase | **Vague 6 livrée, jalon M2 non prononcé** — les sept modules d'exécution et l'applicateur existent et sont verrouillés par leurs régressions ; la chaîne de preuve du plan reste dénouée (COR-020) |
+| Phase | **Vague 6 livrée, jalon M2 non prononcé** — les sept modules d'exécution et l'applicateur existent et sont verrouillés par leurs régressions ; la chaîne de preuve du plan reste nouée (COR-022). La vague 5 avait été livrée puis **exercée sur deux VMs réelles** (§0.13) |
 | Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
-| Jalon visé | **M2 — installation jusqu'au premier token** (§13) — conditions détaillées en §0.13.1 |
+| Jalon visé | **M2 — installation jusqu'au premier token** (§13) — conditions détaillées en §0.14.1 |
 | Branche de travail | `feat/lot-b-vague6-execution-bootstrap` (créée depuis `dev` @ `6e576a8`) |
 | Base de référence | `6e576a8` — 1257 tests verts, `ruff` propre |
-| Périmètre livré à ce jour | AUT-001 → AUT-007, AUT-011 → AUT-015, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
-| Périmètre de la vague 6 | AUT-006 → AUT-011 et AUT-015, plus AUT-014 né du besoin de contrat — **9 items** : 5 `[x]`, 3 `[~]`, plus COR-018 à COR-020, SEC-010 et AUT-016, tous nés de la vague (§0.13) |
-| Ce qui bloque la sortie de M2 | **COR-020** (DEC-010 tranchée, implémentation à faire) et **AUT-016** — les deux seuls P0 ouverts du dépôt |
+| Périmètre livré à ce jour | AUT-001 → AUT-007, AUT-011 → AUT-016, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, OPS-006, OPS-008, OPS-009, SEC-008, TST-001, TST-006 |
+| Périmètre de la vague 6 | AUT-006 → AUT-011 et AUT-016, plus AUT-015 né du besoin de contrat — **9 items** : 6 `[x]`, 3 `[~]` — plus COR-020 à COR-022, SEC-010 et AUT-017, tous nés de la vague (§0.14) |
+| Ce qui bloque la sortie de M2 | **COR-022** (DEC-010 tranchée, implémentation à faire) et **AUT-017** — les deux seuls P0 ouverts du dépôt |
 
 ### 0.2 Base de référence des tests et état courant
 
@@ -94,20 +94,20 @@ vérifiée par `bash -n`, à compléter avec EVA-044.
 
 ### 0.3 Avancement par lot
 
-| Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[!]` Décision | `[–]` Annulé |
-|---|---:|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 20 | 11 | 0 | 8 | 0 | 1 |
-| B — bootstrap automatisé | 16 | 10 | 3 | 3 | 0 | 0 |
-| C — performance | 8 | 0 | 0 | 8 | 0 | 0 |
-| D — sécurité et supply-chain | 10 | 1 | 0 | 9 | 0 | 0 |
-| E — tests et exploitation | 16 | 4 | 1 | 9 | 0 | 2 |
-| **Total** | **70** | **26** | **4** | **37** | **0** | **3** |
+| Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[–]` Annulé |
+|---|---:|---:|---:|---:|---:|
+| A — bloqueurs et invariants | 22 | 11 | 0 | 10 | 1 |
+| B — bootstrap automatisé | 17 | 12 | 3 | 2 | 0 |
+| C — performance | 8 | 0 | 0 | 8 | 0 |
+| D — sécurité et supply-chain | 10 | 1 | 0 | 9 | 0 |
+| E — tests et exploitation | 18 | 4 | 1 | 11 | 2 |
+| **Total** | **75** | **28** | **4** | **40** | **3** |
 
-**Dix-sept items ont été ajoutés au backlog après coup**, d'où 70 au lieu de 53.
-Aucun ne figurait dans les deux audits initiaux : tous sont nés de
+**Vingt-deux items ont été ajoutés au backlog après coup**, d'où 75 au lieu de
+53. Aucun ne figurait dans les deux audits initiaux : tous sont nés de
 l'implémentation, du déploiement réel ou de l'assemblage. C'est le chiffre le
-plus instructif du tableau — un tiers du travail réel n'était pas prévisible sur
-document.
+plus instructif du tableau — **près d'un tiers du travail réel n'était pas
+prévisible sur document**.
 
 | Origine | Items |
 |---|---|
@@ -115,7 +115,8 @@ document.
 | Premier déploiement réel sur deux VMs (§0.10) | COR-015 → COR-017, TST-006, OPS-008, OPS-009 |
 | Vague 4 | OPS-010 |
 | Vague 5 (§0.12) | SEC-009 |
-| **Vague 6 (§0.13)** | **AUT-014, AUT-015, AUT-016, COR-018, COR-019, COR-020, SEC-010** |
+| Second déploiement réel sur deux VMs (§0.13) | COR-018, COR-019, AUT-014, OPS-011, OPS-012 |
+| **Vague 6 (§0.14)** | **AUT-015, AUT-016, AUT-017, COR-020, COR-021, COR-022, SEC-010** |
 
 Les **8 items du jalon M0**, les **7 de la vague 4** et les **6 de la vague 5**
 sont terminés et vérifiés.
@@ -126,12 +127,13 @@ même chose. **OPS-010** est livré côté venvs, la borne sur les sauvegardes
 AUT-010** ont leur mécanique écrite, testée et verrouillée par des régressions —
 mais le dépôt ne contient **aucune implémentation de leurs sondes**. Rien n'a
 jamais été mesuré, aucun token n'a jamais été servi par ce chemin. Les passer
-`[x]` reviendrait à écrire que la machine peut s'installer ; c'est AUT-016 qui
+`[x]` reviendrait à écrire que la machine peut s'installer ; c'est AUT-017 qui
 le décidera.
 
-**Deux P0 restent ouverts** : **COR-020**, dont la décision DEC-010 est prise et
-l'implémentation à faire, et **AUT-016**. Les 7 items restants du Lot A sont en
-P1/P2.
+**Deux P0 restent ouverts**, tous deux nés de la vague 6 : **COR-022**, dont la
+décision DEC-010 est prise et l'implémentation à faire, et **AUT-017**. Les 10
+items restants du Lot A sont en P1/P2, dont COR-018 et COR-019 issus du second
+déploiement réel ; les 2 du Lot B sont AUT-014 (second déploiement) et AUT-017.
 
 ### 0.4 Vagues 1 à 3 — jalon M0 (historique)
 
@@ -167,7 +169,7 @@ tests de régression, qui doivent échouer avant le correctif et passer après.
 | ID | Décision | Retenu le |
 |---|---|---|
 | DEC-001 | **Anonymisation** pour la suppression d'utilisateur : la ligne `users` est conservée, les données personnelles sont effacées, `is_active = 0`, les clés sont révoquées. L'historique d'usage agrégé reste exploitable, la personne n'est plus ré-identifiable. Écarté : `ON DELETE CASCADE` (perte de traçabilité de facturation) et `SET NULL` (casse les jointures des rapports). | 2026-07-30 |
-| DEC-010 | **Activation provisoire avec retour arrière** pour dénouer la chaîne de preuve du plan d'amorçage (COR-020). L'ordre devient `calibrate → enable → smoke_test → (échec : retour à `disabled`) → warmup`. Assumé : une fenêtre pendant laquelle un modèle non encore validé est servable, bornée par le fait que l'amorçage précède l'ouverture du trafic. Écarté : aligner l'activation sur la seule calibration (contredit le critère d'acceptation d'AUT-007 — un modèle activé sans qu'aucun token n'ait été produit par lui) ; valider par un chemin d'admission interne (contredit §10, dont le point n° 1 exige le vrai chemin public). | 2026-08-01 |
+| DEC-010 | **Activation provisoire avec retour arrière** pour dénouer la chaîne de preuve du plan d'amorçage (COR-022). L'ordre devient `calibrate → enable → smoke_test → (échec : retour à `disabled`) → warmup`. Assumé : une fenêtre pendant laquelle un modèle non encore validé est servable, bornée par le fait que l'amorçage précède l'ouverture du trafic. Écarté : aligner l'activation sur la seule calibration (contredit le critère d'acceptation d'AUT-007 — un modèle activé sans qu'aucun token n'ait été produit par lui) ; valider par un chemin d'admission interne (contredit §10, dont le point n° 1 exige le vrai chemin public). | 2026-08-01 |
 | DEC-009 | **Suppression du composant `gateway-student`** : jamais déployé, aucun consommateur. Code, tests, documentation, unités systemd/nginx/nftables et job CI retirés du dépôt. Vérifié sans effet fonctionnel — ni `gateway` ni `node_agent` n'en dépendaient (aucun import, aucune clé `llmstu-*`, aucune route ni base partagée). Les items de backlog exclusivement student (**COR-011**, **OPS-005**, **OPS-007**) sont annulés, ainsi que **EVA-006** et **EVA-023** côté `claude-analyse-projet.md`. Écarté : garder le composant en l'état (surface de maintenance, CI et audit de dépendances pour du code mort). | 2026-07-30 |
 
 Les décisions DEC-002 à DEC-008 restent `[!]` : elles ne bloquent pas le jalon
@@ -175,7 +177,7 @@ M0 et seront tranchées à l'entrée des lots concernés.
 
 **DEC-010 — tranchée le 2026-08-01, voie A.** Comment un modèle
 peut-il être validé par la recette du premier token alors que cette recette
-exige qu'il soit déjà activé, et que l'activation exige la recette (COR-020) ?
+exige qu'il soit déjà activé, et que l'activation exige la recette (COR-022) ?
 Trois voies, aucune gratuite :
 
 | Voie | Ce qu'elle donne | Ce qu'elle coûte |
@@ -189,7 +191,7 @@ d'AUT-007 ni au chemin public de §10. Le coût est réel et assumé par écrit 
 fenêtre pendant laquelle un modèle non encore validé est servable. Elle est
 bornable — l'amorçage précède l'ouverture du trafic, et le retour arrière est
 déjà un mécanisme éprouvé du dépôt (§0.10). L'implémentation est suivie sous
-COR-020, et devra faire de cette fenêtre une propriété **testée**, pas une
+COR-022, et devra faire de cette fenêtre une propriété **testée**, pas une
 intention : un smoke test en échec doit reposer l'entrée en `enabled: false`, et
 un test doit échouer si ce n'est pas le cas.
 
@@ -247,18 +249,19 @@ un test doit échouer si ce n'est pas le cas.
 | 2026-07-31 | **M1** | `8e25616` | Les 2 suites + `ruff` sur les deux composants | **1243 réussis** (1180 / 63), jalon atteint 🔬 |
 | 2026-07-31 | AUT-001 | `c7a25c6` | `pytest tests -q` (gateway) + reproduction ciblée | 1193 réussis ; les six compteurs refusent booléens, flottants, valeurs négatives et clés hors contrat 🔬 |
 | 2026-07-31 | AUT-004 | `3fe1413` | Suite complète sous `GITHUB_ACTIONS=true`, puis sous Python 3.11 | **1194 réussis** ; échec CI-only fermé, un seul test dépendait de la colorisation 🔬 |
-| 2026-08-01 | AUT-014 | `7296be8` | `pytest tests -q` (gateway) + 27 mutations rejouées | 1287 réussis ; contrat du journal d'exécution, une mutation survivante a révélé un plancher de version manquant 🔬 |
+| 2026-07-31 | — | `6e576a8` | **Second déploiement réel sur deux VMs Debian 13** (§0.13) | Vague 5 exercée sur machine réelle ; SHA-256 du catalogue conformes, premier token en local et en cluster, COR-004 et panne de nœud vérifiés ; 2 défauts neufs, 4 confirmations 🔬 |
+| 2026-08-01 | AUT-015 | `7296be8` | `pytest tests -q` (gateway) + 27 mutations rejouées | 1287 réussis ; contrat du journal d'exécution, une mutation survivante a révélé un plancher de version manquant 🔬 |
 | 2026-08-01 | AUT-006 | `267aade`, `054eff6` | `pytest tests -q` (gateway) + 24 mutations + parité CI 3.11 | 1352 réussis ; aucun fichier ne porte son nom définitif sans être confronté au SHA du catalogue 🔬 |
-| 2026-08-01 | AUT-015 | `00818e9` | `pytest tests -q` (gateway) + 40 mutations rejouées | 1364 réussis ; extraction défensive, bascule atomique, version relue sur le binaire posé et fail-closed 🔬 |
+| 2026-08-01 | AUT-016 | `00818e9` | `pytest tests -q` (gateway) + 40 mutations rejouées | 1364 réussis ; extraction défensive, bascule atomique, version relue sur le binaire posé et fail-closed 🔬 |
 | 2026-08-01 | AUT-011 | `6133e3f` | `pytest tests -q` (gateway) + 26 mutations rejouées | 1362 réussis ; les sept conditions de M2 avec leur preuve, hypothèses restées visibles 🔬 |
 | 2026-08-01 | AUT-007 | `ffab29c` | `pytest tests -q` (gateway) + 32 mutations rejouées | 1390 réussis ; entrée écrite désactivée, activation sur preuve typée, commentaires préservés 🔬 |
 | 2026-08-01 | AUT-008 | `49987a7`, `02abcf8` | `pytest tests -q` (gateway) + 23 mutations rejouées | 1365 réussis ; pics relevés pendant la charge, mesure ratée jamais optimiste, déchargement en `finally` 🔬 |
 | 2026-08-01 | AUT-009, AUT-010 | `318b0c7`, `bb9b701`, `3d7676f` | `pytest tests -q` (gateway) + 27 mutations rejouées | 1407 réussis ; flux sans contenu = échec, log d'usage exigé, borne de préchauffage dérivée 🔬 |
 | 2026-08-01 | AUT-001 | `10e2f5e` | `pytest tests -q` (gateway) + mutation rejouée | 1703 réussis ; un comptage de jetons cesse d'être un secret, 3 contournements retirés, 30 tests rouges sans le correctif 🔬 |
-| 2026-08-01 | AUT-014 | `82b8bc9` | `pytest tests -q` (gateway) + 3 mutations rejouées | 1706 réussis ; version de contrat du plan recoupée, clés racine fermées, durée nulle respectée 🔬 |
+| 2026-08-01 | AUT-015 | `82b8bc9` | `pytest tests -q` (gateway) + 3 mutations rejouées | 1706 réussis ; version de contrat du plan recoupée, clés racine fermées, durée nulle respectée 🔬 |
 | 2026-08-01 | AUT-006 | `0836274` | `pytest tests -q` (gateway) + mutation rejouée | Le catalogue déclare le téléchargeur réellement employé ; le test recoupe la déclaration avec les imports 🔬 |
 | 2026-08-01 | AUT-007/008/009 | `b8cc007` | `pytest tests -q` (gateway) + 6 mutations rejouées | Contrats de preuve réconciliés, producteurs alignés sur le consommateur, aucune couche de traduction 🔬 |
-| 2026-08-01 | AUT-014 | `943a467`, `1dd5e00` | `pytest tests -q` (gateway) + 18 mutations + parité CI 3.11 | **1866 réussis** ; applicateur et `bootstrap-apply`, refus en bloc plutôt qu'exécution partielle 🔬 |
+| 2026-08-01 | AUT-015 | `943a467`, `1dd5e00` | `pytest tests -q` (gateway) + 18 mutations + parité CI 3.11 | **1866 réussis** ; applicateur et `bootstrap-apply`, refus en bloc plutôt qu'exécution partielle 🔬 |
 | 2026-08-01 | **Vague 6** | `1dd5e00` | Les 2 suites + `ruff` sur les deux composants | **1929 réussis** (1866 / 63) ; M2 **non prononcé**, bloqué par COR-020 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
@@ -667,7 +670,71 @@ Conditions de §13 et leur état :
 installerait et pourquoi. Le travail d'exécution (M2 : AUT-006 → AUT-011) peut
 démarrer sur une base qui décrit correctement son intention.
 
-### 0.13 Vague 6 — l'exécution du plan (jalon M2)
+### 0.13 Second déploiement réel sur deux VMs (2026-07-31)
+
+Second parcours complet joué hors CI, sur deux VM **Debian 13** neuves
+(4 vCPU, 3 Go de RAM, **sans GPU**, 26 Go libres) : `install.sh --mode local` sur
+EvR-A, `install-agent.sh` sur EvR-B, puis migration `update.sh --mode cluster
+--allow-mode-change`. `llama-server` **réellement compilé** (CPU, `GGML_CUDA=OFF`,
+clone complet → build **10210**, version lisible) et les **deux GGUF du catalogue
+d'amorçage** téléchargés à leur révision épinglée.
+
+Ce que ce run ajoute au précédent (§0.10) : il exerce pour la première fois la
+**vague 5** sur une machine réelle — `bootstrap-plan`, le catalogue, le résolveur
+de runtime et le lecteur de header GGUF n'avaient jamais tourné hors des tests.
+
+#### Ce que le run a validé 🔬
+
+| Objet | Résultat observé |
+|---|---|
+| **Empreintes du catalogue (AUT-005)** | Les deux GGUF téléchargés correspondent **au bit près** aux SHA-256 épinglés. Première vérification terrain — c'était la revendication la plus risquée de la vague |
+| **`bootstrap-plan` sans épinglage** | Bloqué, exit 1, **zéro étape** proposée |
+| **`bootstrap-plan` épinglé + `--llama-bin`** | Reconnaît le binaire en place (build 10210 ≥ plancher), 15 étapes, **837,1 Mio annoncés = 838 Mo réellement présents** |
+| **Lecture du header GGUF (AUT-013)** | Sur fichiers réels : `qwen2`, 24 blocs, 896 d'embedding, 14/2 têtes GQA, ctx 32768, 291 tenseurs, vocab 151936 |
+| **Refus du mode cluster (vague 5)** | Exit 2 avec la conduite à tenir |
+| Premier token via nginx + TLS | HTTP 200 en **5,09 s** à froid, réponse correcte |
+| SSE réellement non bufferisé | deltas espacés de ~70 ms |
+| Éviction LRU | chargement du second modèle → premier évincé |
+| **COR-004** | **409 après 5 s de drain borné, aucun modèle déchargé, flux survivant jusqu'au bout** (2004 deltas + `DONE`) |
+| OPS-009 | `nginx -t` silencieux ; `http2 on;` rendu **automatiquement** sur nginx 1.26.3 |
+| COR-009 | timeouts nginx dérivés du registre à 900 s |
+| OPS-008 | timer `active` et présent dans `list-timers` |
+| SEC-008 | 0 occurrence du nom d'utilisateur sur 105 lignes de journal, contrôle positif inclus |
+| OPS-010 | `venv` est un symlink, 1 release conservée |
+| Panne de nœud | offline après 3 heartbeats, **503 au format OpenAI**, `/ready` 503, retour en ligne et rechargement transparents |
+| Bascule cluster | `update.sh --allow-mode-change` : doctor avant/après + recette du premier token, exit 0 |
+| Recette autonome | SUCCÈS, TTFT 4 ms à chaud |
+
+Deux garde-fous se sont déclenchés **d'eux-mêmes, contre l'opérateur** : `doctor`
+a refusé de valider une clé TLS posée en 0640 au lieu de 0600, et `update.sh` a
+refusé un checkout git modifié.
+
+#### Défauts trouvés — deux nouveaux, quatre confirmés
+
+| Découverte | Preuve | Item |
+|---|---|---|
+| **`install-agent.sh` exige `rsync`, absent des prérequis documentés.** Le préflight le réclame et le script s'en sert deux fois, mais le mot n'apparaît **nulle part** dans `docs/deployment.md`. Sur une Debian 13 minimale il n'est pas installé : l'installation d'un nœud neuf échoue au premier écran. | Reproduit : `[ERREUR] Commande requise absente : rsync`, exit 1 🔬 | **OPS-011** |
+| **Le plan propose de télécharger des artefacts qu'il a lui-même détectés comme présents.** L'inspection GGUF locale est rattachée à chaque modèle retenu (`local_inspection` non nulle, header lu), et pourtant les étapes `download_model` sont émises avec leur volume complet. Un opérateur qui applique le plan re-télécharge 837 Mio pour rien. | Reproduit sur EvR-A, GGUF déjà présents et vérifiés 🔬 | **AUT-014** |
+| **`install.sh --mode local` exige toujours `nvidia-smi` sans échappatoire.** Deuxième run réel bloqué par ce préflight. Le §0.10 l'avait laissé « à trancher » ; deux bancs CPU s'y sont heurtés depuis. | Reproduit : le run a dû relâcher la ligne 149 du script pour installer 🔬 | **OPS-012** |
+| **La queue d'admission reste inerte en mode cluster.** `/v1/capacity` renvoie `enabled: false, status: unavailable` alors que `CAPACITY_QUEUE_ENABLED=true`. Contredit l'invariant annoncé par `AGENTS.md` : « le mode cluster garde le même comportement public que le mode local ». Déjà relevé au §0.10, toujours vrai. | Reproduit sur l'orchestrateur en cluster 🔬 | **COR-019** |
+| **`/admin/cluster` affiche encore les modèles d'un nœud hors ligne.** Pendant la panne, `online: false` et `consecutive_failures: 3` sont corrects, mais `loaded_models` continue d'annoncer un modèle chargé. Induit en erreur dans un diagnostic d'incident. Déjà relevé au §0.10. | Reproduit pendant la coupure du nœud 🔬 | **COR-018** |
+| **COR-008 confirmé** : le corps du 429 est `{"detail":{"error":{…}}}` — double enveloppe. Le 503 cluster, lui, est correctement `{"error":{…}}`. La divergence annoncée par l'item est donc bien réelle et visible côté client. | Reproduit avec un quota abaissé à 3 req/min 🔬 | COR-008 (existant) |
+| **SEC-001 confirmé** : le dashboard charge `cdn.jsdelivr.net` (chart.js) et `fonts.googleapis.com`. Il ne fonctionne pas hors ligne et adresse deux tiers à chaque ouverture. | Reproduit : 4 références externes dans le HTML servi 🔬 | SEC-001 (existant) |
+| **Debian 13 reste hors matrice de support.** Les deux runs réels ont eu lieu dessus ; `docs/deployment.md` §1 ne cite qu'Ubuntu 22.04/24.04. | Constat 📖 | Décision produit, toujours ouverte (§0.8) |
+
+#### Ce que ce run ne prétend pas avoir démontré
+
+- **Le rollback n'a pas été rejoué.** L'injection d'une régression volontaire a
+  été refusée par le garde-fou de l'environnement d'exécution, et le contournement
+  n'a pas été tenté. Le rollback reste validé par le run du 30/07 (§0.10), pas par
+  celui-ci.
+- **Toujours aucun GPU** : la VRAM reste déclarative, et le préflight `nvidia-smi`
+  a dû être relâché localement pour installer en mode local (voir OPS-012). Le
+  checkout a été remis en état avant la bascule cluster — `update.sh` l'a d'ailleurs
+  exigé.
+- **`update-agent.sh` n'a pas été exercé** : le nœud a été installé, pas mis à jour.
+
+### 0.14 Vague 6 — l'exécution du plan (jalon M2)
 
 Cette vague livre les **exécuteurs** : les modules qui appliquent réellement le
 plan que la vague 5 sait écrire. Elle est la première du projet à toucher au
@@ -676,17 +743,36 @@ disque, au réseau et au cycle de vie des modèles autrement que pour observer.
 Elle commence par deux items que personne n'avait planifiés, et qui n'existaient
 dans aucun des deux audits.
 
+> **Note de renumérotation.** Cette vague a été développée en parallèle du
+> second déploiement réel (§0.13), qui a ouvert ses propres items sur `dev`
+> pendant ce temps. Trois identifiants sont entrés en collision à la fusion et
+> ont été **décalés du côté de la vague 6**, `dev` faisant foi. Les messages de
+> commit portent donc les identifiants d'avant le décalage — voici la table de
+> correspondance, sans laquelle `git log` et ce document se contrediraient :
+>
+> | Dans les commits | Dans ce document | Objet |
+> |---|---|---|
+> | `AUT-014` | **AUT-015** | Contrat du journal d'exécution |
+> | `AUT-015` | **AUT-016** | Installation du runtime |
+> | `AUT-016` | **AUT-017** | Sondes de production |
+> | `COR-018` | **COR-020** | `models.yaml` détruit par les mutations admin |
+> | `COR-019` | **COR-021** | `assert` portant un invariant de production |
+> | `COR-020` | **COR-022** | Chaîne de preuve nouée |
+>
+> Les identifiants du second déploiement — `AUT-014`, `COR-018`, `COR-019`,
+> `OPS-011`, `OPS-012` — sont **inchangés** : ils étaient sur `dev` les premiers.
+
 | Chantier | Items | Priorité | Fichiers possédés | Tests | État |
 |---|---|---|---|---:|---|
-| — | AUT-014 (contrat, préalable) | P0 | `bootstrap/execution.py` | +93 | `[x]` |
-| D0 | AUT-015 | P0 | `bootstrap/runtime_installer.py` | +77 | `[x]` |
+| — | AUT-015 (contrat, préalable) | P0 | `bootstrap/execution.py` | +93 | `[x]` |
+| D0 | AUT-016 | P0 | `bootstrap/runtime_installer.py` | +77 | `[x]` |
 | D1 | AUT-006 | P0 | `bootstrap/downloader.py` | +65 | `[x]` |
 | D2 | AUT-007 | P1 | `bootstrap/registry_writer.py` | +103 | `[x]` |
 | D3 | AUT-008 | P1 | `bootstrap/calibration.py` | +78 | `[x]` |
 | D4 | AUT-009, AUT-010 | P0 / P1 | `bootstrap/first_token.py`, `warmup.py` | +120 | `[x]` |
 | D5 | AUT-011 | P1 | `bootstrap/install_report.py` | +75 | `[x]` |
 | — | AUT-001 (défaut de contrat) | P0 | `bootstrap/schema.py` | +17 | `[x]` |
-| — | AUT-014 (revue) | P1 | `bootstrap/execution.py` | +3 | `[x]` |
+| — | AUT-015 (revue) | P1 | `bootstrap/execution.py` | +3 | `[x]` |
 | — | AUT-006 (déclaration de licence) | P2 | `bootstrap/catalog.*` | +1 | `[x]` |
 
 Les six chantiers ont été menés **en parallèle**, dans des worktrees git isolés,
@@ -696,13 +782,13 @@ appliquées et rejouées** au total, pas seulement affirmées.
 
 #### Deux items qui manquaient au backlog
 
-- **AUT-014 — le contrat du journal d'exécution.** La revue de la vague 5 avait
+- **AUT-015 — le contrat du journal d'exécution.** La revue de la vague 5 avait
   posé la question sans lui donner d'identifiant : « l'enjeu est M2, qui
   appliquera des plans relus depuis un fichier ; un applicateur ne doit jamais
   pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe »
   (§0.12). Sans ce contrat figé **avant** les chantiers, six modules auraient
   chacun inventé le leur — et la parallélisation aurait été impossible.
-- **AUT-015 — l'installation du runtime.** Trou franc du backlog. AUT-003
+- **AUT-016 — l'installation du runtime.** Trou franc du backlog. AUT-003
   *résout* quelle variante de `llama-server` installer et s'arrête là ; aucun
   item ne portait la pose du binaire, alors que le jalon M2 l'exige en
   **première** condition. Ni l'audit Codex, ni l'audit Claude, ni cinq vagues
@@ -754,14 +840,14 @@ corrigés** : ils deviennent des items ou enrichissent ceux qui existaient.
 |---|---|---|
 | **`proxy._stream_proxy` ne teste jamais `response.status_code` dans la branche streaming.** Le statut est lu puis utilisé **uniquement** pour le log d'usage ; le `StreamingResponse` est déjà parti avec un 200. Un `llama-server` qui répond 400/500 avec un corps JSON non-SSE voit ce corps relayé ligne par ligne, sous **HTTP 200**, sans préfixe `data:` ni `[DONE]`. Le client voit un succès, le journal enregistre un 502 : les deux vues divergent en silence. | AUT-009, en lisant le chemin qu'il devait exercer | **COR-013 précisé** — l'item existait, son libellé sous-estimait la portée 📖 |
 | **La double enveloppe d'erreur est confirmée**, et `type`/`code` sont inversés par rapport à la convention OpenAI : `auth.py` lève `HTTPException(detail={"error": …})` sans handler dédié, donc `/v1/*` sort `{"detail": {"error": …}}` là où `proxy._openai_error` sort `{"error": …}`. Par ailleurs `_openai_error` met la classe machine dans `type` et le **statut HTTP en chaîne** dans `code` ; `_sse_error` n'émet aucun `code`. La même panne n'a pas la même forme avant et pendant le flux. | AUT-009 | **COR-008 précisé** 📖 |
-| **`ModelRegistry._save()` détruit tous les commentaires de `models.yaml`.** `add()`, `update()`, `set_enabled()` et `remove()` — donc l'API admin et le dashboard — réécrivent le fichier par `yaml.dump`. Sur le fichier livré, cela efface 55 lignes d'en-tête opérationnel (budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7`). S'y ajoutent l'absence de sauvegarde et de `fsync`, et un basculement silencieux des permissions en 0600. **Perte de données en production, aujourd'hui.** | AUT-007 | Nouvel item **COR-018** 📖 |
-| **`runtime_resolver._judge_existing_binary` fait confiance à un manifeste qu'il ne recoupe jamais contre le binaire.** Ni la version ni le commit du manifeste ne sont confrontés au build réellement rendu par `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. | AUT-015 | **SEC-009 élargi** 📖 |
-| **Des `assert` portent des invariants de production** dans `runtime_resolver` (`assert match is not None`, `assert variant is not None`). Sous `python -O` — que rien n'interdit dans une unité systemd — ils disparaissent et l'erreur devient un `AttributeError` opaque au lieu d'un refus nommé. | AUT-015 | Nouvel item **COR-019** 📖 |
+| **`ModelRegistry._save()` détruit tous les commentaires de `models.yaml`.** `add()`, `update()`, `set_enabled()` et `remove()` — donc l'API admin et le dashboard — réécrivent le fichier par `yaml.dump`. Sur le fichier livré, cela efface 55 lignes d'en-tête opérationnel (budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7`). S'y ajoutent l'absence de sauvegarde et de `fsync`, et un basculement silencieux des permissions en 0600. **Perte de données en production, aujourd'hui.** | AUT-007 | Nouvel item **COR-020** 📖 |
+| **`runtime_resolver._judge_existing_binary` fait confiance à un manifeste qu'il ne recoupe jamais contre le binaire.** Ni la version ni le commit du manifeste ne sont confrontés au build réellement rendu par `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. | AUT-016 | **SEC-009 élargi** 📖 |
+| **Des `assert` portent des invariants de production** dans `runtime_resolver` (`assert match is not None`, `assert variant is not None`). Sous `python -O` — que rien n'interdit dans une unité systemd — ils disparaissent et l'erreur devient un `AttributeError` opaque au lieu d'un refus nommé. | AUT-016 | Nouvel item **COR-021** 📖 |
 | **`smoke_test.sh` passe le nom d'utilisateur en query string** (`GET /admin/usage?username=…`). Le nom y est éphémère et généré, donc sans donnée personnelle ; mais `main._redact_path()` redacte le **chemin**, pas la **requête**. Un vrai `username` passé à cette route atterrirait dans les journaux d'accès, ce que SEC-008 interdit. | AUT-009 | Nouvel item **SEC-010** 🧭 |
-| **`schema.validate_plan_dict()` n'a pas de plancher de version** : seule une version *plus récente* est refusée. Un document portant `schema_version: 0` passe sans une erreur, et tout consommateur qui ne fait que valider traitera un plan d'un contrat antérieur comme un plan courant. | AUT-014, par une mutation qui a **survécu** | Contourné dans `execution` par une égalité stricte ; le contrat du plan reste ouvert 🔬 |
-| **`schema.PlanSection.to_dict()` publie une référence, pas une copie** : muter le document rendu modifie le plan typé et donc tous les rendus ultérieurs. Un plan « immuable par contrat » est mutable par son propre rendu. | AUT-014 | Constat 🔬 — l'enjeu grandit en M2, où un applicateur manipule le document relu à côté du plan typé |
+| **`schema.validate_plan_dict()` n'a pas de plancher de version** : seule une version *plus récente* est refusée. Un document portant `schema_version: 0` passe sans une erreur, et tout consommateur qui ne fait que valider traitera un plan d'un contrat antérieur comme un plan courant. | AUT-015, par une mutation qui a **survécu** | Contourné dans `execution` par une égalité stricte ; le contrat du plan reste ouvert 🔬 |
+| **`schema.PlanSection.to_dict()` publie une référence, pas une copie** : muter le document rendu modifie le plan typé et donc tous les rendus ultérieurs. Un plan « immuable par contrat » est mutable par son propre rendu. | AUT-015 | Constat 🔬 — l'enjeu grandit en M2, où un applicateur manipule le document relu à côté du plan typé |
 | **`catalog.CatalogFile.size_bytes` est optionnel** alors qu'aucune prévision d'espace disque n'est possible sans lui : une entrée peut être `pinned`, donc planifiable, tout en étant intéléchargeable. | AUT-006 | Refus explicite côté téléchargeur ; la cohérence voudrait que `size_bytes` entre dans la définition de l'épinglage 📖 |
-| **Aucune variante de `DEFAULT_VARIANTS` ne porte `approx_bytes`** : le volume annoncé par le plan **ignore entièrement** le téléchargement du runtime. Un opérateur qui dimensionne son disque depuis le plan sous-compte de plusieurs centaines de Mo pour une variante CUDA. | AUT-015 | Constat 📖 |
+| **Aucune variante de `DEFAULT_VARIANTS` ne porte `approx_bytes`** : le volume annoncé par le plan **ignore entièrement** le téléchargement du runtime. Un opérateur qui dimensionne son disque depuis le plan sous-compte de plusieurs centaines de Mo pour une variante CUDA. | AUT-016 | Constat 📖 |
 | **Divergence de regex d'identifiant** entre le catalogue (3 à 64 caractères) et le registre (1 à 63). Une entrée de catalogue de 64 caractères est valide en amont et refusée en aval ; le pont ne le découvrirait qu'à l'écriture. | AUT-007 | Contrôlé côté `registry_writer`, non aligné en amont 📖 |
 | **`models.yaml` livré : `gemma-4-26b-a4b` est `enabled: true` avec un chemin portant le commentaire « À ajuster selon le chemin réel ».** Un modèle activé dont le fichier est déclaré incertain fait échouer `/ready` (COR-005), donc `update.sh`. | AUT-007 | Constat 📖 — à trancher |
 | **`codex-analyse.md` §9 n'ordonne pas le déchargement du modèle** entre la passe réduite et la passe cible, ni après. Suivre la spécification à la lettre laisse le modèle chargé, ce qui contredit les invariants de cycle de vie d'`AGENTS.md`. | AUT-008 | **Défaut de la spécification elle-même**, pas du code. Le déchargement a été ajouté ; §9 devrait l'inscrire 📖 |
@@ -800,7 +886,7 @@ ce smoke test, et la recette de §10 passe par `/v1/chat/completions`, qui refus
 un modèle désactivé. **Aucun plan produit par `bootstrap-plan` ne peut aller à
 son terme.** L'applicateur le constate avant toute exécution
 (`chaine_de_preuve_impossible`) et refuse, plutôt que d'entamer un plan qu'il ne
-peut pas finir. C'est **COR-020**, et c'est ce qui tient le jalon M2 ouvert ;
+peut pas finir. C'est **COR-022**, et c'est ce qui tient le jalon M2 ouvert ;
 la décision est posée en **DEC-010**.
 
 Deux autres incohérences ne se voyaient qu'une fois les modules côte à côte :
@@ -872,15 +958,15 @@ d'architecture**, aussi bien écrite soit-elle.
   ne purge rien, comme `update.sh` avant OPS-010 et comme les sauvegardes
   `*.pre-migration.*.bak` (OPS-002).
 
-#### 0.13.1 Sortie du jalon M2 — **non prononcée**
+#### 0.14.1 Sortie du jalon M2 — **non prononcée**
 
 Conditions de §13 et leur état réel :
 
 | Condition M2 | État |
 |---|---|
-| Runtime installé et vérifié | `[~]` — AUT-015 livré et testé : extraction défensive, bascule atomique, version relue sur le binaire posé, fail-closed. Mais `DEFAULT_VARIANTS` ne porte **aucune empreinte**, donc en configuration par défaut rien ne s'installe |
+| Runtime installé et vérifié | `[~]` — AUT-016 livré et testé : extraction défensive, bascule atomique, version relue sur le binaire posé, fail-closed. Mais `DEFAULT_VARIANTS` ne porte **aucune empreinte**, donc en configuration par défaut rien ne s'installe |
 | Modèle téléchargé à révision figée | `[x]` — AUT-006, l'invariant central est verrouillé par 24 mutations |
-| Licence acceptée | `[~]` — le mécanisme existe et refuse fail-closed, mais **aucun moyen de fournir une acceptation** depuis la CLI (AUT-016) |
+| Licence acceptée | `[~]` — le mécanisme existe et refuse fail-closed, mais **aucun moyen de fournir une acceptation** depuis la CLI (AUT-017) |
 | Calibration effectuée | `[~]` — AUT-008 : mécanique complète, **aucune sonde implémentée**, rien n'a jamais été mesuré |
 | Modèle préchauffé | `[~]` — AUT-010 : borne dérivée du registre, mais rien n'appelle le module |
 | Appel E2E réussi | `[~]` — AUT-009 : les douze points de §10 sont codés, **aucun nginx réel traversé**, aucun client HTTP concret |
@@ -889,12 +975,12 @@ Conditions de §13 et leur état réel :
 **Décision de sortie : refusée.** Deux raisons, l'une structurelle et l'autre
 matérielle :
 
-1. **COR-020** — la chaîne de preuve du plan est nouée sur elle-même. Aucun plan
+1. **COR-022** — la chaîne de preuve du plan est nouée sur elle-même. Aucun plan
    produit par `bootstrap-plan` ne peut être appliqué jusqu'au bout. Tant que
-   COR-020 n'est pas implémenté — DEC-010 tranche pour la voie A —, la
+   COR-022 n'est pas implémenté — DEC-010 tranche pour la voie A —, la
    condition « appel E2E réussi » est inatteignable par construction, pas par
    manque de code.
-2. **AUT-016** — trois modules définissent le contrat de leurs sondes et le
+2. **AUT-017** — trois modules définissent le contrat de leurs sondes et le
    dépôt n'en contient aucune implémentation. `bootstrap-apply` ne câble que 5
    des 9 actions et refuse tout plan réel en code 2.
 
@@ -1775,20 +1861,22 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-005 | `[x]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
 | COR-006 | `[x]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
 | COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
-| COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe, et `type`/`code` suivent la convention OpenAI. **Précisé le 2026-08-01** (§0.13) : la double enveloppe est confirmée — `auth.py` lève `HTTPException(detail={"error": …})` et aucun handler `HTTPException` n'existe, donc `/v1/*` sort `{"detail": {"error": …}}` là où `proxy._openai_error` sort `{"error": …}`. S'y ajoutent deux écarts non relevés jusqu'ici : `_openai_error` met la classe machine dans `type` et le **statut HTTP en chaîne** dans `code`, à l'inverse de la convention OpenAI (un client SDK qui teste `err.code == "model_not_found"` échoue) ; et `_sse_error` code `"type": "server_error"` en dur **sans émettre de `code`**, de sorte que la même panne n'a pas la même forme avant et pendant le flux. |
+| COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe, et `type`/`code` suivent la convention OpenAI. **Reproduit sur hôte réel le 2026-07-31** (§0.13) : un 429 de quota rend `{"detail":{"error":{…}}}` alors qu'un 503 cluster rend correctement `{"error":{…}}` — la divergence est visible côté client, sur deux chemins d'erreur du même service. **Cause établie et portée élargie le 2026-08-01** (§0.14) : `auth.py` lève `HTTPException(detail={"error": …})` et **aucun handler `HTTPException` n'existe**, donc FastAPI ré-enveloppe. S'y ajoutent deux écarts que le terrain n'avait pas montrés : `proxy._openai_error` met la classe machine dans `type` et le **statut HTTP en chaîne** dans `code`, à l'inverse de la convention OpenAI (un client SDK qui teste `err.code == "model_not_found"` échoue) ; et `_sse_error` code `"type": "server_error"` en dur **sans émettre de `code`**, de sorte que la même panne n'a pas la même forme avant et pendant le flux. |
 | COR-009 | `[x]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. **Livré le 2026-07-30** : `/ready` et `/completion` étaient documentés sur l'URL publique mais retombaient en 404 côté nginx ; les timeouts sont désormais dérivés du `load_timeout_seconds` maximal du registre (900 s) au lieu des 30 s qui faisaient échouer tout pré-chargement admin en 504. |
 | COR-010 | `[ ]` | P1 | Corriger `revoke_key()` | `%` et `_` sont littéraux ou rejetés ; seconde révocation a un comportement défini. |
 | COR-011 | `[–]` | — | ~~Corriger le slot student abandonné~~ | Annulé : composant supprimé (DEC-009). |
 | COR-012 | `[ ]` | P1 | Définir une réservation de quota | Les requêtes concurrentes ne dépassent pas silencieusement le budget, ou le dépassement maximal accepté est borné et documenté. |
-| COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. **Portée corrigée le 2026-08-01** (§0.13) : le libellé sous-estimait le défaut. `proxy._stream_proxy` ne teste **jamais** `response.status_code` dans la branche streaming — il le lit et ne s'en sert que pour le log d'usage, le `StreamingResponse` étant déjà parti avec un 200. Un backend qui répond 400/500 avec un corps JSON non-SSE voit ce corps **relayé ligne par ligne**, sous HTTP 200, sans préfixe `data:` ni `[DONE]`. Le client conclut au succès, le journal enregistre un 502 : les deux vues divergent en silence. Le cas *timeout/connexion* est mieux traité (`_sse_error` émet bien une erreur SSE puis `[DONE]`), mais il ne couvre que les exceptions `httpx`, pas un statut HTTP d'erreur. |
+| COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. **Portée corrigée le 2026-08-01** (§0.14) : le libellé sous-estimait le défaut. `proxy._stream_proxy` ne teste **jamais** `response.status_code` dans la branche streaming — il le lit et ne s'en sert que pour le log d'usage, le `StreamingResponse` étant déjà parti avec un 200. Un backend qui répond 400/500 avec un corps JSON non-SSE voit ce corps **relayé ligne par ligne**, sous HTTP 200, sans préfixe `data:` ni `[DONE]`. Le client conclut au succès, le journal enregistre un 502 : les deux vues divergent en silence. Le cas *timeout/connexion* est mieux traité (`_sse_error` émet bien une erreur SSE puis `[DONE]`), mais il ne couvre que les exceptions `httpx`, pas un statut HTTP d'erreur. |
 | COR-014 | `[x]` | P0 | Rendre chargeables les réglages de liste de l'environnement | `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `ALLOWED_MODELS` acceptent la syntaxe documentée sans faire échouer le démarrage ; les fichiers d'exemple livrés sont chargeables. **Item ajouté le 2026-07-30**, découvert par AUT-012 : ces trois réglages étaient inutilisables tels que documentés. |
 | COR-015 | `[x]` | P0 | Réparer le démarrage en mode cluster | `CLUSTER_MODE=cluster` démarre et sert ; la régression est verrouillée par TST-006. **Item ajouté le 2026-07-30** (§0.10). Correctif d'une ligne appliqué et vérifié sur VM (`n.node_id` → `n.id` dans `model_manager._build_manager()`), puis **verrouillé par TST-006** le 2026-07-30 : réintroduire `n.node_id` fait échouer 2 tests sur `AttributeError`. |
 | COR-016 | `[x]` | P0 | Rendre `update-agent.sh` capable de réussir | Une mise à jour de node-agent aboutit sans rollback, et la stratégie de venv est la même que celle de `update.sh` (construction à l'emplacement final, bascule par symlink) plutôt qu'un déplacement de venv. **Item ajouté le 2026-07-30** (§0.10). Contournement appliqué et vérifié sur VM (`ExecStart` via `python -m uvicorn`, conservé en défense en profondeur), puis **correctif structurel livré** le 2026-07-30 : le venv est construit à son emplacement définitif et `venv-agent` devient un symlink que l'on bascule, comme dans `update.sh`. Un agent installé par l'ancien script est migré en place, sans action opérateur. Test de non-régression : un exécutable de `bin/` doit rester lançable après la bascule. |
 | COR-017 | `[x]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10), **livré le même jour** : `reset-failed` avant chaque démarrage dans les 4 scripts de déploiement, et l'échec de redémarrage d'un rollback sort désormais en code 9 « INDISPONIBILITÉ », distinct du code 1 « version précédente restaurée et en service ». |
 
-| COR-018 | `[ ]` | P1 | Préserver `models.yaml` lors des mutations admin | Une mutation par l'API admin ou le dashboard conserve les commentaires du fichier, produit une sauvegarde, écrit atomiquement avec `fsync`, et laisse les permissions inchangées. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-007 : `ModelRegistry._save()` réécrit le fichier entier par `yaml.dump`, ce qui efface les 55 lignes d'en-tête opérationnel du fichier livré — budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7` — et tous les commentaires d'entrée. Il ne sauvegarde pas, ne synchronise pas, et `NamedTemporaryFile` fait basculer le fichier en 0600 sans restaurer les permissions d'origine. Perte de données en production, aujourd'hui, sur un chemin emprunté par le dashboard. `bootstrap/registry_writer.py` montre la forme attendue : ajout textuel, reparse comparatif, refus plutôt que réécriture globale. |
-| COR-020 | `[ ]` | **P0** | Dénouer la chaîne de preuve du plan d'amorçage | Un plan produit par `bootstrap-plan` peut être appliqué **jusqu'à son terme** : aucune étape n'exige une preuve qu'une étape ultérieure produit. **Item ajouté le 2026-08-01** (§0.13), découvert à l'assemblage de la vague 6 — aucun chantier ne pouvait le voir seul. Le planificateur (vague 5) ordonne, par modèle, `download → write_registry → calibrate → enable_model → warmup`, puis ajoute **un seul** `smoke_test` final, décrit comme « unique et finale — elle valide la chaîne, pas un modèle en particulier ». Or le critère d'acceptation d'AUT-007 exige l'inverse : « entrée désactivée tant que la calibration **et le smoke test** n'ont pas réussi », donc une preuve **par modèle**, **avant** l'activation. Et la recette de §10 passe par `/v1/chat/completions`, qui refuse un modèle `enabled: false` (`model_disabled`). Les trois contraintes ne peuvent pas être vraies ensemble. **Bloque la sortie du jalon M2.** **Décision prise le 2026-08-01 — voie A** (DEC-010) : activation provisoire puis retour arrière si la recette échoue. Reste à implémenter, et la fenêtre d'exposition doit être une propriété **testée** : un smoke test en échec repose l'entrée en `enabled: false`, et un test échoue si ce n'est pas le cas. |
-| COR-019 | `[ ]` | P2 | Ne pas porter d'invariant de production par `assert` | Aucun `assert` ne garde un invariant dont la violation doit produire une erreur nommée. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-015 : `runtime_resolver.ProvenanceManifest.build_number` et `to_decision()` s'appuient sur `assert match is not None` / `assert variant is not None`. Sous `python -O`, que rien n'interdit dans une unité systemd, ces gardes disparaissent et le refus explicite devient un `AttributeError` opaque. À rechercher ailleurs dans le dépôt avant de conclure. |
+| COR-018 | `[ ]` | P2 | Cesser d'annoncer les modèles d'un nœud hors ligne | Pendant qu'un nœud est `online: false`, `/admin/cluster` ne présente plus ses `loaded_models` comme chargés : la liste est vidée ou explicitement marquée `unavailable`, et un test le verrouille avec un contrôle positif prouvant qu'elle sait afficher des modèles quand le nœud est en ligne. **Item ajouté le 2026-07-31** (§0.13), relevé une première fois au §0.10 et reproduit depuis : `online: false`, `consecutive_failures: 3`, et pourtant un modèle encore annoncé chargé. Le drapeau est juste, la liste ment — et c'est la liste qu'on lit en incident. |
+| COR-019 | `[ ]` | P1 | Rendre la queue d'admission cohérente entre local et cluster | Soit la queue est portée en mode cluster et `/v1/capacity` y répond comme en local, soit son indisponibilité devient une **limite documentée** dans `docs/api.md` et `AGENTS.md`, dont la phrase « le mode cluster garde le même comportement public que le mode local » est alors amendée. Un test doit verrouiller le choix retenu. **Item ajouté le 2026-07-31** (§0.13) : `/v1/capacity` renvoie `enabled: false, status: unavailable` en cluster **malgré** `CAPACITY_QUEUE_ENABLED=true`. Un client qui interroge la capacité reçoit donc deux contrats publics différents selon une topologie qu'il ne connaît pas. |
+| COR-020 | `[ ]` | P1 | Préserver `models.yaml` lors des mutations admin | Une mutation par l'API admin ou le dashboard conserve les commentaires du fichier, produit une sauvegarde, écrit atomiquement avec `fsync`, et laisse les permissions inchangées. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-007 : `ModelRegistry._save()` réécrit le fichier entier par `yaml.dump`, ce qui efface les 55 lignes d'en-tête opérationnel du fichier livré — budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7` — et tous les commentaires d'entrée. Il ne sauvegarde pas, ne synchronise pas, et `NamedTemporaryFile` fait basculer le fichier en 0600 sans restaurer les permissions d'origine. Perte de données en production, aujourd'hui, sur un chemin emprunté par le dashboard. `bootstrap/registry_writer.py` montre la forme attendue : ajout textuel, reparse comparatif, refus plutôt que réécriture globale. |
+| COR-021 | `[ ]` | P2 | Ne pas porter d'invariant de production par `assert` | Aucun `assert` ne garde un invariant dont la violation doit produire une erreur nommée. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-017 : `runtime_resolver.ProvenanceManifest.build_number` et `to_decision()` s'appuient sur `assert match is not None` / `assert variant is not None`. Sous `python -O`, que rien n'interdit dans une unité systemd, ces gardes disparaissent et le refus explicite devient un `AttributeError` opaque. À rechercher ailleurs dans le dépôt avant de conclure. |
+| COR-022 | `[ ]` | **P0** | Dénouer la chaîne de preuve du plan d'amorçage | Un plan produit par `bootstrap-plan` peut être appliqué **jusqu'à son terme** : aucune étape n'exige une preuve qu'une étape ultérieure produit. **Item ajouté le 2026-08-01** (§0.14), découvert à l'assemblage de la vague 6 — aucun chantier ne pouvait le voir seul. Le planificateur (vague 5) ordonne, par modèle, `download → write_registry → calibrate → enable_model → warmup`, puis ajoute **un seul** `smoke_test` final, décrit comme « unique et finale — elle valide la chaîne, pas un modèle en particulier ». Or le critère d'acceptation d'AUT-007 exige l'inverse : « entrée désactivée tant que la calibration **et le smoke test** n'ont pas réussi », donc une preuve **par modèle**, **avant** l'activation. Et la recette de §10 passe par `/v1/chat/completions`, qui refuse un modèle `enabled: false` (`model_disabled`). Les trois contraintes ne peuvent pas être vraies ensemble. **Bloque la sortie du jalon M2.** **Décision prise le 2026-08-01 — voie A** (DEC-010) : activation provisoire puis retour arrière si la recette échoue. Reste à implémenter, et la fenêtre d'exposition doit être une propriété **testée** : un smoke test en échec repose l'entrée en `enabled: false`, et un test échoue si ce n'est pas le cas. |
 
 ### Lot B — bootstrap automatisé
 
@@ -1801,15 +1889,17 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | AUT-005 | `[x]` | P0 | Créer le catalogue approuvé | Révision, fichiers, SHA, licence, paramètres et ressources pour chaque modèle proposé. **Livré le 2026-07-31** : `bootstrap/catalog.yaml`, deux entrées apache-2.0 des deux côtés de la chaîne de licence, révisions et SHA-256 **réels** (relevés sur l'API publique Hugging Face, recoupés par `X-Linked-Etag`, revérifiés à la fusion). Entrée non épinglée = **fail-closed** : listée, mais exclue de toute planification de téléchargement. L'ensemble split/`mmproj` est indivisible par construction, pas par consigne. |
 | AUT-006 | `[x]` | P0 | Télécharger les modèles de façon sûre | Reprise, espace disque, fichier temporaire, SHA, renommage atomique et provenance. **Livré le 2026-08-01** : aucun fichier ne porte son nom définitif sans avoir été confronté au SHA-256 **du catalogue** — écriture en `.part` dans le même répertoire, empreinte calculée en flux, `os.replace` ensuite. Empreinte fausse : le partiel est **détruit**, jamais « réparé » ni repris plus tard comme sain ; corps tronqué : il est conservé, la reprise est légitime. Reprise conditionnée à une preuve d'origine (dépôt, révision, nom, empreinte) et au recoupement du `Content-Range`. Espace disque refusé **en amont**, marge `max(5 %, 1 Gio)`. Acceptation de licence fournie par l'opérateur, jamais déduite d'une licence permissive. `huggingface_hub` évalué puis **écarté** (requests/filelock/fsspec/tqdm dans le chemin d'un outil qui tourne avant le venv de la gateway ; et il possède le temporaire, le renommage et vérifie l'ETag du serveur là où nous voulons l'empreinte que ce catalogue a épinglée après revue). **Réserve** : `UrllibTransport`, le transport de production, n'est couvert par aucun test. |
 | AUT-007 | `[x]` | P1 | Générer `models.yaml` | Entrée désactivée tant que la calibration et le smoke test n'ont pas réussi. **Livré le 2026-08-01** : l'entrée est écrite `enabled: false` sans paramètre permettant l'inverse, et l'activation est une action distincte qui exige une preuve typée, datée, fraîche, et dont les trois empreintes sont recoupées. Le fichier candidat est **validé par `ModelRegistry` lui-même** avant `os.replace` — c'est la leçon de COR-014. Ajout textuel avec reparse comparatif plutôt que `yaml.dump` global : les 55 lignes d'en-tête opérationnel du fichier livré sont préservées, et si l'ajout ne produit pas exactement le document attendu on **refuse** au lieu de se replier sur la réécriture. Une entrée modifiée par l'exploitant n'est jamais écrasée ; la calibration ne peut que **relever** `vram_gb`, jamais l'abaisser. |
-| AUT-008 | `[~]` | P1 | Calibrer RAM/VRAM | Mesures avant/après, pics et marge enregistrés par fingerprint. **Mécanique livrée le 2026-08-01**, item maintenu `[~]` : les neuf étapes de §9 sont appliquées dans leur ordre littéral, les pics sont relevés **pendant** la charge par une tâche concurrente bornée trois fois, la mesure ne retombe **jamais** sur l'estimation statique en la présentant comme mesurée, le modèle est déchargé dans un `finally`, et la réutilisabilité d'une preuve est une décision testable qui dit laquelle des trois empreintes diverge. Le module **mesure et propose**, il n'écrit jamais `models.yaml`. **Pourquoi `[~]` et non `[x]`** : le module définit le contrat de ses sondes et le dépôt n'en contient **aucune implémentation** — ni `nvidia-smi`, ni chargement de modèle, ni prompt. Rien n'a jamais été mesuré. Voir AUT-016. |
-| AUT-009 | `[~]` | P0 | Recette premier token | Appel public complet avec TTFT mesuré et rapport sans secrets. **Mécanique livrée le 2026-08-01**, item maintenu `[~]` : les douze points de §10 sont appliqués, un flux sans delta de contenu est un **échec** (COR-006) et `no_content` prime sur `no_done`, la réussite exige aussi le **log d'usage** — une génération non facturée n'est pas un succès —, l'identité éphémère est nettoyée dans un `finally` conformément à DEC-001, et le nom d'utilisateur est toujours généré, aucun nom réel ne pouvant entrer dans un rapport. Les codes de cause sont alignés sur `deploy/smoke_test.sh`, que ce module **ne remplace pas** : le script reste le filet lançable en incident sans venv Python et le seul à exercer le vrai TLS/nginx. **Pourquoi `[~]`** : aucun client HTTP concret n'est fourni, aucun nginx réel n'est traversé par un test, et les formes de réponse des cinq routes admin sont recopiées depuis la lecture du code, recoupées contre rien. Voir AUT-016. |
+| AUT-008 | `[~]` | P1 | Calibrer RAM/VRAM | Mesures avant/après, pics et marge enregistrés par fingerprint. **Mécanique livrée le 2026-08-01**, item maintenu `[~]` : les neuf étapes de §9 sont appliquées dans leur ordre littéral, les pics sont relevés **pendant** la charge par une tâche concurrente bornée trois fois, la mesure ne retombe **jamais** sur l'estimation statique en la présentant comme mesurée, le modèle est déchargé dans un `finally`, et la réutilisabilité d'une preuve est une décision testable qui dit laquelle des trois empreintes diverge. Le module **mesure et propose**, il n'écrit jamais `models.yaml`. **Pourquoi `[~]` et non `[x]`** : le module définit le contrat de ses sondes et le dépôt n'en contient **aucune implémentation** — ni `nvidia-smi`, ni chargement de modèle, ni prompt. Rien n'a jamais été mesuré. Voir AUT-017. |
+| AUT-009 | `[~]` | P0 | Recette premier token | Appel public complet avec TTFT mesuré et rapport sans secrets. **Mécanique livrée le 2026-08-01**, item maintenu `[~]` : les douze points de §10 sont appliqués, un flux sans delta de contenu est un **échec** (COR-006) et `no_content` prime sur `no_done`, la réussite exige aussi le **log d'usage** — une génération non facturée n'est pas un succès —, l'identité éphémère est nettoyée dans un `finally` conformément à DEC-001, et le nom d'utilisateur est toujours généré, aucun nom réel ne pouvant entrer dans un rapport. Les codes de cause sont alignés sur `deploy/smoke_test.sh`, que ce module **ne remplace pas** : le script reste le filet lançable en incident sans venv Python et le seul à exercer le vrai TLS/nginx. **Pourquoi `[~]`** : aucun client HTTP concret n'est fourni, aucun nginx réel n'est traversé par un test, et les formes de réponse des cinq routes admin sont recopiées depuis la lecture du code, recoupées contre rien. Voir AUT-017. |
 | AUT-010 | `[~]` | P1 | Pré-chauffer le modèle par défaut | Le premier utilisateur ne déclenche pas le chargement après un déploiement réussi. **Mécanique livrée le 2026-08-01**, item maintenu `[~]` : la borne d'attente est **dérivée du registre** et non inventée — le piège de §0.9, où un chargement peut demander 300 s —, un dépassement est un échec explicite et non une attente infinie, l'absence de sonde de génération **ferme** le trafic, et l'ancienne version est conservée tant que le feu vert n'est pas donné. **Pourquoi `[~]`** : rien n'appelle ce module. `main.py`, `install.sh` et `update.sh` ne le connaissent pas, et `derive_warmup_timeout_seconds()` reçoit ses valeurs de l'appelant sans que le câblage vers `model_registry` existe. |
 | AUT-011 | `[x]` | P1 | Produire le rapport d'installation | Versions, empreintes, licences, matériel, modèle, performances et contrôles. **Livré le 2026-08-01** : le rapport agrège le plan exécuté et le journal d'exécution, dit lesquelles des **sept conditions du jalon M2** sont satisfaites et par quelle preuve, et **ne prétend jamais plus que ce qui a été fait** — un journal en simulation ne satisfait aucune condition d'installation. Il distingue le constat de l'hypothèse : les variantes d'artefact retenues sur hypothèse restent visibles comme telles, ce qu'un lecteur pressé prendrait sinon pour un fait vérifié. Champs récapitulatifs recalculés et comparés élément par élément, jeu de clés racine fermé, refus de rendre un document qui fuit. Indexation par **nom de champ** et non par chemin producteur : un index par chemin se briserait en silence à la première réorganisation, en rendant une liste vide qui se lit « aucune licence ». |
 | AUT-012 | `[x]` | P0 | Ajouter `evaruntime doctor` | Rapport humain/JSON et exit codes couvrant secrets, runtime, GPU, modèles, ports, DB, nginx, TLS fourni et limites systemd. |
 | AUT-013 | `[x]` | P1 | Inspecter les métadonnées GGUF | Architecture, tenseurs, contexte et KV alimentent une estimation conservatrice sans être présentés comme une mesure exacte. **Livré le 2026-07-31** : parseur maison en bibliothèque standard, bornes explicites sur chaque champ de longueur venu du fichier (un GGUF est une entrée non fiable), validé contre deux vrais headers récupérés par requête `Range`. Le mot « estimation » figure dans le nom des types, dans le rendu et dans la liste des facteurs ignorés. Paquet `gguf` officiel évalué puis écarté (`numpy` sur une machine vierge), conclusion écrite dans le docstring. |
-| AUT-014 | `[x]` | P0 | Définir le contrat du journal d'exécution | Un plan relu depuis un fichier n'est exécutable qu'après revalidation complète ; le journal distingue fait, déjà satisfait, sauté, échoué et non tenté ; verdict et compteurs sont recalculés, jamais crus. **Item ajouté le 2026-08-01**, né de l'ouverture de la vague 6 : AUT-001 s'arrête à la publication du plan, et la revue de la vague 5 avait explicitement laissé la question à M2 — « un applicateur ne doit jamais pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe » (§0.12). Sans ce contrat, six chantiers d'exécution auraient chacun inventé le leur. |
-| AUT-016 | `[ ]` | **P0** | Implémenter les sondes de production du bootstrap | Les contrats de sonde définis par AUT-008, AUT-009 et AUT-010 ont une implémentation réelle, et `bootstrap-apply` peut câbler les neuf actions du plan depuis la CLI. **Item ajouté le 2026-08-01** (§0.13), révélé par l'assemblage : trois modules définissent proprement le contrat de leurs sondes — lecture VRAM/RAM, chargement et déchargement de modèle, prompt court, client HTTP vers la gateway — et **le dépôt n'en contient aucune implémentation**. Conséquence directe : `bootstrap-apply` ne câble que 5 des 9 actions et refuse en code 2 tout plan réel. C'est la différence entre « la mécanique est écrite » et « la machine peut s'installer ». Couvre aussi la reconstitution d'une `RuntimeResolution` depuis un document de plan, sans laquelle `install_runtime` n'est pas câblable, et un moyen de fournir une acceptation de licence à `accept_license`. |
-| AUT-015 | `[x]` | P0 | Installer le runtime résolu | L'artefact est vérifié avant d'être rendu exécutable, l'extraction d'archive est défensive, la bascule est atomique, la version est relue depuis le binaire posé et confrontée à l'épinglage, l'installation est idempotente et réversible, et un manifeste de provenance est écrit à côté du binaire. **Item ajouté le 2026-08-01** : trou du backlog découvert en ouvrant la vague 6. AUT-003 **résout** quelle variante de `llama-server` installer et s'arrête là ; aucun item ne portait l'installation elle-même, alors que le jalon M2 l'exige en **première** condition (« runtime installé et vérifié »). |
+| AUT-015 | `[x]` | P0 | Définir le contrat du journal d'exécution | Un plan relu depuis un fichier n'est exécutable qu'après revalidation complète ; le journal distingue fait, déjà satisfait, sauté, échoué et non tenté ; verdict et compteurs sont recalculés, jamais crus. **Item ajouté le 2026-08-01**, né de l'ouverture de la vague 6 : AUT-001 s'arrête à la publication du plan, et la revue de la vague 5 avait explicitement laissé la question à M2 — « un applicateur ne doit jamais pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe » (§0.12). Sans ce contrat, six chantiers d'exécution auraient chacun inventé le leur. |
+| AUT-016 | `[x]` | P0 | Installer le runtime résolu | L'artefact est vérifié avant d'être rendu exécutable, l'extraction d'archive est défensive, la bascule est atomique, la version est relue depuis le binaire posé et confrontée à l'épinglage, l'installation est idempotente et réversible, et un manifeste de provenance est écrit à côté du binaire. **Item ajouté le 2026-08-01** : trou du backlog découvert en ouvrant la vague 6. AUT-003 **résout** quelle variante de `llama-server` installer et s'arrête là ; aucun item ne portait l'installation elle-même, alors que le jalon M2 l'exige en **première** condition (« runtime installé et vérifié »). |
+| AUT-017 | `[ ]` | **P0** | Implémenter les sondes de production du bootstrap | Les contrats de sonde définis par AUT-008, AUT-009 et AUT-010 ont une implémentation réelle, et `bootstrap-apply` peut câbler les neuf actions du plan depuis la CLI. **Item ajouté le 2026-08-01** (§0.14), révélé par l'assemblage : trois modules définissent proprement le contrat de leurs sondes — lecture VRAM/RAM, chargement et déchargement de modèle, prompt court, client HTTP vers la gateway — et **le dépôt n'en contient aucune implémentation**. Conséquence directe : `bootstrap-apply` ne câble que 5 des 9 actions et refuse en code 2 tout plan réel. C'est la différence entre « la mécanique est écrite » et « la machine peut s'installer ». Couvre aussi la reconstitution d'une `RuntimeResolution` depuis un document de plan, sans laquelle `install_runtime` n'est pas câblable, et un moyen de fournir une acceptation de licence à `accept_license`. |
+
+| AUT-014 | `[ ]` | P1 | Reconnaître un artefact déjà présent et vérifié | Quand un fichier du catalogue est **déjà présent** au chemin cible et que son SHA-256 correspond à l'entrée épinglée, le plan ne propose plus son téléchargement : l'étape devient une `verify_artifact` seule, le volume annoncé est décompté, et le motif est écrit dans le détail de l'étape. Un test doit couvrir les trois cas — absent, présent et conforme, présent mais **empreinte divergente** (qui doit rester bloquant, jamais silencieusement réutilisé). **Item ajouté le 2026-07-31** (§0.13), reproduit sur un hôte réel : le planificateur avait bien lu le header des deux GGUF présents — `local_inspection` non nulle — et proposait pourtant 837,1 Mio de téléchargement. L'information manquait au raisonnement, pas à la collecte. |
 
 ### Lot C — performance
 
@@ -1828,15 +1918,15 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
-| SEC-001 | `[ ]` | P0 | Vendoriser les assets admin et ajouter CSP | Dashboard fonctionnel hors ligne, aucune ressource tierce, CSP testée. |
+| SEC-001 | `[ ]` | P0 | Vendoriser les assets admin et ajouter CSP | Dashboard fonctionnel hors ligne, aucune ressource tierce, CSP testée. **Reproduit sur hôte réel le 2026-07-31** (§0.13) : le HTML servi porte 4 références externes — `cdn.jsdelivr.net` pour chart.js et `fonts.googleapis.com` pour deux polices. Sur un réseau sans sortie Internet, le dashboard d'administration est donc inutilisable au moment précis où l'on en a besoin. |
 | SEC-002 | `[ ]` | P0 | Durcir l'environnement généré | Allowlist modèle, CORS explicite et build minimum visibles dans le fichier généré. |
 | SEC-003 | `[ ]` | P0 | Verrouiller les dépendances | Installation reproductible, dépendances dev séparées, hashes ou artefacts contrôlés. |
 | SEC-004 | `[ ]` | P0 | Rendre l'audit CVE bloquant | Politique d'exception documentée avec expiration. |
 | SEC-005 | `[ ]` | P1 | Imposer l'intégrité des modèles approuvés | Aucun modèle catalogue ne charge sans SHA/provenance. |
 | SEC-006 | `[ ]` | P1 | Sécuriser le data-plane cluster | Prompts chiffrés ou réseau isolé attesté et contrôlé. |
 | SEC-007 | `[ ]` | P1 | Produire SBOM et attestations runtime | Chaque release et binaire redistribué possède provenance et notices. |
-| SEC-009 | `[ ]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version\|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. **Élargi le 2026-08-01** (§0.13), en livrant AUT-015 : `runtime_resolver._judge_existing_binary` accorde `reuse_existing` sur la foi d'un manifeste **qu'il ne recoupe jamais contre le binaire** — ni la version ni le commit déclarés ne sont confrontés à ce que rend `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. `runtime_installer` ferme le trou de son côté en recalculant l'empreinte à chaque passe ; le résolveur reste exposé. |
-| SEC-010 | `[ ]` | P2 | Rédiger la query string dans les journaux d'accès | Un nom d'utilisateur passé en paramètre de requête n'apparaît pas plus dans les journaux qu'un nom passé dans le chemin. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-009 : `main._redact_path()` redacte le **chemin**, pas la **requête**, alors que `GET /admin/usage?username=…` existe et est employé par `deploy/smoke_test.sh`. Le nom y est éphémère et généré, donc sans donnée personnelle — mais un opérateur qui interroge cette route avec un vrai nom écrirait ce nom au journal, ce que SEC-008 interdit. À confirmer par lecture de `_redact_path` avant d'écrire le correctif. |
+| SEC-009 | `[ ]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version\|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. **Élargi le 2026-08-01** (§0.14), en livrant AUT-016 : `runtime_resolver._judge_existing_binary` accorde `reuse_existing` sur la foi d'un manifeste **qu'il ne recoupe jamais contre le binaire** — ni la version ni le commit déclarés ne sont confrontés à ce que rend `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. `runtime_installer` ferme le trou de son côté en recalculant l'empreinte à chaque passe ; le résolveur reste exposé. |
+| SEC-010 | `[ ]` | P2 | Rédiger la query string dans les journaux d'accès | Un nom d'utilisateur passé en paramètre de requête n'apparaît pas plus dans les journaux qu'un nom passé dans le chemin. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-009 : `main._redact_path()` redacte le **chemin**, pas la **requête**, alors que `GET /admin/usage?username=…` existe et est employé par `deploy/smoke_test.sh`. Le nom y est éphémère et généré, donc sans donnée personnelle — mais un opérateur qui interroge cette route avec un vrai nom écrirait ce nom au journal, ce que SEC-008 interdit. À confirmer par lecture de `_redact_path` avant d'écrire le correctif. |
 | SEC-008 | `[x]` | P1 | Ne pas journaliser les noms d'utilisateur | Aucun `log.*` de la gateway ne porte de nom d'utilisateur ; le chemin de requête est rédigé. **Item ajouté le 2026-07-30**, découvert en livrant COR-002 : anonymiser en base est sans effet si le journal garde une copie du nom. |
 
 ### Lot E — tests, exploitation et standardisation
@@ -1858,6 +1948,8 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-008 | `[x]` | P1 | Armer réellement le timer de sauvegarde | Après `install.sh` puis après `update.sh`, `systemctl is-active llm-gateway-backup.timer` retourne `active` et le timer apparaît dans `list-timers`, sans reboot et sans déclencher de sauvegarde immédiate avant l'initialisation de la base. **Item ajouté le 2026-07-30** (§0.10) : `enable` sans `--now` laissait la sauvegarde quotidienne inerte jusqu'au prochain redémarrage. |
 | OPS-009 | `[x]` | P2 | Moderniser les directives nginx livrées | `nginx -t` ne produit aucun avertissement de dépréciation sur les versions supportées (`http2 on;` au lieu de `listen … ssl http2`). **Item ajouté le 2026-07-30** (§0.10) : le bruit à chaque reload masque les avertissements utiles. |
 | OPS-010 | `[~]` | P1 | Borner la rétention des venvs de release | Après N mises à jour successives, `gateway/deploy/update.sh` et `node_agent/deploy/update-agent.sh` laissent au plus 2 arborescences de venv (l'active et la précédente) et la cible du symlink n'est jamais supprimée. **Item ajouté le 2026-07-30** : sans purge, chaque mise à jour ajoutait ~200 Mo au disque du nœud, en silence. Rétention livrée et testée dans les deux scripts (`EVA_GATEWAY_VENV_KEEP` / `EVA_AGENT_VENV_KEEP`, défaut 2). **Reste à faire** : la même borne pour les sauvegardes `*.pre-migration.*.bak` d'OPS-006, suivie sous OPS-002. |
+| OPS-011 | `[ ]` | P1 | Aligner les prérequis documentés sur ce que les scripts exigent réellement | `docs/deployment.md` §1 liste **toutes** les commandes réclamées par les préflights d'`install.sh` et d'`install-agent.sh`, et un test dérive la liste attendue du code des scripts plutôt que de la recopier — sans quoi il rate la prochaine dépendance ajoutée. **Item ajouté le 2026-07-31** (§0.13) : `install-agent.sh` exige `rsync` (préflight ligne 76, usage lignes 122 et 126), le mot n'apparaît nulle part dans la documentation, et une Debian 13 minimale ne l'installe pas — l'installation d'un nœud neuf échoue au premier écran, sur une dépendance que rien n'annonce. |
+| OPS-012 | `[ ]` | P1 | Donner une échappatoire explicite au préflight GPU d'`install.sh` | `install.sh --mode local` accepte un hôte sans GPU via une option **explicite** (`--allow-no-gpu`), qui inscrit ce choix dans l'environnement généré et le fait remonter par `doctor` ; sans l'option, le refus actuel est conservé et son message dit quoi faire. Un test couvre les deux branches. **Item ajouté le 2026-07-31** (§0.13) : le préflight `command -v nvidia-smi` a bloqué **les deux** déploiements réels sur banc CPU (§0.10 puis §0.13), et les deux ont dû contourner le script. Un garde-fou que tout le monde contourne ne protège plus personne — il apprend seulement à passer outre. |
 | TST-006 | `[x]` | P0 | Couvrir la construction du manager en mode cluster | Un test construit `model_manager._build_manager()` avec `CLUSTER_MODE=cluster` et un `nodes.yaml` minimal ; il échoue sur le code d'avant COR-015 et passe après. **Item ajouté le 2026-07-30** (§0.10) : 633 tests passaient alors que le mode cluster ne démarrait pas. Complète TST-005, qui vise le parcours E2E et non la construction à l'import. |
 
 ## 13. Jalons

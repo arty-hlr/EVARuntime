@@ -1,5 +1,5 @@
 """
-AUT-014 — régressions de l'applicateur (`bootstrap/applier.py`) et de sa CLI.
+AUT-015 — régressions de l'applicateur (`bootstrap/applier.py`) et de sa CLI.
 
 L'applicateur est le seul module de M2 qui peut modifier une machine sans qu'un
 exécuteur le lui ait demandé : c'est lui qui décide de partir. Quatre familles

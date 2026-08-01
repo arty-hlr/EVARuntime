@@ -683,7 +683,7 @@ def bootstrap_plan(
     raise typer.Exit(plan.exit_code(strict=strict))
 
 
-# ── Applicateur de bootstrap (AUT-006 → AUT-011, AUT-014) ─────────────────────
+# ── Applicateur de bootstrap (AUT-006 → AUT-011, AUT-015) ─────────────────────
 
 @app.command("bootstrap-apply")
 def bootstrap_apply(

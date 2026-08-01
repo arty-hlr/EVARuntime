@@ -1930,7 +1930,7 @@ rapport d'installation.
 > 2. **L'ordre du plan rend la chaîne de preuve impossible** : le planificateur
 >    place `enable_model` avant le `smoke_test` dont l'activation exige la
 >    preuve. Le constat `chaine_de_preuve_impossible` est émis avant toute
->    exécution. Voir COR-020 dans `codex-analyse.md` §0.13.
+>    exécution. Voir COR-022 dans `codex-analyse.md` §0.14.
 >
 > Ce qui est garanti dès aujourd'hui : la commande **ne fait jamais à moitié**.
 > Elle refuse en bloc plutôt que d'entamer un plan qu'elle ne peut pas finir.

@@ -1,5 +1,5 @@
 """
-AUT-015 — installation effective de `llama-server` (jalon M2, action `install_runtime`).
+AUT-016 — installation effective de `llama-server` (jalon M2, action `install_runtime`).
 
 Ce que ce module fait
 ---------------------

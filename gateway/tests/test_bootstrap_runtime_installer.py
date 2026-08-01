@@ -1,5 +1,5 @@
 """
-AUT-015 — régressions de l'installateur de runtime (`bootstrap/runtime_installer.py`).
+AUT-016 — régressions de l'installateur de runtime (`bootstrap/runtime_installer.py`).
 
 Cet exécuteur est le premier du parcours M2 qui **écrit sur l'hôte** : il pose un
 binaire téléchargé, le rend exécutable et le publie. Les tests verrouillent donc

@@ -29,15 +29,15 @@ M2 — un module par exécuteur, plus le contrat et les deux documents finaux :
 
 | Module               | Item    | Rôle                                           |
 |----------------------|---------|------------------------------------------------|
-| `execution`          | AUT-014 | Contrat d'exécution : modes, journal, registre |
-| `runtime_installer`  | AUT-015 | Pose de l'artefact `llama-server` vérifié      |
+| `execution`          | AUT-015 | Contrat d'exécution : modes, journal, registre |
+| `runtime_installer`  | AUT-016 | Pose de l'artefact `llama-server` vérifié      |
 | `downloader`         | AUT-006 | Licences, téléchargement et vérification GGUF  |
 | `registry_writer`    | AUT-007 | Écriture de `models.yaml`, activation sur preuve |
 | `calibration`        | AUT-008 | Chargement réel : pics, TTFT, `vram_gb` proposé |
 | `first_token`        | AUT-009 | Recette du premier token par le chemin public  |
 | `warmup`             | AUT-010 | Pré-chauffage avant ouverture du trafic        |
 | `install_report`     | AUT-011 | Rapport d'installation : ce qui tourne, d'où   |
-| `applier`            | AUT-014 | Assemblage : câblage, chaîne des preuves       |
+| `applier`            | AUT-015 | Assemblage : câblage, chaîne des preuves       |
 
 La règle d'indépendance, telle qu'elle est réellement appliquée
 ---------------------------------------------------------------

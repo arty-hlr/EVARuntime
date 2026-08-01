@@ -1,5 +1,5 @@
 """
-AUT-014 — application du plan de bootstrap : le seul module qui connaît tous les exécuteurs.
+AUT-015 — application du plan de bootstrap : le seul module qui connaît tous les exécuteurs.
 
 Ce que fait ce module, et ce qu'il ne fait pas
 ---------------------------------------------
@@ -424,7 +424,7 @@ def _verify_dispatcher(
                 findings=(_finding(
                     "verification_runtime_integree", "info",
                     "Le plan décrit la vérification de l'archive de llama-server comme une "
-                    "étape distincte, mais l'installateur (AUT-015) contrôle l'empreinte "
+                    "étape distincte, mais l'installateur (AUT-016) contrôle l'empreinte "
                     "avant d'extraire quoi que ce soit. Rien n'est vérifié à CE numéro "
                     "d'étape : le contrôle a lieu au suivant, et l'installation est annulée "
                     "s'il échoue.",
@@ -589,7 +589,7 @@ def missing_executor_reasons(
 
 
 _WIRING_FOR: dict[str, str] = {
-    schema.ACTION_INSTALL_RUNTIME: "ApplierConfig.runtime (AUT-015)",
+    schema.ACTION_INSTALL_RUNTIME: "ApplierConfig.runtime (AUT-016)",
     schema.ACTION_DOWNLOAD_MODEL: "ApplierConfig.download (AUT-006)",
     schema.ACTION_VERIFY_ARTIFACT: "ApplierConfig.download ou .runtime (AUT-006/015)",
     schema.ACTION_ACCEPT_LICENSE: "ApplierConfig.download (AUT-006)",
