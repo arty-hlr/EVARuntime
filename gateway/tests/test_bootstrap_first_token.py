@@ -290,7 +290,7 @@ def test_flux_avec_contenu_est_servi():
     assert resultat.served is True
     assert resultat.content_chunks == 2
     assert resultat.saw_done is True
-    assert resultat.prompt_units == 11 and resultat.completion_units == 3
+    assert resultat.prompt_tokens == 11 and resultat.completion_tokens == 3
 
 
 def test_les_deux_mesures_de_temps_sont_distinctes():
@@ -782,7 +782,7 @@ def test_preuve_valide_autorise_le_modele_exerce():
     ("verdict", "peut-etre"),
     ("verdict", ft.PROOF_NOT_SERVED),
     ("dry_run", True),
-    ("model", "gros"),
+    ("model_id", "gros"),
     ("usage_logged", False),
     ("reason", ft.REASON_NO_CONTENT),
 ])
@@ -790,8 +790,7 @@ def test_une_preuve_alteree_n_autorise_rien(cle, valeur):
     """Chaque condition est exprimée en égalité positive : elle refuse seule."""
     preuve = _preuve_valide()
     preuve[cle] = valeur
-    attendu_modele = "tiny" if cle != "model" else "gros"
-    assert ft.proof_authorizes(preuve, attendu_modele if cle != "model" else "tiny") is False
+    assert ft.proof_authorizes(preuve, "tiny") is False
 
 
 def test_une_preuve_tronquee_ou_absurde_n_autorise_rien():
@@ -864,15 +863,14 @@ def test_le_filet_a_secrets_voit_bien_une_fuite_controle_positif():
     assert schema.find_secret_leaks({"m": "hf_" + "z" * 24}) != ()
 
 
-def test_aucun_champ_publie_ne_contient_le_mot_token():
+def test_les_compteurs_portent_les_noms_de_l_api_et_restent_publiables():
     """
-    Garde-fou de nommage, pas cosmétique.
+    Le contournement de nommage est retiré, et rien ne casse — c'est la preuve.
 
-    `schema._SECRET_KEY_RE` refuse tout nom de champ contenant `TOKEN`, sans
-    distinguer un jeton d'authentification d'un décompte de jetons de langage.
-    Renommer `prompt_units` en `prompt_tokens` rendrait le rapport d'exécution
-    ENTIER impubliable — `render_execution_json` appelle `assert_no_secrets` sur
-    tout le document. Ce test fige le contournement.
+    Les compteurs se sont appelés `prompt_units` / `completion_units` parce que
+    `schema._SECRET_KEY_RE` frappait `token` en sous-chaîne et rendait le rapport
+    ENTIER impubliable. Le motif est désormais ancré. Ce test verrouille les deux
+    faces : les noms sont bien ceux de l'API, ET le document reste publiable.
     """
     horloge = FakeClock()
     rapport = run_recipe(FakeGateway(horloge), make_settings(), horloge)
@@ -888,10 +886,12 @@ def test_aucun_champ_publie_ne_contient_le_mot_token():
 
     document = rapport.to_dict()
     assert list(cles(document))                                    # contrôle positif
-    assert not [c for c in cles(document) if "token" in c.lower()]
-    # ... et la preuve porte bien les compteurs, sous leur nom sûr.
-    assert rapport.proof()["prompt_units"] == 11
-    assert rapport.proof()["completion_units"] == 3
+    assert "completion_tokens" in list(cles(document))
+    # Contrôle positif du détecteur : un nom de porteur, lui, fuit toujours.
+    assert schema.find_secret_leaks({"hf_token": "x"}) != ()
+    assert schema.find_secret_leaks(document) == ()
+    assert rapport.proof()["prompt_tokens"] == 11
+    assert rapport.proof()["completion_tokens"] == 3
 
 
 def test_une_url_avec_identifiants_est_refusee_a_la_construction():

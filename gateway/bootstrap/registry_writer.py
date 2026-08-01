@@ -276,6 +276,12 @@ _CALIBRATION_KEYS = frozenset({
     "peak_vram_gb", "peak_ram_gb", "load_seconds", "measured_at",
 })
 
+# Exposé publiquement pour que l'applicateur PROJETTE un document de producteur
+# sur ce jeu de clés au lieu d'en recopier la liste chez lui. Une seconde liste
+# tenue à la main finirait par diverger de celle qui décide réellement, et c'est
+# celle qui n'a pas été mise à jour qui laisserait passer une preuve incomplète.
+CALIBRATION_PROOF_KEYS: frozenset[str] = _CALIBRATION_KEYS
+
 
 @dataclass(frozen=True)
 class CalibrationProof:
@@ -351,6 +357,8 @@ class CalibrationProof:
 _SMOKE_TEST_KEYS = frozenset({
     "model_id", "endpoint", "http_status", "ttft_ms", "completion_tokens", "measured_at",
 })
+
+SMOKE_TEST_PROOF_KEYS: frozenset[str] = _SMOKE_TEST_KEYS
 
 
 @dataclass(frozen=True)
@@ -461,11 +469,12 @@ class ActivationProof:
         Sérialisation complète de la preuve — pour un rapport d'installation, pas
         pour `StepResult.evidence`.
 
-        Attention, et c'est une chausse-trappe du contrat : `find_secret_leaks()`
-        de `schema` refuse tout champ dont le NOM contient « token », quel qu'en
-        soit le contenu. `completion_tokens` — un simple compteur — suffit donc à
-        rendre un rapport d'exécution impubliable. C'est pourquoi les preuves
-        d'étape passent par `proof_digest()`, dont aucune clé ne porte ce mot.
+        La chausse-trappe qui motivait cette note a été fermée : `schema` n'ancre
+        plus son motif de secret sur « token » en sous-chaîne, et
+        `completion_tokens` est publiable. `digest()` reste néanmoins ce que les
+        preuves d'étape publient — non par contournement, mais parce qu'un
+        `StepResult.evidence` doit porter ce qu'un lecteur RECOUPE, pas la preuve
+        entière recopiée une seconde fois dans le journal.
         """
         return {
             "calibration": self.calibration.to_dict(),

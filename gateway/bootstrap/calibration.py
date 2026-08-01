@@ -361,7 +361,7 @@ def evaluate_reuse(proof: CalibrationProof, expected: CalibrationIdentity) -> Re
             divergences=(),
             message=(
                 f"mesure réutilisable : {proof.identity.model_id} a été calibré le "
-                f"{proof.tested_at} sur le même matériel, le même runtime et les mêmes "
+                f"{proof.measured_at} sur le même matériel, le même runtime et les mêmes "
                 "paramètres"
             ),
         )
@@ -669,13 +669,21 @@ class CalibrationProof:
 
     `applied` vaut toujours `False` : ce module ne touche pas `models.yaml`. Le
     champ existe pour que le consommateur n'ait pas à le supposer.
+
+    `load_seconds` et `measured_at` sont dans la preuve, et pas seulement à la
+    racine du rapport, parce que le consommateur d'AUT-007 les exige DANS le
+    bloc `calibration` : une durée de chargement rangée un niveau au-dessus
+    obligeait l'applicateur à aller la chercher ailleurs, donc à recomposer une
+    preuve à partir de deux endroits — exactement le raccord où quelqu'un finit
+    par mettre une valeur par défaut.
     """
     identity: CalibrationIdentity
     idle_vram_bytes: int
     peak_vram_bytes: int
     peak_ram_bytes: int
+    load_seconds: float
     safety_margin: float
-    tested_at: str
+    measured_at: str
     report_path: str = ""
 
     @property
@@ -718,12 +726,13 @@ class CalibrationProof:
             "idle_vram_gb": _gib(self.idle_vram_bytes),
             "peak_vram_gb": self.measured_vram_gb,
             "peak_ram_gb": _gib(self.peak_ram_bytes),
+            "load_seconds": round(self.load_seconds, 3),
             "measured_vram_gb": self.measured_vram_gb,
             "safety_margin": self.safety_margin,
             "proposed_vram_gb": self.proposed_vram_gb,
             "margin_formula": self.margin_formula(),
             "applied": False,
-            "tested_at": self.tested_at,
+            "measured_at": self.measured_at,
             "report_path": self.report_path,
         })
         return document
@@ -745,7 +754,7 @@ class CalibrationReport:
     idle_ram_bytes: int
     passes: tuple[PassMeasurement, ...]
     safety_margin: float
-    tested_at: str
+    measured_at: str
     sample_interval_seconds: float
     report_path: str = ""
 
@@ -789,8 +798,9 @@ class CalibrationReport:
             idle_vram_bytes=self.idle_vram_bytes,
             peak_vram_bytes=self.peak_vram_bytes,
             peak_ram_bytes=self.peak_ram_bytes,
+            load_seconds=self.target_pass.load_seconds,
             safety_margin=self.safety_margin,
-            tested_at=self.tested_at,
+            measured_at=self.measured_at,
             report_path=self.report_path,
         )
 
@@ -833,11 +843,12 @@ _REQUIRED_CALIBRATION_KEYS: tuple[str, ...] = (
     "idle_vram_gb",
     "peak_vram_gb",
     "peak_ram_gb",
+    "load_seconds",
     "measured_vram_gb",
     "safety_margin",
     "proposed_vram_gb",
     "applied",
-    "tested_at",
+    "measured_at",
 )
 
 
@@ -889,7 +900,7 @@ def validate_calibration_document(document: Any) -> tuple[str, ...]:
         if calibration.get(cle, _ABSENT) is _ABSENT:
             errors.append(f"calibration.{cle} est obligatoire (§9)")
 
-    for cle in ("model_id", "runtime_version", "tested_at"):
+    for cle in ("model_id", "runtime_version", "measured_at"):
         valeur = calibration.get(cle)
         if not isinstance(valeur, str) or not valeur:
             errors.append(f"calibration.{cle} doit être une chaîne non vide")
@@ -901,8 +912,8 @@ def validate_calibration_document(document: Any) -> tuple[str, ...]:
                 f"reçu {calibration.get(cle)!r}"
             )
 
-    for cle in ("idle_vram_gb", "peak_vram_gb", "peak_ram_gb", "measured_vram_gb",
-                "safety_margin", "proposed_vram_gb"):
+    for cle in ("idle_vram_gb", "peak_vram_gb", "peak_ram_gb", "load_seconds",
+                "measured_vram_gb", "safety_margin", "proposed_vram_gb"):
         valeur = calibration.get(cle)
         if isinstance(valeur, bool) or not isinstance(valeur, (int, float)):
             errors.append(f"calibration.{cle} doit être un nombre, reçu {valeur!r}")
@@ -931,7 +942,30 @@ def validate_calibration_document(document: Any) -> tuple[str, ...]:
 
     errors.extend(_recouper_proposition(calibration))
     errors.extend(_recouper_pic(calibration, passes))
+    errors.extend(_recouper_chargement(calibration, document))
     return tuple(errors)
+
+
+def _recouper_chargement(
+    calibration: Mapping[str, Any], document: Mapping[str, Any]
+) -> list[str]:
+    """
+    `load_seconds` figure à deux endroits : les deux doivent dire la même chose.
+
+    La durée de chargement est publiée à la racine (§9) ET dans la preuve, parce
+    que le consommateur d'AUT-007 l'exige dans le bloc. Deux copies d'une même
+    mesure sont une divergence en attente ; ici elle est recoupée, donc elle ne
+    peut plus s'installer en silence.
+    """
+    racine = document.get("load_seconds")
+    if isinstance(racine, bool) or not isinstance(racine, (int, float)):
+        return [f"load_seconds (racine) doit être un nombre, reçu {racine!r}"]
+    if abs(float(calibration["load_seconds"]) - float(racine)) > 0.0011:
+        return [
+            f"calibration.load_seconds annonce {calibration['load_seconds']!r} alors que "
+            f"load_seconds à la racine vaut {racine!r} : les deux nomment la même mesure"
+        ]
+    return []
 
 
 def _recouper_proposition(calibration: Mapping[str, Any]) -> list[str]:
@@ -948,8 +982,9 @@ def _recouper_proposition(calibration: Mapping[str, Any]) -> list[str]:
         idle_vram_bytes=0,
         peak_vram_bytes=int(mesure * (1024 ** 3)),
         peak_ram_bytes=0,
+        load_seconds=float(calibration["load_seconds"]),
         safety_margin=marge,
-        tested_at=str(calibration["tested_at"]),
+        measured_at=str(calibration["measured_at"]),
     )
     erreurs: list[str] = []
     if abs(float(calibration["peak_vram_gb"]) - mesure) > 0.005:
@@ -1024,7 +1059,7 @@ def render_calibration_human(report: CalibrationReport) -> str:
         f"  Runtime       : {report.identity.runtime_version}",
         f"  Matériel      : {report.identity.hardware_fingerprint}",
         f"  Paramètres    : {report.identity.params_fingerprint}",
-        f"  Mesuré le     : {report.tested_at}",
+        f"  Mesuré le     : {report.measured_at}",
         "",
         "MESURES (Gio, 2^30 octets)",
         f"  VRAM au repos : {_gib(report.idle_vram_bytes):.2f}",
@@ -1082,8 +1117,9 @@ def proof_from_document(document: Mapping[str, Any], *, origin: str = "<rapport>
         idle_vram_bytes=int(float(calibration["idle_vram_gb"]) * (1024 ** 3)),
         peak_vram_bytes=int(float(calibration["measured_vram_gb"]) * (1024 ** 3)),
         peak_ram_bytes=int(float(calibration["peak_ram_gb"]) * (1024 ** 3)),
+        load_seconds=float(calibration["load_seconds"]),
         safety_margin=float(calibration["safety_margin"]),
-        tested_at=str(calibration["tested_at"]),
+        measured_at=str(calibration["measured_at"]),
         report_path=str(calibration.get("report_path") or ""),
     )
 
@@ -1431,7 +1467,7 @@ async def calibrate(
         idle_ram_bytes=idle_ram,
         passes=tuple(passes),
         safety_margin=options.safety_margin,
-        tested_at=context.now(),
+        measured_at=context.now(),
         sample_interval_seconds=options.sample_interval_seconds,
     )
 
@@ -1467,7 +1503,7 @@ def write_report(
         idle_ram_bytes=report.idle_ram_bytes,
         passes=report.passes,
         safety_margin=report.safety_margin,
-        tested_at=report.tested_at,
+        measured_at=report.measured_at,
         sample_interval_seconds=report.sample_interval_seconds,
         report_path=str(cible),
     )
@@ -1538,7 +1574,7 @@ def _resultat_deja_satisfait(
         step,
         status=ex.STEP_ALREADY_SATISFIED,
         summary=(
-            f"« {preuve.identity.model_id} » a déjà été calibré le {preuve.tested_at} sur ce "
+            f"« {preuve.identity.model_id} » a déjà été calibré le {preuve.measured_at} sur ce "
             f"matériel, ce runtime et ces paramètres : "
             f"{preuve.measured_vram_gb:.2f} Gio mesurés, {preuve.proposed_vram_gb:.2f} Gio "
             "proposés — aucun modèle n'a été rechargé"

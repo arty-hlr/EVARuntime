@@ -69,16 +69,25 @@ rendre quoi que ce soit, la preuve et les indices sont repassés à
 la publier. Le prompt et le texte généré ne sont jamais recopiés : seuls des
 compteurs (`content_chunks`, `content_chars`) le sont.
 
-Pourquoi les compteurs s'appellent `*_units` et non `*_tokens`
---------------------------------------------------------------
-`schema._SECRET_KEY_RE` refuse **tout** nom de champ contenant `TOKEN`, sans
-distinguer un jeton d'authentification d'un décompte de jetons de langage. Un
-`prompt_tokens` ou un `max_tokens` dans une preuve rendrait donc le rapport
-d'exécution entier impubliable (`render_execution_json` appelle
-`assert_no_secrets` sur tout le document). Les compteurs portent donc les noms
-`prompt_units` / `completion_units` / `generation_limit`. Le contrat de `schema`
-est figé et n'est pas modifié ici ; la contrainte est contournée par le nommage
-et signalée comme un défaut du filtre, pas comme une fatalité.
+Les compteurs s'appellent `*_tokens`, et c'est une correction
+-------------------------------------------------------------
+Ils se sont appelés `prompt_units` / `completion_units` / `generation_limit`
+pendant une livraison, parce que `schema._SECRET_KEY_RE` frappait alors en
+sous-chaîne **tout** nom contenant `token` : un `completion_tokens` suffisait à
+rendre le rapport d'exécution entier impubliable. Le motif est désormais ancré
+sur les frontières de composant (`(^|_)TOKEN(_|$)`), un compte au pluriel passe
+et un porteur d'authentification au singulier reste retenu. Le contournement est
+donc retiré : les compteurs portent les noms de l'API OpenAI, qui sont ceux que
+l'exploitant lit dans `usage_log`.
+
+La preuve nomme comme le consommateur
+-------------------------------------
+`proof()` est le SEUL document que ce module publie pour un tiers, et son
+consommateur unique est `registry_writer.SmokeTestProof` (AUT-007). Ses clés
+sont donc celles que ce contrat exige — `model_id`, `http_status`,
+`completion_tokens`, `measured_at`, `endpoint` — et non le vocabulaire interne
+de `StreamOutcome`. Faire porter la traduction par l'applicateur aurait créé un
+troisième endroit où lire une preuve, donc un endroit de plus où être indulgent.
 """
 from __future__ import annotations
 
@@ -139,6 +148,14 @@ READINESS_LEVELS: tuple[str, ...] = (LEVEL_NONE, LEVEL_STRUCTURAL, LEVEL_SERVING
 
 PROOF_KIND = "eva.first_token.proof"
 PROOF_VERSION = 1
+
+# Le chemin PUBLIC que la recette exerce, et le seul. Publié dans la preuve
+# parce que le consommateur (AUT-007) refuse une recette qui n'aurait pas
+# traversé `/v1/` : une génération obtenue en interrogeant `llama-server` en
+# direct prouve que le modèle charge, pas que la chaîne nginx → gateway →
+# llama-server sert (§10). Le chemin est une CONSTANTE et non un réglage : s'il
+# devenait paramétrable, la preuve pourrait attester d'un chemin privé.
+GENERATION_PATH = "/v1/chat/completions"
 
 # Le SEUL verdict qui vaut feu vert. Toute autre valeur — y compris une valeur
 # inconnue d'une version future — refuse, par construction (`==`, jamais `!=`).
@@ -244,7 +261,7 @@ class FirstTokenSettings:
             "base_url": self.base_url,
             "admin_url": self.admin_url,
             "model": self.model_id or "<dérivé du plus petit modèle activé>",
-            "generation_limit": self.max_tokens,
+            "max_tokens": self.max_tokens,
             "ttft_threshold_ms": self.ttft_threshold_ms,
             "fail_on_ttft": self.fail_on_ttft,
         }
@@ -340,8 +357,8 @@ class StreamOutcome:
     total_ms: int = -1
     content_chunks: int = 0
     content_chars: int = 0
-    prompt_units: int = 0
-    completion_units: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     stream_model: str = ""
     saw_done: bool = False
     max_inter_delta_gap_ms: int = -1
@@ -360,8 +377,8 @@ class StreamOutcome:
             "total_ms": self.total_ms,
             "content_chunks": self.content_chunks,
             "content_chars": self.content_chars,
-            "prompt_units": self.prompt_units,
-            "completion_units": self.completion_units,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
             "stream_model": self.stream_model,
             "saw_done": self.saw_done,
             "max_inter_delta_gap_ms": self.max_inter_delta_gap_ms,
@@ -382,8 +399,8 @@ class _StreamTally:
     content_chars: int = 0
     bad_envelope: int = 0
     upstream_error: str | None = None
-    prompt_units: int = 0
-    completion_units: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
     models: set = field(default_factory=set)
     t_first_content: float | None = None
     t_last_content: float | None = None
@@ -406,8 +423,8 @@ def _consume_chunk(chunk: Any, tally: _StreamTally, now: float) -> None:
         tally.models.add(str(chunk["model"]))
     usage = chunk.get("usage")
     if isinstance(usage, dict):
-        tally.prompt_units = _positive_int(usage.get("prompt_tokens"), tally.prompt_units)
-        tally.completion_units = _positive_int(usage.get("completion_tokens"), tally.completion_units)
+        tally.prompt_tokens = _positive_int(usage.get("prompt_tokens"), tally.prompt_tokens)
+        tally.completion_tokens = _positive_int(usage.get("completion_tokens"), tally.completion_tokens)
     for choice in chunk.get("choices") or []:
         if not isinstance(choice, dict):
             continue
@@ -457,7 +474,7 @@ def _stream_reason(tally: _StreamTally, http_code: int, expected_model: str) -> 
         return REASON_MODEL_MISMATCH
     if tally.bad_envelope:
         return REASON_BAD_ENVELOPE
-    if tally.prompt_units <= 0 or tally.completion_units <= 0:
+    if tally.prompt_tokens <= 0 or tally.completion_tokens <= 0:
         return REASON_NO_USAGE
     return REASON_OK
 
@@ -529,8 +546,8 @@ async def analyse_sse_stream(
         total_ms=total_ms,
         content_chunks=tally.content_chunks,
         content_chars=tally.content_chars,
-        prompt_units=tally.prompt_units,
-        completion_units=tally.completion_units,
+        prompt_tokens=tally.prompt_tokens,
+        completion_tokens=tally.completion_tokens,
         stream_model=sorted(tally.models)[0] if tally.models else "",
         saw_done=tally.saw_done,
         max_inter_delta_gap_ms=gap_ms,
@@ -623,6 +640,11 @@ class RecipeReport:
         Sa forme est figée par `PROOF_KIND`/`PROOF_VERSION`. Un consommateur
         n'autorise l'activation d'un modèle que si `proof_authorizes()` le dit ;
         il ne doit jamais réécrire cette règle chez lui.
+
+        Les noms sont ceux du contrat consommateur (`registry_writer`) : `model_id`,
+        `http_status`, `measured_at`, `completion_tokens`, `endpoint`. Traduire
+        chez le consommateur aurait supposé une couche intermédiaire capable
+        d'inventer un champ absent ; nommer juste ici supprime la couche.
         """
         stream = self.stream.to_dict() if self.stream is not None else None
         return {
@@ -630,23 +652,24 @@ class RecipeReport:
             "version": PROOF_VERSION,
             "verdict": PROOF_SERVED if self.served else PROOF_NOT_SERVED,
             "reason": self.reason,
-            "model": self.model,
+            "model_id": self.model,
             "base_url": self.settings_view.get("base_url", ""),
-            "observed_at": self.observed_at,
+            "endpoint": GENERATION_PATH,
+            "measured_at": self.observed_at,
             "dry_run": self.dry_run,
             "readiness": {
                 "liveness": bool(self.readiness_levels.get("liveness")),
                 "structural": bool(self.readiness_levels.get("structural")),
                 "serving": bool(self.readiness_levels.get("serving")),
             },
-            "http_code": stream["http_code"] if stream else -1,
+            "http_status": stream["http_code"] if stream else -1,
             "headers_ms": stream["headers_ms"] if stream else -1,
             "ttft_ms": stream["ttft_ms"] if stream else -1,
             "total_ms": stream["total_ms"] if stream else -1,
             "content_chunks": stream["content_chunks"] if stream else 0,
             "content_chars": stream["content_chars"] if stream else 0,
-            "prompt_units": stream["prompt_units"] if stream else 0,
-            "completion_units": stream["completion_units"] if stream else 0,
+            "prompt_tokens": stream["prompt_tokens"] if stream else 0,
+            "completion_tokens": stream["completion_tokens"] if stream else 0,
             "sse_buffering_suspected": bool(stream["buffering_suspected"]) if stream else False,
             "usage_entries": self.usage_entries,
             "usage_logged": self.usage_entries > 0,
@@ -687,7 +710,7 @@ def proof_authorizes(proof: Any, model_id: str) -> bool:
         return False
     if not isinstance(model_id, str) or not model_id:
         return False
-    if proof.get("model") != model_id:
+    if proof.get("model_id") != model_id:
         return False
     if proof.get("usage_logged") is not True:
         return False
@@ -857,7 +880,7 @@ def _dry_run_report(settings: FirstTokenSettings, context: ex.ExecutionContext) 
         ("model_resolution", f"GET {settings.admin_url}/admin/models"),
         ("identity", f"POST {settings.admin_url}/admin/users puis .../keys"),
         ("model_load", f"POST {settings.admin_url}/admin/models/<modèle>/load"),
-        ("generation", f"POST {settings.base_url}/v1/chat/completions (stream: true)"),
+        ("generation", f"POST {settings.base_url}{GENERATION_PATH} (stream: true)"),
         ("usage_log", f"GET {settings.admin_url}/admin/usage"),
         ("identity_cleanup", f"DELETE {settings.admin_url}/admin/keys/<préfixe> puis /admin/users/<éphémère>"),
     )
@@ -1054,7 +1077,7 @@ async def _generate(
     deadline = t_start + settings.stream_timeout_s
     try:
         async with client.stream(
-            "POST", f"{settings.base_url}/v1/chat/completions",
+            "POST", f"{settings.base_url}{GENERATION_PATH}",
             json=corps, headers=entetes, timeout=settings.stream_timeout_s,
         ) as reponse:
             t_headers = context.monotonic()

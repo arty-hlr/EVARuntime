@@ -337,8 +337,9 @@ def _preuve(identity: cal.CalibrationIdentity | None = None) -> cal.CalibrationP
         idle_vram_bytes=IDLE_VRAM,
         peak_vram_bytes=PIC_VRAM_CIBLE,
         peak_ram_bytes=PIC_RAM_CIBLE,
+        load_seconds=1.5,
         safety_margin=0.10,
-        tested_at="2026-08-01T10:00:00Z",
+        measured_at="2026-08-01T10:00:00Z",
     )
 
 
@@ -535,14 +536,14 @@ def test_le_rapport_porte_toutes_les_empreintes_de_la_section_9(tmp_path):
     calibration = document["calibration"]
     for cle in (
         "model_id", "runtime_version", "hardware_fingerprint", "params_fingerprint",
-        "idle_vram_gb", "peak_vram_gb", "peak_ram_gb", "tested_at",
+        "idle_vram_gb", "peak_vram_gb", "peak_ram_gb", "measured_at",
     ):
         assert cle in calibration, cle
     for cle in ("load_seconds", "ttft_ms",
                 "prompt_tokens_per_second", "generation_tokens_per_second"):
         assert cle in document, cle
     assert document["kind"] == cal.CALIBRATION_KIND
-    assert calibration["tested_at"] == "2026-08-01T10:00:00Z"
+    assert calibration["measured_at"] == "2026-08-01T10:00:00Z"
 
 
 def test_le_rapport_publie_les_noms_de_debits_litteraux_de_la_section_9(tmp_path):
@@ -603,8 +604,9 @@ def test_la_proposition_arrondit_vers_le_haut_jamais_vers_le_bas():
         # 10,05 Gio × 1,10 = 11,055 → 11,06 et non 11,05.
         peak_vram_bytes=int(10.05 * GIB),
         peak_ram_bytes=PIC_RAM_CIBLE,
+        load_seconds=1.5,
         safety_margin=0.10,
-        tested_at="2026-08-01T10:00:00Z",
+        measured_at="2026-08-01T10:00:00Z",
     )
     assert preuve.measured_vram_gb == 10.05
     assert preuve.proposed_vram_gb == 11.06
