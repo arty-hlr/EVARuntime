@@ -30,13 +30,19 @@ catalog_version: 1
 # §8 impose de distinguer la licence du LOGICIEL DE TÉLÉCHARGEMENT de celles des
 # modèles. Elle est commune à toutes les entrées : elle vit donc ici.
 downloader:
-  name: "huggingface_hub"
-  license_id: "apache-2.0"
-  license_url: "https://github.com/huggingface/huggingface_hub/blob/main/LICENSE"
+  name: "eva-bootstrap downloader"
+  license_id: "agpl-3.0"
+  license_url: "https://www.gnu.org/licenses/agpl-3.0.html"
   notes: >-
-    Client officiel, utilisé avec révision figée, liste exacte de fichiers et
-    vérification SHA-256 (AUT-006). Le jeton éventuel passe par l'environnement
-    ou un credential store, jamais par argv.
+    Module du dépôt (`gateway/bootstrap/downloader.py`), bâti sur la
+    bibliothèque standard. Révision figée, liste exacte de fichiers, écriture
+    vers un nom temporaire, vérification SHA-256 puis renommage atomique
+    (AUT-006). Le jeton éventuel passe par l'environnement ou un credential
+    store, jamais par argv. `huggingface_hub` a été évalué puis écarté : il
+    tire requests/filelock/fsspec/tqdm dans le chemin d'un outil qui doit
+    tourner avant le venv de la gateway, il possède le temporaire et le
+    renommage, et il vérifie l'ETag du serveur là où nous voulons l'empreinte
+    que ce catalogue a épinglée après revue.
 
 models:
   # ── Entrée 1 ───────────────────────────────────────────────────────────────

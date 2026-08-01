@@ -106,6 +106,13 @@ _LICENSES: dict[str, bool] = {
     "qwen": False,
     "qwen-research": False,
     "other": False,
+    # Licence d'EVARuntime lui-même. Elle n'entre ici que parce que le
+    # téléchargeur est désormais un module du dépôt (AUT-006) et non plus un
+    # outil tiers : `downloader.license_id` doit pouvoir la nommer. Marquée NON
+    # permissive à dessein — aucun modèle ne doit jamais être accepté sous ce
+    # motif, et `test_le_catalogue_livre_nutilise_que_des_licences_reellement
+    # _permissives` le vérifie.
+    "agpl-3.0": False,
 }
 
 _KNOWN_PROVIDERS: frozenset[str] = frozenset({"huggingface"})
