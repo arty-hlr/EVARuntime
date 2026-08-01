@@ -595,6 +595,167 @@ Conditions de §13 et leur état :
 installerait et pourquoi. Le travail d'exécution (M2 : AUT-006 → AUT-011) peut
 démarrer sur une base qui décrit correctement son intention.
 
+### 0.13 Vague 6 — l'exécution du plan (jalon M2)
+
+Cette vague livre les **exécuteurs** : les modules qui appliquent réellement le
+plan que la vague 5 sait écrire. Elle est la première du projet à toucher au
+disque, au réseau et au cycle de vie des modèles autrement que pour observer.
+
+Elle commence par deux items que personne n'avait planifiés, et qui n'existaient
+dans aucun des deux audits.
+
+| Chantier | Items | Priorité | Fichiers possédés | Tests | État |
+|---|---|---|---|---:|---|
+| — | AUT-014 (contrat, préalable) | P0 | `bootstrap/execution.py` | +93 | `[x]` |
+| D0 | AUT-015 | P0 | `bootstrap/runtime_installer.py` | +77 | `[x]` |
+| D1 | AUT-006 | P0 | `bootstrap/downloader.py` | +65 | `[x]` |
+| D2 | AUT-007 | P1 | `bootstrap/registry_writer.py` | +103 | `[x]` |
+| D3 | AUT-008 | P1 | `bootstrap/calibration.py` | +78 | `[x]` |
+| D4 | AUT-009, AUT-010 | P0 / P1 | `bootstrap/first_token.py`, `warmup.py` | +120 | `[x]` |
+| D5 | AUT-011 | P1 | `bootstrap/install_report.py` | +75 | `[x]` |
+| — | AUT-001 (défaut de contrat) | P0 | `bootstrap/schema.py` | +17 | `[x]` |
+| — | AUT-014 (revue) | P1 | `bootstrap/execution.py` | +3 | `[x]` |
+| — | AUT-006 (déclaration de licence) | P2 | `bootstrap/catalog.*` | +1 | `[x]` |
+
+Les six chantiers ont été menés **en parallèle**, dans des worktrees git isolés,
+avec propriété exclusive de leurs fichiers. Aucun ne s'importe. Chacun a dû
+prouver la rougeur de ses tests en cassant réellement son code : **173 mutations
+appliquées et rejouées** au total, pas seulement affirmées.
+
+#### Deux items qui manquaient au backlog
+
+- **AUT-014 — le contrat du journal d'exécution.** La revue de la vague 5 avait
+  posé la question sans lui donner d'identifiant : « l'enjeu est M2, qui
+  appliquera des plans relus depuis un fichier ; un applicateur ne doit jamais
+  pouvoir être convaincu d'agir par un champ dérivé que personne ne recoupe »
+  (§0.12). Sans ce contrat figé **avant** les chantiers, six modules auraient
+  chacun inventé le leur — et la parallélisation aurait été impossible.
+- **AUT-015 — l'installation du runtime.** Trou franc du backlog. AUT-003
+  *résout* quelle variante de `llama-server` installer et s'arrête là ; aucun
+  item ne portait la pose du binaire, alors que le jalon M2 l'exige en
+  **première** condition. Ni l'audit Codex, ni l'audit Claude, ni cinq vagues
+  d'implémentation ne l'avaient vu.
+
+#### Le défaut qui a coûté trois contournements
+
+`schema._SECRET_KEY_RE` cherchait « TOKEN » **en sous-chaîne**. Dans une
+passerelle LLM, un jeton est d'abord une unité de facturation :
+`completion_tokens`, `max_tokens`, `tokens_per_second` et `first_token_ms`
+étaient donc tous déclarés « fuites », et le rendu refusait de publier le
+document qui les portait.
+
+Conséquence concrète : **le rapport de calibration prescrit par §9 était
+littéralement impubliable**, puisqu'il exige `prompt_tokens_per_second`.
+
+Trois chantiers ont buté dessus **indépendamment** — AUT-007, AUT-008 et
+AUT-011 — et l'ont chacun contourné de son côté : alias `prompt_tps`, résumé
+`digest()`, renommage en `*_units`. Aucun n'avait le droit de toucher à
+`schema.py`, et chacun a donc documenté un défaut comme s'il s'agissait d'une
+contrainte. C'est le coût réel de la propriété exclusive de fichiers : elle
+empêche les collisions, elle n'empêche pas trois personnes de payer trois fois
+la même dette.
+
+Le motif est désormais ancré sur les frontières de composant — le singulier
+reste un porteur d'authentification (`access_token`, `hf_token`, `token_file`),
+le pluriel est un comptage — et les mesures dont le nom porte le singulier sont
+exemptées nommément. Un nom non prévu **bloque la publication au lieu de fuir** :
+la dégradation reste bruyante. Les trois contournements ont été retirés.
+Rougeur : remettre le motif non ancré fait tomber 30 tests.
+
+#### Trois trous dans le contrat d'exécution, trouvés par ses usagers
+
+Aucun n'avait été vu par les 93 tests du contrat lui-même. C'est la limite d'un
+contrat écrit avant ceux qui s'en servent.
+
+| Découverte | Trouvé par | Traitement |
+|---|---|---|
+| **`plan_schema_version` était émise mais jamais relue.** Un journal archivé annonçant une version de plan arbitraire validait sans une erreur — le champ censé attester contre quel contrat l'exécution a eu lieu était décoratif. | AUT-011 | Corrigé 🔬 |
+| **Les clés racine inconnues étaient acceptées.** Un rapport enrichi d'un « conclusion : tout est vert » que rien ne recoupe passait la validation. Exactement la classe de trou fermée en trois passes sur le contrat du plan en vague 5 — le journal, lui, était resté ouvert. | AUT-011 | Corrigé 🔬 |
+| **`duration_ms` valait `0` par défaut et le lanceur écrasait toute valeur fausse** : un exécuteur mesurant honnêtement 0 ms était indistinguable d'un exécuteur muet. | AUT-008 | Corrigé — le défaut est `None`, et `0` est une mesure respectée 🔬 |
+
+#### Défauts découverts pendant la vague 6
+
+Ceux qui touchent du code hors du périmètre de la vague sont **signalés, pas
+corrigés** : ils deviennent des items ou enrichissent ceux qui existaient.
+
+| Découverte | Trouvé par | Traitement |
+|---|---|---|
+| **`proxy._stream_proxy` ne teste jamais `response.status_code` dans la branche streaming.** Le statut est lu puis utilisé **uniquement** pour le log d'usage ; le `StreamingResponse` est déjà parti avec un 200. Un `llama-server` qui répond 400/500 avec un corps JSON non-SSE voit ce corps relayé ligne par ligne, sous **HTTP 200**, sans préfixe `data:` ni `[DONE]`. Le client voit un succès, le journal enregistre un 502 : les deux vues divergent en silence. | AUT-009, en lisant le chemin qu'il devait exercer | **COR-013 précisé** — l'item existait, son libellé sous-estimait la portée 📖 |
+| **La double enveloppe d'erreur est confirmée**, et `type`/`code` sont inversés par rapport à la convention OpenAI : `auth.py` lève `HTTPException(detail={"error": …})` sans handler dédié, donc `/v1/*` sort `{"detail": {"error": …}}` là où `proxy._openai_error` sort `{"error": …}`. Par ailleurs `_openai_error` met la classe machine dans `type` et le **statut HTTP en chaîne** dans `code` ; `_sse_error` n'émet aucun `code`. La même panne n'a pas la même forme avant et pendant le flux. | AUT-009 | **COR-008 précisé** 📖 |
+| **`ModelRegistry._save()` détruit tous les commentaires de `models.yaml`.** `add()`, `update()`, `set_enabled()` et `remove()` — donc l'API admin et le dashboard — réécrivent le fichier par `yaml.dump`. Sur le fichier livré, cela efface 55 lignes d'en-tête opérationnel (budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7`). S'y ajoutent l'absence de sauvegarde et de `fsync`, et un basculement silencieux des permissions en 0600. **Perte de données en production, aujourd'hui.** | AUT-007 | Nouvel item **COR-018** 📖 |
+| **`runtime_resolver._judge_existing_binary` fait confiance à un manifeste qu'il ne recoupe jamais contre le binaire.** Ni la version ni le commit du manifeste ne sont confrontés au build réellement rendu par `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. | AUT-015 | **SEC-009 élargi** 📖 |
+| **Des `assert` portent des invariants de production** dans `runtime_resolver` (`assert match is not None`, `assert variant is not None`). Sous `python -O` — que rien n'interdit dans une unité systemd — ils disparaissent et l'erreur devient un `AttributeError` opaque au lieu d'un refus nommé. | AUT-015 | Nouvel item **COR-019** 📖 |
+| **`smoke_test.sh` passe le nom d'utilisateur en query string** (`GET /admin/usage?username=…`). Le nom y est éphémère et généré, donc sans donnée personnelle ; mais `main._redact_path()` redacte le **chemin**, pas la **requête**. Un vrai `username` passé à cette route atterrirait dans les journaux d'accès, ce que SEC-008 interdit. | AUT-009 | Nouvel item **SEC-010** 🧭 |
+| **`schema.validate_plan_dict()` n'a pas de plancher de version** : seule une version *plus récente* est refusée. Un document portant `schema_version: 0` passe sans une erreur, et tout consommateur qui ne fait que valider traitera un plan d'un contrat antérieur comme un plan courant. | AUT-014, par une mutation qui a **survécu** | Contourné dans `execution` par une égalité stricte ; le contrat du plan reste ouvert 🔬 |
+| **`schema.PlanSection.to_dict()` publie une référence, pas une copie** : muter le document rendu modifie le plan typé et donc tous les rendus ultérieurs. Un plan « immuable par contrat » est mutable par son propre rendu. | AUT-014 | Constat 🔬 — l'enjeu grandit en M2, où un applicateur manipule le document relu à côté du plan typé |
+| **`catalog.CatalogFile.size_bytes` est optionnel** alors qu'aucune prévision d'espace disque n'est possible sans lui : une entrée peut être `pinned`, donc planifiable, tout en étant intéléchargeable. | AUT-006 | Refus explicite côté téléchargeur ; la cohérence voudrait que `size_bytes` entre dans la définition de l'épinglage 📖 |
+| **Aucune variante de `DEFAULT_VARIANTS` ne porte `approx_bytes`** : le volume annoncé par le plan **ignore entièrement** le téléchargement du runtime. Un opérateur qui dimensionne son disque depuis le plan sous-compte de plusieurs centaines de Mo pour une variante CUDA. | AUT-015 | Constat 📖 |
+| **Divergence de regex d'identifiant** entre le catalogue (3 à 64 caractères) et le registre (1 à 63). Une entrée de catalogue de 64 caractères est valide en amont et refusée en aval ; le pont ne le découvrirait qu'à l'écriture. | AUT-007 | Contrôlé côté `registry_writer`, non aligné en amont 📖 |
+| **`models.yaml` livré : `gemma-4-26b-a4b` est `enabled: true` avec un chemin portant le commentaire « À ajuster selon le chemin réel ».** Un modèle activé dont le fichier est déclaré incertain fait échouer `/ready` (COR-005), donc `update.sh`. | AUT-007 | Constat 📖 — à trancher |
+| **`codex-analyse.md` §9 n'ordonne pas le déchargement du modèle** entre la passe réduite et la passe cible, ni après. Suivre la spécification à la lettre laisse le modèle chargé, ce qui contredit les invariants de cycle de vie d'`AGENTS.md`. | AUT-008 | **Défaut de la spécification elle-même**, pas du code. Le déchargement a été ajouté ; §9 devrait l'inscrire 📖 |
+| **Le catalogue déclarait un téléchargeur qui n'était pas celui employé** : `huggingface_hub` sous apache-2.0, alors qu'AUT-006 a délibérément écarté cette dépendance. §8 exige de distinguer la licence du logiciel de téléchargement — une déclaration fausse est pire qu'absente, elle a l'apparence d'une vérification. | AUT-006, en écrivant son manifeste de provenance | Corrigé — le test ne compare plus un nom en dur, il recoupe la déclaration avec les **imports réels** du module 🔬 |
+
+#### Ce que l'orchestration a appris
+
+Les worktrees fournis aux six chantiers ont été taillés depuis `main`, **66
+commits en arrière**, sans le paquet `bootstrap` ni le contrat qu'ils devaient
+consommer. Les six agents ont **refusé de travailler** et ont diagnostiqué la
+cause au lieu d'inventer le contrat manquant.
+
+Cela tient à une seule ligne du mandat : « vérifie d'abord que
+`bootstrap/execution.py` existe ; s'il est absent, arrête-toi ». Sans cette
+précondition, six chantiers auraient produit six définitions divergentes de
+`StepExecutor` — et le défaut ne serait apparu qu'à la fusion, après des heures
+de travail à jeter. **Une précondition vérifiable vaut mieux qu'une consigne
+d'architecture**, aussi bien écrite soit-elle.
+
+#### Ce que la vague 6 ne prétend pas avoir démontré
+
+- **Toujours aucun GPU réel.** La VRAM reste entièrement déclarative. Le module
+  qui *prétend mesurer* — `calibration` — n'a mesuré que des doubles : aucun
+  `nvidia-smi` n'a été exécuté, aucun `llama-server` n'a été chargé, et les
+  sondes qu'il définit n'ont **aucune implémentation** dans le dépôt.
+- **Aucun réseau réel, aucun dépôt Hugging Face réel.** Le comportement effectif
+  de HF n'est pas prouvé : chaîne de redirection vers le CDN, forme des
+  `Content-Range`, réponses aux `Range` sur objets LFS, codes 401/403/416,
+  coupures TCP en cours de flux. Les transports HTTP de production
+  (`UrllibTransport`, des deux modules qui en ont un) ne sont **couverts par
+  aucun test** — c'est le seul composant de production non testé de la vague.
+- **Aucun nginx réel dans un test automatisé.** Le point n° 1 de §10 — « le test
+  doit traverser le vrai chemin public » — est **codé, pas démontré**. La
+  détection de SSE bufferisé n'a jamais vu un vrai buffering, et ses deux seuils
+  sont des choix non validés terrain. Le chantier ajoute d'ailleurs que la
+  bufferisation **n'est pas décidable depuis le client seul** : un backend
+  rapide qui traite un long prompt puis répond en rafale produit la même
+  signature.
+- **Les formes de réponse des routes admin sont recopiées depuis la lecture du
+  code**, pas obtenues d'un serveur. `/ready` est recoupé contre
+  `readiness.ReadinessReport` réel ; **les cinq routes admin ne sont recoupées
+  contre rien**, et une divergence de champ y passerait inaperçue.
+- **Aucune archive de release amont réelle n'a été téléchargée** : la structure
+  supposée des artefacts `llama-server` est une hypothèse. `DEFAULT_VARIANTS` ne
+  contient aucune empreinte, donc **en configuration par défaut, l'installateur
+  de runtime n'installe rien**.
+- **Les marges sont des chiffres choisis, pas mesurés** : 10 % pour la
+  calibration, 1,15 pour l'activation, 24 h de fraîcheur de preuve, 0,5 s
+  d'intervalle d'échantillonnage. Aucune donnée ne les appuie.
+- **Le prompt court de §9 ne remplit pas le cache KV.** C'est la limite la plus
+  dangereuse de la calibration : le pic mesuré peut sous-estimer le régime
+  permanent, et la spécification elle-même prescrit ce prompt court.
+- **Aucune concurrence.** Deux applications simultanées sur le même
+  `models_dir` ou le même `models.yaml` se marcheraient dessus : il n'existe
+  aucun verrou. Une calibration menée pendant qu'un autre modèle est servi
+  mesurerait la VRAM des deux.
+- **L'atomicité est prouvée par construction, pas par expérience** : aucun test
+  ne coupe le processus entre deux étapes, ne remplit un disque, ni ne simule un
+  `os.replace` inter-volumes.
+- **Les fixtures sont minuscules** — quelques centaines d'octets. Rien ne
+  démontre le comportement sur un GGUF de 40 Go : coût du re-hachage à la
+  reprise, coût du hachage d'idempotence à chaque exécution, pression mémoire.
+- **Les releases et les venvs s'accumulent toujours.** L'installateur de runtime
+  ne purge rien, comme `update.sh` avant OPS-010 et comme les sauvegardes
+  `*.pre-migration.*.bak` (OPS-002).
+
 ---
 
 ## 1. Objet du document
@@ -1462,16 +1623,19 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-005 | `[x]` | P0 | Renforcer `/ready` | Binaire ou modèle absent → non-ready ; test local et cluster. |
 | COR-006 | `[x]` | P0 | Utiliser un vrai smoke test pour update/rollback | Une version incapable de générer n'est jamais validée. |
 | COR-007 | `[x]` | P0 | Aligner limites RAM/systemd sur les profils | Aucun modèle approuvé n'est incompatible avec `MemoryMax`; profil MiniMax explicitement traité. |
-| COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe. |
+| COR-008 | `[ ]` | P1 | Uniformiser les erreurs OpenAI | Auth, quota, chargement et upstream renvoient tous `{"error": ...}` sans double enveloppe, et `type`/`code` suivent la convention OpenAI. **Précisé le 2026-08-01** (§0.13) : la double enveloppe est confirmée — `auth.py` lève `HTTPException(detail={"error": …})` et aucun handler `HTTPException` n'existe, donc `/v1/*` sort `{"detail": {"error": …}}` là où `proxy._openai_error` sort `{"error": …}`. S'y ajoutent deux écarts non relevés jusqu'ici : `_openai_error` met la classe machine dans `type` et le **statut HTTP en chaîne** dans `code`, à l'inverse de la convention OpenAI (un client SDK qui teste `err.code == "model_not_found"` échoue) ; et `_sse_error` code `"type": "server_error"` en dur **sans émettre de `code`**, de sorte que la même panne n'a pas la même forme avant et pendant le flux. |
 | COR-009 | `[x]` | P1 | Aligner les routes nginx et FastAPI | Chaque route documentée est exposée ou supprimée de la documentation. **Livré le 2026-07-30** : `/ready` et `/completion` étaient documentés sur l'URL publique mais retombaient en 404 côté nginx ; les timeouts sont désormais dérivés du `load_timeout_seconds` maximal du registre (900 s) au lieu des 30 s qui faisaient échouer tout pré-chargement admin en 504. |
 | COR-010 | `[ ]` | P1 | Corriger `revoke_key()` | `%` et `_` sont littéraux ou rejetés ; seconde révocation a un comportement défini. |
 | COR-011 | `[–]` | — | ~~Corriger le slot student abandonné~~ | Annulé : composant supprimé (DEC-009). |
 | COR-012 | `[ ]` | P1 | Définir une réservation de quota | Les requêtes concurrentes ne dépassent pas silencieusement le budget, ou le dépassement maximal accepté est borné et documenté. |
-| COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. |
+| COR-013 | `[ ]` | P1 | Préserver les erreurs upstream avant SSE | Une 4xx/5xx de `llama-server` ne devient pas un HTTP 200 ambigu ; contrat d'erreur streaming testé. **Portée corrigée le 2026-08-01** (§0.13) : le libellé sous-estimait le défaut. `proxy._stream_proxy` ne teste **jamais** `response.status_code` dans la branche streaming — il le lit et ne s'en sert que pour le log d'usage, le `StreamingResponse` étant déjà parti avec un 200. Un backend qui répond 400/500 avec un corps JSON non-SSE voit ce corps **relayé ligne par ligne**, sous HTTP 200, sans préfixe `data:` ni `[DONE]`. Le client conclut au succès, le journal enregistre un 502 : les deux vues divergent en silence. Le cas *timeout/connexion* est mieux traité (`_sse_error` émet bien une erreur SSE puis `[DONE]`), mais il ne couvre que les exceptions `httpx`, pas un statut HTTP d'erreur. |
 | COR-014 | `[x]` | P0 | Rendre chargeables les réglages de liste de l'environnement | `ALLOWED_MODEL_DIRS`, `CORS_ALLOW_ORIGINS` et `ALLOWED_MODELS` acceptent la syntaxe documentée sans faire échouer le démarrage ; les fichiers d'exemple livrés sont chargeables. **Item ajouté le 2026-07-30**, découvert par AUT-012 : ces trois réglages étaient inutilisables tels que documentés. |
 | COR-015 | `[x]` | P0 | Réparer le démarrage en mode cluster | `CLUSTER_MODE=cluster` démarre et sert ; la régression est verrouillée par TST-006. **Item ajouté le 2026-07-30** (§0.10). Correctif d'une ligne appliqué et vérifié sur VM (`n.node_id` → `n.id` dans `model_manager._build_manager()`), puis **verrouillé par TST-006** le 2026-07-30 : réintroduire `n.node_id` fait échouer 2 tests sur `AttributeError`. |
 | COR-016 | `[x]` | P0 | Rendre `update-agent.sh` capable de réussir | Une mise à jour de node-agent aboutit sans rollback, et la stratégie de venv est la même que celle de `update.sh` (construction à l'emplacement final, bascule par symlink) plutôt qu'un déplacement de venv. **Item ajouté le 2026-07-30** (§0.10). Contournement appliqué et vérifié sur VM (`ExecStart` via `python -m uvicorn`, conservé en défense en profondeur), puis **correctif structurel livré** le 2026-07-30 : le venv est construit à son emplacement définitif et `venv-agent` devient un symlink que l'on bascule, comme dans `update.sh`. Un agent installé par l'ancien script est migré en place, sans action opérateur. Test de non-régression : un exécutable de `bin/` doit rester lançable après la bascule. |
 | COR-017 | `[x]` | P0 | Rendre les redémarrages insensibles au start-limit systemd | Un rollback ne peut pas laisser le service en `failed` : chaque `systemctl start` des scripts de déploiement est précédé d'un `systemctl reset-failed`, et un échec de rollback est signalé comme une indisponibilité, pas comme un simple avertissement. **Item ajouté le 2026-07-30** (§0.10), **livré le même jour** : `reset-failed` avant chaque démarrage dans les 4 scripts de déploiement, et l'échec de redémarrage d'un rollback sort désormais en code 9 « INDISPONIBILITÉ », distinct du code 1 « version précédente restaurée et en service ». |
+
+| COR-018 | `[ ]` | P1 | Préserver `models.yaml` lors des mutations admin | Une mutation par l'API admin ou le dashboard conserve les commentaires du fichier, produit une sauvegarde, écrit atomiquement avec `fsync`, et laisse les permissions inchangées. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-007 : `ModelRegistry._save()` réécrit le fichier entier par `yaml.dump`, ce qui efface les 55 lignes d'en-tête opérationnel du fichier livré — budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7` — et tous les commentaires d'entrée. Il ne sauvegarde pas, ne synchronise pas, et `NamedTemporaryFile` fait basculer le fichier en 0600 sans restaurer les permissions d'origine. Perte de données en production, aujourd'hui, sur un chemin emprunté par le dashboard. `bootstrap/registry_writer.py` montre la forme attendue : ajout textuel, reparse comparatif, refus plutôt que réécriture globale. |
+| COR-019 | `[ ]` | P2 | Ne pas porter d'invariant de production par `assert` | Aucun `assert` ne garde un invariant dont la violation doit produire une erreur nommée. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-015 : `runtime_resolver.ProvenanceManifest.build_number` et `to_decision()` s'appuient sur `assert match is not None` / `assert variant is not None`. Sous `python -O`, que rien n'interdit dans une unité systemd, ces gardes disparaissent et le refus explicite devient un `AttributeError` opaque. À rechercher ailleurs dans le dépôt avant de conclure. |
 
 ### Lot B — bootstrap automatisé
 
@@ -1517,7 +1681,8 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | SEC-005 | `[ ]` | P1 | Imposer l'intégrité des modèles approuvés | Aucun modèle catalogue ne charge sans SHA/provenance. |
 | SEC-006 | `[ ]` | P1 | Sécuriser le data-plane cluster | Prompts chiffrés ou réseau isolé attesté et contrôlé. |
 | SEC-007 | `[ ]` | P1 | Produire SBOM et attestations runtime | Chaque release et binaire redistribué possède provenance et notices. |
-| SEC-009 | `[ ]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. |
+| SEC-009 | `[ ]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version\|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. **Élargi le 2026-08-01** (§0.13), en livrant AUT-015 : `runtime_resolver._judge_existing_binary` accorde `reuse_existing` sur la foi d'un manifeste **qu'il ne recoupe jamais contre le binaire** — ni la version ni le commit déclarés ne sont confrontés à ce que rend `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. `runtime_installer` ferme le trou de son côté en recalculant l'empreinte à chaque passe ; le résolveur reste exposé. |
+| SEC-010 | `[ ]` | P2 | Rédiger la query string dans les journaux d'accès | Un nom d'utilisateur passé en paramètre de requête n'apparaît pas plus dans les journaux qu'un nom passé dans le chemin. **Item ajouté le 2026-08-01** (§0.13), découvert en livrant AUT-009 : `main._redact_path()` redacte le **chemin**, pas la **requête**, alors que `GET /admin/usage?username=…` existe et est employé par `deploy/smoke_test.sh`. Le nom y est éphémère et généré, donc sans donnée personnelle — mais un opérateur qui interroge cette route avec un vrai nom écrirait ce nom au journal, ce que SEC-008 interdit. À confirmer par lecture de `_redact_path` avant d'écrire le correctif. |
 | SEC-008 | `[x]` | P1 | Ne pas journaliser les noms d'utilisateur | Aucun `log.*` de la gateway ne porte de nom d'utilisateur ; le chemin de requête est rédigé. **Item ajouté le 2026-07-30**, découvert en livrant COR-002 : anonymiser en base est sans effet si le journal garde une copie du nom. |
 
 ### Lot E — tests, exploitation et standardisation
