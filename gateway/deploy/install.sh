@@ -90,6 +90,22 @@ systemctl_enable_now() {
     systemctl enable --now "$unit"
 }
 
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Source de vérité UNIQUE et déclarative des dépendances de commandes de ce
+# script. `docs/deployment.md` §1 doit les lister toutes, et
+# `gateway/tests/test_deploy_required_commands.py` DÉRIVE la liste attendue de
+# ces tableaux au lieu de la recopier : ajouter une commande ici suffit pour que
+# le test exige sa documentation. Corollaire, vérifié par le même test : aucun
+# `command -v <nom littéral>` ne doit exister ailleurs dans ce script, sinon la
+# dépendance échappe à la documentation — c'est exactement ainsi que `rsync`
+# avait disparu des prérequis du node-agent.
+INSTALL_REQUIRED_COMMANDS=(awk chmod chown cp find id mkdir mktemp mv python3 systemctl useradd)
+# Mode local uniquement : l'orchestrateur cluster ne touche ni GPU ni groupes GPU.
+INSTALL_REQUIRED_COMMANDS_LOCAL=(nvidia-smi usermod)
+# Absentes, ces commandes ne bloquent pas l'installation mais désactivent une
+# fonction : `nginx` (reverse-proxy) et `sqlite3` (armement du timer de backup).
+INSTALL_OPTIONAL_COMMANDS=(nginx sqlite3)
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
@@ -136,8 +152,18 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 
 [[ $EUID -eq 0 ]] || error "Ce script doit être exécuté en root (sudo bash install.sh)"
-for required in awk chmod chown cp find id mkdir mktemp mv systemctl useradd "$PYTHON"; do
-    command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
+
+required=()
+required+=("${INSTALL_REQUIRED_COMMANDS[@]}")
+if [[ "$EFFECTIVE_MODE" != "cluster" ]]; then
+    required+=("${INSTALL_REQUIRED_COMMANDS_LOCAL[@]}")
+fi
+for command_name in "${required[@]}"; do
+    # `python3` est le nom DOCUMENTÉ ; PYTHON= substitue l'interpréteur contrôlé
+    # sans changer la dépendance annoncée.
+    [[ "$command_name" == python3 ]] && command_name="$PYTHON"
+    command -v "$command_name" &>/dev/null || \
+        error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
 [[ -f "$SCRIPT_DIR/requirements.txt" ]] || error "Préflight : requirements.txt introuvable"
 [[ -f "$SCRIPT_DIR/deploy/llm-gateway.service" ]] || error "Préflight : unité systemd locale introuvable"
@@ -145,8 +171,6 @@ if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité systemd orchestrateur introuvable"
     [[ -f "$SCRIPT_DIR/deploy/nodes.yaml.example" ]] || error "Préflight : template nodes.yaml introuvable"
 else
-    command -v usermod &>/dev/null || error "Préflight : commande requise introuvable : usermod"
-    command -v nvidia-smi &>/dev/null || error "Préflight local : nvidia-smi introuvable"
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
     [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
 fi

@@ -187,6 +187,18 @@ SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
 NGINX_SITE="/etc/nginx/sites-available/llm-gateway"
 
 # Répertoires
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Même convention déclarative que `install.sh` : source unique, dérivée par
+# `gateway/tests/test_deploy_required_commands.py` et documentée en
+# `docs/deployment.md` §1. Aucun `command -v <nom littéral>` ailleurs.
+UPDATE_REQUIRED_COMMANDS=(awk chmod chown cp curl find git mkdir mktemp mv systemctl)
+# Mode local uniquement : l'orchestrateur cluster n'a pas de GPU.
+UPDATE_REQUIRED_COMMANDS_LOCAL=(nvidia-smi)
+# Exigée seulement quand la recette du premier token est jouée (COR-006).
+UPDATE_REQUIRED_COMMANDS_SMOKE=(python3)
+# Absentes, ces commandes désactivent une fonction sans bloquer la mise à jour.
+UPDATE_OPTIONAL_COMMANDS=(nginx sqlite3)
+
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
 DATA_DIR="${LLM_GATEWAY_DATA_DIR:-/var/lib/llm-gateway}"
 CONFIG_DIR="${LLM_GATEWAY_CONFIG_DIR:-/etc/llm-gateway}"
@@ -252,19 +264,21 @@ fi
 [[ -d "$INSTALL_DIR" ]] || error "$INSTALL_DIR n'existe pas — lancez d'abord install.sh"
 [[ -f "$INSTALL_DIR/venv/bin/python" ]] || error "venv introuvable — lancez d'abord install.sh"
 [[ -f "$CONFIG_FILE" ]] || error "Configuration introuvable : $CONFIG_FILE"
-for required in awk chmod chown cp curl find git mkdir mktemp mv systemctl; do
-    command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
+required=()
+required+=("${UPDATE_REQUIRED_COMMANDS[@]}")
+[[ "$EFFECTIVE_MODE" == "cluster" ]] || required+=("${UPDATE_REQUIRED_COMMANDS_LOCAL[@]}")
+[[ "$RUN_SMOKE_TEST" != true ]] || required+=("${UPDATE_REQUIRED_COMMANDS_SMOKE[@]}")
+for command_name in "${required[@]}"; do
+    command -v "$command_name" &>/dev/null || \
+        error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
 if [[ "$RUN_SMOKE_TEST" == true ]]; then
     [[ -f "$SMOKE_TEST_SCRIPT" ]] || \
         error "Préflight : recette du premier token introuvable ($SMOKE_TEST_SCRIPT). Utilisez --skip-smoke-test en connaissance de cause."
-    command -v python3 &>/dev/null || \
-        error "Préflight : python3 requis par la recette du premier token."
 fi
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité orchestrateur introuvable"
 else
-    command -v nvidia-smi &>/dev/null || error "Préflight local : nvidia-smi introuvable"
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
     [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
 fi

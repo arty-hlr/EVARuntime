@@ -44,6 +44,47 @@ GPU local et pilote des node-agents installés séparément.
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
+### Commandes exigées par les scripts de déploiement
+
+Les préflights refusent de continuer si l'une de ces commandes manque. La liste
+est **exhaustive** et **tenue à jour mécaniquement** : chaque script déclare ses
+dépendances dans un tableau bash unique (`INSTALL_REQUIRED_COMMANDS`,
+`AGENT_REQUIRED_COMMANDS`, …) et `gateway/tests/test_deploy_required_commands.py`
+dérive de ces tableaux la liste qui doit figurer ci-dessous. Une dépendance
+ajoutée à un script sans être documentée ici fait échouer la CI.
+
+| Commande | Exigée par | Paquet Debian/Ubuntu |
+|---|---|---|
+| `awk` | `install.sh`, `update.sh` | `mawk` ou `gawk` (présent) |
+| `chmod`, `chown`, `cp`, `id`, `mkdir`, `mktemp`, `mv` | `install.sh`, `update.sh` | `coreutils` (présent) |
+| `find` | `install.sh`, `update.sh` | `findutils` (présent) |
+| `python3` | tous | `python3` (≥ 3.11) |
+| `systemctl` | tous | `systemd` (présent) |
+| `useradd` | `install.sh` | `passwd` (présent) |
+| `usermod` | `install.sh` **mode local** | `passwd` (présent) |
+| `nvidia-smi` | `install.sh` / `update.sh` **mode local** | pilote NVIDIA — contournable par `--allow-no-gpu`, voir [§4](#4-installation-du-gateway) |
+| `curl` | `update.sh` | `curl` — **à installer** |
+| `git` | `update.sh`, `update-agent.sh` (sans `--no-pull`) | `git` — **à installer** |
+| `rsync` | `install-agent.sh`, `update-agent.sh` | `rsync` — **à installer**, absent d'une Debian 13 minimale |
+| `openssl` | `install-agent.sh` | `openssl` — **à installer** si absent |
+
+Commandes **optionnelles** : absentes, elles ne bloquent pas l'installation mais
+désactivent une fonction, et le script le dit.
+
+| Commande | Fonction perdue si absente | Paquet |
+|---|---|---|
+| `nginx` | reverse-proxy TLS non configuré ([§8](#8-configuration-nginx)) | `nginx` |
+| `sqlite3` | timer de sauvegarde quotidienne **non armé** ([§11](#11-mise-à-jour)) | `sqlite3` |
+| `ufw` | aucune règle firewall créée sur le nœud ; à faire dans le firewall réseau | `ufw` |
+
+```bash
+# Orchestrateur / gateway mono-nœud
+sudo apt install -y curl git sqlite3 nginx
+
+# CHAQUE nœud GPU, avant install-agent.sh
+sudo apt install -y rsync openssl
+```
+
 ### Vérifications initiales
 
 ```bash
