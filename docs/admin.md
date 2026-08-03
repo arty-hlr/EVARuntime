@@ -2189,6 +2189,13 @@ distinguer.
 - **Le serveur de calibration est identifié.** Un port déjà occupé est refusé
   avant lancement ; le processus est encore vivant après `/health` et doit
   annoncer l'alias exact du modèle via `/v1/models`.
+- **La mise en page de `models.yaml` ne décide pas de l'issue** (COR-028).
+  L'écriture et l'activation localisent une entrée quel que soit l'ordre de ses
+  clés — un fichier déjà passé par une mutation admin a `capabilities` avant
+  `id`, et l'étape `enable_model` le refusait auparavant. Ce localisateur est
+  celui de `model_registry`, pas un second : il n'y a qu'une politique
+  d'écriture de `models.yaml` dans le dépôt. Une entrée réellement introuvable
+  ou présente deux fois reste **refusée**, sans rien écrire.
 - **Aucun secret dans la sortie**, y compris dans un message d'erreur, y compris
   le chemin du fichier de plan.
 

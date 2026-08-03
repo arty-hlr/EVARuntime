@@ -87,6 +87,16 @@ d'exploitation du fichier, qui sont de la documentation. C'est la politique
 d'AUT-007 (`bootstrap/registry_writer.py`), réutilisée par `model_registry.py`
 pour qu'il n'existe qu'**une** politique d'écriture de `models.yaml`.
 
+La **localisation** d'une entrée dans ce texte suit la même règle depuis COR-028 :
+elle vit dans `model_registry._entry_bounds`, et `registry_writer` s'y adosse au
+lieu d'entretenir un second localisateur. Le premier ancrait sur une ligne
+`- id: <model_id>`, donc sur les seules entrées dont `id` est la première clé ;
+`yaml.safe_dump` trie les clés et met `capabilities` en tête, si bien que sur
+tout hôte dont le `models.yaml` était déjà passé par une mutation admin, l'étape
+`enable_model` de l'amorçage refusait un fichier pourtant valide. Le refus reste
+la bonne issue quand l'entrée est réellement introuvable ou ambiguë : le
+localisateur voit plus large, il ne refuse pas moins.
+
 S'y ajoutent une sauvegarde horodatée et bornée
 (`models.yaml.pre-admin.<stamp>.bak`, 5 conservées, motif distinct des
 `*.pre-bootstrap.*` du bootstrap), une écriture atomique validée par le chargeur

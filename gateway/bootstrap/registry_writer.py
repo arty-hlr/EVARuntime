@@ -980,41 +980,44 @@ def _entry_block_bounds(lines: Sequence[str], model_id: str) -> tuple[int, int, 
     """
     Bornes textuelles de l'entrée `model_id` : (début, fin exclue, indentation des champs).
 
-    La recherche porte sur la ligne `- id: <model_id>` et exige qu'elle soit
-    unique. Le bloc court jusqu'au prochain élément de liste de même indentation,
-    ou jusqu'à une ligne moins indentée qui n'est ni vide ni un commentaire.
-    """
-    motif = re.compile(
-        r"^(\s*)-\s+id:\s*[\"']?" + re.escape(model_id) + r"[\"']?\s*(#.*)?$"
-    )
-    debuts = [i for i, ligne in enumerate(lines) if motif.match(ligne)]
-    if len(debuts) != 1:
-        raise RegistryWriterError(
-            f"« {model_id} » : {len(debuts)} ligne(s) « - id: » trouvée(s) dans le texte du "
-            "registre, une seule est attendue. Le bootstrap ne retouche pas un fichier "
-            "dont il n'identifie pas l'entrée avec certitude."
-        )
-    debut = debuts[0]
-    tiret_indent = len(re.match(r"^(\s*)", lines[debut]).group(1))
-    champ_indent = tiret_indent + 2
+    COR-028 — **il n'y a qu'un localisateur dans le dépôt**, et il vit dans
+    `model_registry`. Cette fonction n'en est plus qu'un adaptateur d'exception.
 
-    fin = len(lines)
-    for i in range(debut + 1, len(lines)):
-        ligne = lines[i]
-        if not ligne.strip():
-            continue
-        indent = len(ligne) - len(ligne.lstrip())
-        depouillee = ligne.lstrip()
-        if indent <= tiret_indent and depouillee.startswith("- "):
-            fin = i
-            break
-        if indent < tiret_indent or (indent == tiret_indent and not depouillee.startswith("#")):
-            fin = i
-            break
-    # Les commentaires qui précèdent immédiatement l'élément suivant lui
-    # appartiennent visuellement ; les laisser dans le bloc courant n'a aucune
-    # conséquence puisque seules des lignes de champ y sont retouchées.
-    return debut, fin, champ_indent
+    L'implémentation d'origine ancrait sur une ligne `- id: <model_id>`, donc sur
+    les seules entrées dont `id` est la PREMIÈRE clé. C'est vrai du `models.yaml`
+    livré et de ce que ce module écrit, mais pas d'un fichier passé par
+    `yaml.safe_dump`, qui trie les clés et met `capabilities` en tête — c'est-à-dire
+    pas du fichier de tout hôte ayant déjà subi une mutation admin. Sur ces
+    hôtes-là, `enable_model_entry` et `provisionally_enable_model_entry`, donc
+    l'étape `enable_model` de la chaîne de preuve M2, refusaient en fail-closed un
+    registre parfaitement valide et arrêtaient l'amorçage.
+
+    COR-020 a livré dans `model_registry._entry_bounds` un localisateur
+    indépendant de l'ordre des clés. Entretenir ici un second localisateur sur le
+    même fichier aurait rouvert exactement le défaut que COR-020 a fermé : deux
+    implémentations de la même politique d'écriture, dont c'est toujours celle
+    qu'on a oublié de corriger qui touche le fichier de production.
+
+    Sens de la dépendance, au regard de la règle posée par `bootstrap/__init__.py` :
+    un exécuteur peut importer un module de la gateway **quand c'est lui qui fait
+    autorité**, et c'est déjà à ce titre que ce module soumet chacun de ses
+    candidats à `model_registry.ModelRegistry`. `model_registry` est le lecteur de
+    référence de `models.yaml` ; savoir où vit une entrée dans ce texte lui
+    revient. La dépendance inverse existe déjà et reste tardive
+    (`model_registry._text_write_policy()` importe ce module pour la politique
+    d'écriture, dont il réemploie `_set_scalar_field` et `_render_scalar`) : le
+    couplage est symétrique, assumé, et documenté des deux côtés. Un troisième
+    module de contrat n'aurait rien ajouté qu'un niveau d'indirection.
+
+    Seule l'exception est traduite : les appelants de ce module attendent un
+    `RegistryWriterError`, et un refus doit rester un refus d'exécuteur. Le
+    fail-closed est **inchangé** — zéro ou plusieurs entrées identifiées restent
+    un refus, avec sa phrase.
+    """
+    try:
+        return model_registry._entry_bounds(list(lines), model_id)
+    except model_registry.RegistryWriteRefused as exc:
+        raise RegistryWriterError(str(exc)) from exc
 
 
 def _set_scalar_field(
