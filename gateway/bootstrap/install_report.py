@@ -23,7 +23,11 @@ Cinq promesses, et chacune est vérifiable ici
    sortie de M2 sont évaluées une par une contre le journal, et une condition
    qu'aucune étape ne couvre sort `unproven` — jamais `satisfied` par défaut.
    Un rapport de simulation ne peut satisfaire aucune condition d'installation.
-   Un rapport qui ne peut pas dire non ne vaut rien ;
+   Une étape ne prouve une condition que si elle la CONCERNE, **cible
+   comprise** : `verify_artifact` sert deux domaines — l'archive du runtime et
+   les GGUF des modèles — et vérifier le GGUF d'un modèle n'a jamais prouvé que
+   le runtime était installé (COR-026). Un rapport qui ne peut pas dire non ne
+   vaut rien ;
 2. **il distingue le constat de l'hypothèse.** Le résolveur de runtime porte un
    champ `evidence` sur chaque variante, et certaines de ses entrées sont
    explicitement des hypothèses non vérifiées (§0.12). Elles sont extraites du
@@ -157,12 +161,36 @@ CONDITION_STATUSES: frozenset[str] = frozenset({
 @dataclass(frozen=True)
 class M2Condition:
     """
-    Une des sept conditions de sortie de M2 (§13), et les actions qui la prouvent.
+    Une des sept conditions de sortie de M2 (§13), et les étapes qui la prouvent.
 
     `actions` est le lien entre une phrase de jalon et des faits vérifiables : la
     condition n'est satisfaite que si TOUTES les étapes du plan portant ces
-    actions ont abouti. `self_evident` n'est vrai que pour la septième, « rapport
-    final produit », que ce document prouve en existant.
+    actions ont abouti. Ces actions-là ne concernent qu'un domaine ; leur seule
+    présence suffit à rattacher l'étape à la condition.
+
+    `shared_actions` porte les actions à DEUX domaines. Il n'y en a qu'une,
+    `verify_artifact`, que le planificateur émet une fois pour l'archive de
+    `llama-server` et une fois par ensemble de GGUF (`runtime_installer.covers_step`
+    documente la même ambiguïté côté applicateur). Une telle étape ne prouve une
+    condition que si sa **cible** est aussi celle d'une étape `anchor_actions` —
+    c'est-à-dire d'une action qui, elle, ne peut concerner que ce domaine. Sans
+    cette borne, la vérification du GGUF d'un modèle prouvait « runtime installé »
+    (COR-026, facette a) : la première condition du jalon, affirmée sur une preuve
+    qui ne la regardait pas.
+
+    La comparaison est une **égalité de chaînes**, jamais une analyse de forme :
+    ce module ne sait pas lire une cible et n'a pas à l'apprendre. Ce qu'il
+    suppose est plus faible et vérifiable dans le contrat : les quatre actions
+    d'ancrage d'un modèle (`calibrate_model`, `enable_model`, `warmup_model`,
+    `smoke_test`) portent l'identifiant du modèle **verbatim**, là où
+    `write_registry` et `accept_license` le décorent — d'où leur absence de la
+    liste, elles ne pourraient jamais s'apparier. Si un producteur change cette
+    grammaire, l'appariement cesse, l'étape partagée cesse de prouver, et la
+    condition retombe en `unproven` : l'erreur se voit, elle ne se maquille pas
+    en `satisfied`. C'est le même sens sûr que celui d'`EVIDENCE_VERIFIED_MARKERS`.
+
+    `self_evident` n'est vrai que pour la septième, « rapport final produit »,
+    que ce document prouve en existant.
 
     L'identifiant s'appelle `code` et non `key` : `schema._SECRET_KEY_RE` refuse
     un champ nommé `key` porteur d'une valeur, et le rendu du rapport aurait été
@@ -172,19 +200,41 @@ class M2Condition:
     code: str
     label: str
     actions: tuple[str, ...]
+    shared_actions: tuple[str, ...] = ()
+    anchor_actions: tuple[str, ...] = ()
     self_evident: bool = False
+
+    @property
+    def proving_actions(self) -> tuple[str, ...]:
+        """Toutes les actions susceptibles de prouver la condition, sans doublon."""
+        return self.actions + tuple(
+            a for a in self.shared_actions if a not in self.actions
+        )
 
 
 M2_CONDITIONS: tuple[M2Condition, ...] = (
     M2Condition(
         "runtime_installed",
         "Runtime installé et vérifié",
-        (schema.ACTION_INSTALL_RUNTIME, schema.ACTION_VERIFY_ARTIFACT),
+        (schema.ACTION_INSTALL_RUNTIME,),
+        shared_actions=(schema.ACTION_VERIFY_ARTIFACT,),
+        anchor_actions=(schema.ACTION_INSTALL_RUNTIME,),
     ),
     M2Condition(
         "model_downloaded",
-        "Modèle téléchargé à révision figée",
+        # Libellé élargi par COR-026 : un hôte dont les GGUF étaient déjà là et
+        # attestés n'a rien téléchargé, et le jalon reste tenu. « Téléchargé »
+        # aurait fait dire au rapport une chose qui n'a pas eu lieu ; ce que la
+        # condition exige réellement, ce sont les octets de la révision figée.
+        "Modèle en place à révision figée",
         (schema.ACTION_DOWNLOAD_MODEL,),
+        shared_actions=(schema.ACTION_VERIFY_ARTIFACT,),
+        anchor_actions=(
+            schema.ACTION_CALIBRATE_MODEL,
+            schema.ACTION_ENABLE_MODEL,
+            schema.ACTION_WARMUP_MODEL,
+            schema.ACTION_SMOKE_TEST,
+        ),
     ),
     M2Condition(
         "license_accepted",
@@ -222,6 +272,11 @@ M2_CONDITIONS: tuple[M2Condition, ...] = (
 # Écrire le registre et activer un modèle sont des MOYENS d'atteindre l'appel
 # E2E, pas des conditions de sortie du jalon ; leur résultat reste visible dans
 # le récapitulatif d'exécution, mais il ne fabrique pas de condition remplie.
+#
+# `enable_model` figure par ailleurs dans les `anchor_actions` de
+# `model_downloaded` : servir d'ancre, c'est NOMMER une cible, pas la prouver.
+# Une étape `enable_model` en échec ne rend donc aucune condition insatisfaite —
+# elle dit seulement de quel modèle parle la vérification voisine.
 CONDITION_UNMAPPED_ACTIONS: frozenset[str] = frozenset({
     schema.ACTION_WRITE_REGISTRY,
     schema.ACTION_ENABLE_MODEL,
@@ -443,15 +498,12 @@ def _evaluate_condition(
             ),
         )
 
-    concernés = [
-        r for r in results
-        if isinstance(r, dict) and r.get("action") in condition.actions
-    ]
+    concernés, directe, hors_domaine = _proving_steps(condition, results)
     orders = tuple(
         r["order"] for r in concernés
         if isinstance(r.get("order"), int) and not isinstance(r.get("order"), bool)
     )
-    actions = tuple(condition.actions)
+    actions = condition.proving_actions
 
     if not concernés:
         return ConditionOutcome(
@@ -460,8 +512,9 @@ def _evaluate_condition(
             status=CONDITION_UNPROVEN,
             proof=(
                 "aucune étape du journal ne porte "
-                + " ni ".join(f"« {a} »" for a in actions)
+                + _liste(condition.actions)
                 + " : rien n'atteste cette condition, dans un sens ni dans l'autre"
+                + _clause_hors_domaine(condition, hors_domaine)
             ),
             actions=actions,
         )
@@ -517,16 +570,111 @@ def _evaluate_condition(
             step_orders=orders,
         )
 
+    if directe:
+        preuve = (
+            f"{len(concernés)} étape(s) appliquée(s) ou déjà satisfaite(s) : "
+            + ", ".join(str(o) for o in orders)
+        )
+    else:
+        # Le plan ne portait aucune étape propre à la condition — typiquement,
+        # les GGUF étaient déjà présents et attestés, donc AUT-014 n'a émis
+        # aucun `download_model`. Ce n'est pas la même chose que « rien ne
+        # l'atteste » : la vérification d'intégrité a bien eu lieu, sur la
+        # cible de cette condition, et le rapport le dit mot pour mot.
+        preuve = (
+            "aucune étape " + _liste(condition.actions) + " n'était au programme ; "
+            "la condition est attestée autrement : étape(s) "
+            + ", ".join(str(o) for o in orders) + " " + _liste(condition.shared_actions)
+            + ", sur la cible de cette condition, appliquée(s) ou déjà satisfaite(s)"
+        )
+
     return ConditionOutcome(
         code=condition.code,
         label=condition.label,
         status=CONDITION_SATISFIED,
-        proof=(
-            f"{len(concernés)} étape(s) appliquée(s) ou déjà satisfaite(s) : "
-            + ", ".join(str(o) for o in orders)
-        ),
+        proof=preuve,
         actions=actions,
         step_orders=orders,
+    )
+
+
+def _liste(actions: Sequence[str]) -> str:
+    """« a » ni « b » — la forme employée par toutes les phrases de preuve."""
+    return " ni ".join(f"« {a} »" for a in actions)
+
+
+def _domain_targets(condition: M2Condition, results: Sequence[Any]) -> frozenset[str]:
+    """
+    Cibles que des étapes NON ambiguës rattachent au domaine de cette condition.
+
+    Vide si la condition n'a pas d'action partagée : rien à discriminer, donc
+    aucune raison de parcourir le journal. Les cibles absentes, vides ou non
+    textuelles ne sont jamais retenues — une cible qu'on ne sait pas lire ne
+    rattache rien.
+    """
+    if not condition.shared_actions:
+        return frozenset()
+    return frozenset(
+        r["target"]
+        for r in results
+        if isinstance(r, dict)
+        and r.get("action") in condition.anchor_actions
+        and isinstance(r.get("target"), str)
+        and r["target"]
+    )
+
+
+def _proving_steps(
+    condition: M2Condition, results: Sequence[Any]
+) -> tuple[list[dict], bool, list[dict]]:
+    """
+    Trie le journal pour une condition : ce qui la prouve, et ce qui n'en est pas.
+
+    Rend trois choses, dans l'ordre du journal :
+
+    1. les étapes qui la concernent — actions propres, plus actions partagées
+       dont la CIBLE est rattachée au domaine par une action d'ancrage ;
+    2. si au moins une de ces étapes porte une action propre. C'est ce qui
+       distingue « la condition a été remplie par son étape dédiée » de « son
+       étape dédiée n'existait pas, une autre l'atteste » ;
+    3. les étapes à action partagée qui ont été ÉCARTÉES faute de cible
+       rattachable. Elles ne prouvent rien ici, mais leur existence change la
+       phrase rendue : « aucune preuve » et « une preuve qui regarde ailleurs »
+       ne se réparent pas de la même façon.
+    """
+    domaine = _domain_targets(condition, results)
+    retenues: list[dict] = []
+    ecartees: list[dict] = []
+    directe = False
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        action = result.get("action")
+        if action in condition.actions:
+            retenues.append(result)
+            directe = True
+        elif action in condition.shared_actions:
+            if result.get("target") in domaine:
+                retenues.append(result)
+            else:
+                ecartees.append(result)
+    return retenues, directe, ecartees
+
+
+def _clause_hors_domaine(condition: M2Condition, ecartees: Sequence[dict]) -> str:
+    """Dit pourquoi une étape à action partagée n'a rien prouvé ici. Vide s'il n'y en a pas."""
+    if not ecartees:
+        return ""
+    orders = ", ".join(
+        str(r.get("order")) for r in ecartees
+        if isinstance(r.get("order"), int) and not isinstance(r.get("order"), bool)
+    )
+    return (
+        f" — l'étape ou les étapes {orders} portent bien "
+        + _liste(condition.shared_actions)
+        + ", mais leur cible n'est celle d'aucune étape "
+        + _liste(condition.anchor_actions)
+        + " : elles attestent un autre domaine"
     )
 
 

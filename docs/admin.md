@@ -1017,6 +1017,12 @@ mémoire de la gateway est restauré* :
   donc la divergence vient d'une édition manuelle et l'écraser serait une perte
   de données.
 
+Ces refus se lisent de la **même façon sur les trois verbes** (COR-029) :
+`POST`, `PATCH` et `DELETE` répondent tous `422` avec le message de refus dans
+`detail`. C'est ce message qui dit quoi corriger ; jusqu'à COR-029, `DELETE` le
+perdait dans un `500` au corps générique. Un identifiant inconnu reste, lui, un
+`404` — ce n'est pas la même panne et elle ne se répare pas pareil.
+
 Dans tous ces cas, corrigez le fichier à la main puis redémarrez la gateway (le
 registre relit `models.yaml` au démarrage). La gateway ne se rabat **jamais** sur
 une réécriture globale.
@@ -2290,6 +2296,13 @@ distinguer.
 - **Le serveur de calibration est identifié.** Un port déjà occupé est refusé
   avant lancement ; le processus est encore vivant après `/health` et doit
   annoncer l'alias exact du modèle via `/v1/models`.
+- **La mise en page de `models.yaml` ne décide pas de l'issue** (COR-028).
+  L'écriture et l'activation localisent une entrée quel que soit l'ordre de ses
+  clés — un fichier déjà passé par une mutation admin a `capabilities` avant
+  `id`, et l'étape `enable_model` le refusait auparavant. Ce localisateur est
+  celui de `model_registry`, pas un second : il n'y a qu'une politique
+  d'écriture de `models.yaml` dans le dépôt. Une entrée réellement introuvable
+  ou présente deux fois reste **refusée**, sans rien écrire.
 - **Aucun secret dans la sortie**, y compris dans un message d'erreur, y compris
   le chemin du fichier de plan.
 
@@ -2307,6 +2320,28 @@ Deux propriétés à connaître :
   `llama-server` sont retenues sur hypothèse et non sur constat ; le rapport le
   dit, parce que c'est exactement ce qu'un lecteur pressé prendrait pour un fait
   vérifié six mois plus tard.
+
+#### Ce qui prouve quoi (COR-026)
+
+L'action `verify_artifact` sert **deux domaines** : l'archive de `llama-server`
+et les ensembles de GGUF. Une étape ne prouve donc une condition que si sa
+**cible** appartient au domaine de cette condition — la vérification du GGUF
+d'un modèle ne prouve rien du runtime, et réciproquement. Une vérification dont
+la cible n'est rattachable à aucun domaine ne prouve rien du tout, et le rapport
+écrit pourquoi.
+
+Conséquence pratique, sur un hôte où les GGUF étaient **déjà présents et
+attestés** : `bootstrap-plan` n'émet plus d'étape `download_model` (AUT-014), et
+la condition « Modèle en place à révision figée » est alors tenue par la seule
+`verify_artifact` du modèle. Le rapport écrit littéralement *« aucune étape
+"download_model" n'était au programme »* — à ne pas confondre avec *« rien
+n'atteste cette condition »*, qui reste le verdict quand aucune vérification
+n'a eu lieu. Les deux se lisent différemment parce qu'ils ne se réparent pas de
+la même façon.
+
+Élargir ce que le rapport sait voir ne l'a pas rendu plus complaisant : une
+vérification en échec, sautée, simulée ou jamais tentée laisse sa condition
+**non satisfaite**, exactement comme avant.
 
 `bootstrap-apply` ne remplace pas `doctor` (§8). `doctor` répond à « cet hôte
 peut-il démarrer **maintenant** ? » en sondant le système vivant ; le rapport
