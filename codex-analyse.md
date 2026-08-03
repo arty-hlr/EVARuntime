@@ -20,23 +20,26 @@
 ```text
 M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 perf  ──  M4 pilote  ──  M5 prod
    [x] 30 juil.        [x] 31 juil.         [~] EN COURS         [ ]          [ ]           [ ]
-                                          preuve terrain requise
+                                       plus aucun blocage de code
+                                        preuve terrain seule requise
 ```
 
 | | |
 |---|---|
-| **Où en est-on** | Jalons **M0 et M1 atteints**, M1 ayant été **exercé sur deux VMs réelles** lors du second déploiement (§0.13). La **vague 6 (M2) a livré ses sept modules d'exécution** et son applicateur : le système sait installer un runtime vérifié, télécharger des modèles à empreinte contrôlée, écrire un registre désactivé, calibrer, activer sur preuve, pré-chauffer, jouer la recette du premier token et produire un rapport d'installation (§0.14) |
-| **Ce qui bloque** | **Aucun bloqueur P0 propre au parcours M2 ne reste ouvert dans le code.** COR-022 est fermé par une activation provisoire mémoire compensée ; COR-023 synchronise cette fenêtre avec la gateway sous bail fail-closed ; AUT-017 fournit les sondes de production. Le jalon reste ouvert faute de preuve physique et parce que les variantes runtime par défaut ne portent toujours pas de SHA-256 |
-| **Ce qui vient ensuite** | Exécuter `bootstrap-apply --apply` sur l'hôte cible mono-worker, avec un runtime réellement épinglé, un GPU et le nginx de production ; archiver le rapport et traiter tout écart terrain au lieu de prononcer M2 sur les seuls tests |
-| **Santé des tests** | **2089 tests verts** (2026 gateway + 63 node_agent), `ruff` propre et `bash -n` propre sur les deux composants |
-| **Reste à faire** | 38 items sur 82 (§0.3). Le parcours d'application n'a plus de P0 de code ouvert ; la preuve terrain M2 reste à produire |
-| **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel** et le **nginx réel**. Les sondes existent désormais et attestent le runtime, les UUID GPU et le serveur de calibration, mais elles n'ont pas été exercées sur cet hôte. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce nouveau chemin GPU |
+| **Où en est-on** | Jalons **M0 et M1 atteints**, M1 ayant été **exercé sur deux VMs réelles** (§0.13). La vague 6 a livré les sept modules d'exécution de M2 et son applicateur (§0.14). La **vague 7 a fermé les 18 items qui empêchaient encore ce parcours d'aboutir** (§0.15) : il ne reste **aucun blocage de code connu** sur la route du jalon |
+| **Ce qui bloque** | **Uniquement la preuve terrain.** Les trois blocages de code que la vague 6 laissait ouverts sont fermés : l'opérateur peut désormais **épingler son runtime** (AUT-018, la matrice livrée ne portait ni empreinte ni URL d'archive — l'installateur ne pouvait rien installer), `install.sh` accepte un hôte **sans GPU** par option explicite (OPS-012, qui avait fait contourner le script aux deux déploiements réels), et la condition n°1 du jalon **peut enfin être prouvée** (COR-030) |
+| **Ce qui vient ensuite** | Relever les **empreintes amont réelles** de `llama-server` dans un fichier `--runtime-variants`, puis exécuter `bootstrap-apply --apply` sur l'hôte cible mono-worker avec GPU et nginx de production. Passer `nginx -t` **avant tout reload** : `nginx.conf` a été modifiée par SEC-016 et n'a jamais été validée par le vrai binaire. Archiver le rapport et traiter tout écart terrain, au lieu de prononcer M2 sur les seuls tests |
+| **Santé des tests** | **2426 tests verts** (2363 gateway dont 1 `skip` propre + 63 node_agent), `ruff` et `bash -n` propres sur les deux composants. **+337 tests** pendant la seule vague 7 |
+| **Reste à faire** | 31 items sur 93 (§0.3). Le Lot B — bootstrap automatisé — est **intégralement livré**. Aucun P0 ouvert hors des lots performance et sécurité amont |
+| **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
+| **Ce que la vague 7 a appris** | Trois défauts de **sécurité et d'honnêteté** que 2089 tests verts n'avaient pas vus : SEC-008 était **intégralement contournée en production** par le journal d'accès d'uvicorn ; `_VERSION_RE` produisait une **attestation mensongère** de build plutôt qu'un refus ; et le rapport qui **prononce** le jalon prouvait sa condition n°1 par la vérification d'un GGUF de modèle. Aucun n'était visible en test — voir §0.15 |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
 décisions tranchées **et celle qui reste à prendre**, §0.7 le journal des
-livraisons, §0.8, §0.10, §0.12, §0.13 et §0.14 les défauts trouvés en implémentant, en
-déployant et en assemblant — ceux qu'aucun des deux audits n'avait vus —, §0.9
-ce que l'exploitation doit savoir.
+livraisons, §0.8, §0.10, §0.12, §0.13, §0.14 et §0.15 les défauts trouvés en
+implémentant, en déployant et en assemblant — ceux qu'aucun des deux audits
+n'avait vus —, §0.9 ce que l'exploitation doit savoir. **§0.15.1 remplace
+§0.14.1** pour l'état des sept conditions du jalon M2.
 
 > **Une lecture qui revient à chaque vague.** Les défauts les plus coûteux ne
 > sont jamais dans le code qu'on vient d'écrire : ils sont dans le **contrat**
@@ -46,35 +49,49 @@ ce que l'exploitation doit savoir.
 > exige, trois trous dans un contrat d'exécution que ses 93 tests n'avaient pas
 > vus, et une contradiction d'ordonnancement qu'aucun des six chantiers ne
 > pouvait apercevoir seul.
+>
+> **La vague 7 a déplacé cette leçon d'un cran.** Ses défauts les plus graves
+> n'étaient pas dans un contrat mal lu : ils étaient dans du code **que
+> personne n'atteignait**, et dans des **tests qui ne pouvaient rien voir**.
+> Quatre garde-fous se sont révélés inertes le même jour — un analyseur
+> d'imports aveugle aux imports relatifs, deux tests d'absence bâtis dessus, une
+> fixture dont la grammaire rendait un défaut structurellement invisible. Un
+> test vert ne prouve rien tant qu'on n'a pas cassé le code sous lui ; c'est
+> pour cela que chaque item de cette vague a dû rejouer ses mutations, et c'est
+> ce protocole, pas la suite elle-même, qui a trouvé les vrais trous.
 
 ### 0.1 Situation
 
 | Champ | Valeur |
 |---|---|
-| Dernière mise à jour | 2026-08-01 |
-| Phase | **Revue post-vague 6 livrée, jalon M2 non prononcé** — la chaîne de preuve, le raccord de production et la synchronisation live sont implémentés et testés ; la sortie attend maintenant une exécution physique GPU/nginx avec runtime épinglé. La vague 5 avait été livrée puis **exercée sur deux VMs réelles** (§0.13) |
+| Dernière mise à jour | 2026-08-03 |
+| Phase | **Vague 7 livrée — clôture du code du jalon M2, jalon toujours non prononcé.** Les trois blocages de code que la vague 6 laissait ouverts sont fermés (runtime épinglable, préflight GPU franchissable, condition n°1 prouvable). Il ne reste **aucun blocage de code connu** sur la route de M2 : la sortie n'attend plus qu'une exécution physique avec GPU, nginx et une archive amont réelle |
 | Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
-| Jalon visé | **M2 — installation jusqu'au premier token** (§13) — conditions détaillées en §0.14.1 |
-| Branche de travail | `codex/fix-vague6-audit` (revue de `8cf908f`, elle-même 28 commits devant `origin/dev` @ `d96c612`) |
-| Base de référence | `8cf908f` — 1929 tests verts, `ruff` et CI GitHub propres |
-| Périmètre livré à ce jour | AUT-001 → AUT-013, AUT-015 → AUT-017, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, COR-022 → COR-025, OPS-006, OPS-008, OPS-009, SEC-008, SEC-011 → SEC-014, TST-001, TST-006 |
-| Périmètre de la revue post-vague 6 | **AUT-017, COR-022 → COR-025 et SEC-011 → SEC-014**, plus les durcissements d'attestation runtime/GPU, de calibration, de lecture unique du plan et de compensation live (§0.14) |
-| Ce qui bloque la sortie de M2 | **La preuve terrain**, pas un P0 de code : runtime épinglé à fournir, puis application complète sur GPU et à travers nginx |
+| Jalon visé | **M2 — installation jusqu'au premier token** (§13) — conditions détaillées en **§0.15.1**, qui remplace §0.14.1 |
+| Branche de travail | `codex/vague7-cloture-m2` @ `55b36fb` (33 commits sans fusion au-dessus de `a6bcb2c`, sept branches de chantier fusionnées) |
+| Base de référence | `a6bcb2c` — 2089 tests verts, `ruff` propre |
+| Périmètre livré à ce jour | AUT-001 → AUT-019, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, COR-020 → COR-030, OPS-006, OPS-008, OPS-009, OPS-011, OPS-012, SEC-002, SEC-008 → SEC-014, SEC-016, SEC-017, TST-001, TST-006, TST-007 |
+| Périmètre de la vague 7 | **18 items** : AUT-014, AUT-018, AUT-019, COR-020, COR-021, COR-026 → COR-030, OPS-011, OPS-012, SEC-002, SEC-009, SEC-010, SEC-016, SEC-017, TST-007 (§0.15) |
+| Ce qui bloque la sortie de M2 | **La preuve terrain, et elle seule.** Il faut relever des empreintes SHA-256 amont réelles, les fournir en `--runtime-variants`, appliquer le plan sur GPU, traverser nginx et archiver le rapport |
 
 ### 0.2 Base de référence des tests et état courant
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **2026** 🔬 |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **2363** 🔬 (+ 1 `skip`) |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **2089** 🔬 |
+| **Total** | — | **354** | **2426** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
 **+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, **+499 par la
-vague 5**, puis **+832 par la vague 6 et sa revue** (+160 pendant cette passe),
-tous des régressions rouges avant
-correctif et vertes après. Les scripts de déploiement passent `bash -n`.
+vague 5**, **+832 par la vague 6 et sa revue**, puis **+337 par la vague 7**,
+tous des régressions rouges avant correctif et vertes après. Les scripts de
+déploiement passent `bash -n`.
+
+L'unique `skip` est celui de SEC-016 : le test exécute réellement `nginx -t`
+sur une configuration dérivée quand le binaire est présent, et se saute proprement
+sinon. Il **n'a pas encore trouvé de binaire** — voir la réserve de §0.15.
 
 La vague 6 a produit **191 mutations appliquées et rejouées** — le code
 réellement cassé, la suite relancée, la garde remise. **Onze ont survécu** au
@@ -82,6 +99,13 @@ premier passage : autant de garde-fous que personne ne testait, chacun fermé pa
 un test supplémentaire plutôt que par une affirmation. Un protocole de mutation
 qui ne trouve jamais de survivant ne prouve rien sur les tests ; il prouve
 seulement qu'on n'a pas cherché.
+
+La vague 7 a poussé ce protocole plus loin, et il a payé : sur AUT-014, le
+correctif a été muté **dans les deux sens** — une fois en retirant le
+raisonnement (3 rouges), une fois en *créditant trop*, c'est-à-dire en
+réutilisant silencieusement un fichier présent (3 autres rouges). Aucun des six
+tests de comportement n'est tenu par un seul côté du verdict. C'est ce qui
+sépare un test qui décrit d'un test qui contraint.
 
 > **Retrait du composant `gateway-student` (DEC-009, 30 juillet 2026).** Les
 > totaux ci-dessus perdent mécaniquement les 79 tests de référence et 138 tests
@@ -97,18 +121,23 @@ vérifiée par `bash -n`, à compléter avec EVA-044.
 
 | Lot | Items | `[x]` Fait | `[~]` En cours | `[ ]` À faire | `[–]` Annulé |
 |---|---:|---:|---:|---:|---:|
-| A — bloqueurs et invariants | 25 | 15 | 0 | 9 | 1 |
-| B — bootstrap automatisé | 17 | 16 | 0 | 1 | 0 |
+| A — bloqueurs et invariants | 30 | 22 | 0 | 7 | 1 |
+| B — bootstrap automatisé | 19 | 19 | 0 | **0** | 0 |
 | C — performance | 8 | 0 | 0 | 8 | 0 |
-| D — sécurité et supply-chain | 14 | 5 | 0 | 9 | 0 |
-| E — tests et exploitation | 18 | 4 | 1 | 11 | 2 |
-| **Total** | **82** | **40** | **1** | **38** | **3** |
+| D — sécurité et supply-chain | 17 | 10 | 0 | 7 | 0 |
+| E — tests et exploitation | 19 | 7 | 1 | 9 | 2 |
+| **Total** | **93** | **58** | **1** | **31** | **3** |
 
-**Vingt-neuf items ont été ajoutés au backlog après coup**, d'où 82 au lieu de
+**Le Lot B — bootstrap automatisé — est intégralement livré.** C'est le lot qui
+porte le parcours « machine vierge → premier token » ; sa clôture est ce qui
+autorise à dire que M2 n'attend plus que sa preuve terrain.
+
+**Quarante items ont été ajoutés au backlog après coup**, d'où 93 au lieu de
 53. Aucun ne figurait dans les deux audits initiaux : tous sont nés de
 l'implémentation, du déploiement réel ou de l'assemblage. C'est le chiffre le
-plus instructif du tableau — **près d'un tiers du travail réel n'était pas
-prévisible sur document**.
+plus instructif du tableau — **43 % du travail réel n'était pas prévisible sur
+document**, et la proportion **monte** à mesure que le code touche le monde réel
+plutôt que lui-même.
 
 | Origine | Items |
 |---|---|
@@ -117,7 +146,16 @@ prévisible sur document**.
 | Vague 4 | OPS-010 |
 | Vague 5 (§0.12) | SEC-009 |
 | Second déploiement réel sur deux VMs (§0.13) | COR-018, COR-019, AUT-014, OPS-011, OPS-012 |
-| **Vague 6 et sa revue (§0.14)** | **AUT-015, AUT-016, AUT-017, COR-020, COR-021, COR-022, COR-023, COR-024, COR-025, SEC-010, SEC-011, SEC-012, SEC-013, SEC-014** |
+| Vague 6 et sa revue (§0.14) | AUT-015, AUT-016, AUT-017, COR-020, COR-021, COR-022, COR-023, COR-024, COR-025, SEC-010, SEC-011, SEC-012, SEC-013, SEC-014 |
+| **Vague 7 (§0.15)** | **AUT-018, AUT-019, COR-026, COR-027, COR-028, COR-029, COR-030, SEC-015, SEC-016, SEC-017, TST-007** |
+
+Les onze items de la vague 7 méritent une lecture par **origine**, car elle dit
+où se cachent réellement les défauts : **sept sur onze** ont été trouvés par un
+chantier en train de livrer **un autre item** — AUT-014 a fait sortir COR-026 et
+COR-027, COR-020 a fait sortir COR-028 et COR-029, SEC-010 a fait sortir
+SEC-016, SEC-002 a fait sortir SEC-015, AUT-018 a fait sortir TST-007. Aucun
+n'était visible depuis le document. Ils ne se voient qu'en **traversant** le
+code pour de bon.
 
 Les **8 items du jalon M0**, les **7 de la vague 4** et les **6 de la vague 5**
 sont terminés et vérifiés.
@@ -129,9 +167,15 @@ désormais leurs sondes et leur raccord CLI réels. Cela atteste une capacité
 logicielle, pas une exécution terrain : M2 reste non prononcé tant qu'un GPU et
 nginx n'ont pas produit le rapport complet.
 
-**Aucun P0 de code propre au parcours M2 ne reste ouvert.** Les 9 items restants
-du Lot A sont en P1/P2, dont COR-018 et COR-019 issus du second déploiement
-réel ; le seul item restant du Lot B est AUT-014.
+**Aucun blocage de code connu ne reste sur la route de M2.** Le Lot B est clos.
+Les 7 items restants du Lot A sont en P1/P2 — dont COR-018 et COR-019, issus du
+second déploiement réel et propres au **mode cluster**, hors du périmètre
+mono-worker de M2. Côté Lot D, les 7 restants sont des chantiers de
+supply-chain (SEC-001, SEC-003 → SEC-007) et **SEC-015**, seul item ouvert de la
+vague 7 : le plancher de build est désormais *visible* dans l'environnement
+généré mais toujours *inerte*, faute qu'un script bash puisse connaître le build
+installé. Cela affaiblit SEC-009 sur les hôtes installés par le script, sans
+conditionner le jalon.
 
 ### 0.4 Vagues 1 à 3 — jalon M0 (historique)
 
@@ -263,7 +307,15 @@ ainsi qu'un rollback tardif et les courses local/cluster, sont testés.
 | 2026-08-01 | AUT-015 | `943a467`, `1dd5e00` | `pytest tests -q` (gateway) + 18 mutations + parité CI 3.11 | **1866 réussis** ; applicateur et `bootstrap-apply`, refus en bloc plutôt qu'exécution partielle 🔬 |
 | 2026-08-01 | **Vague 6** | `1dd5e00` | Les 2 suites + `ruff` sur les deux composants | **1929 réussis** (1866 / 63) ; M2 **non prononcé**, bloqué par COR-022 🔬 |
 | 2026-08-01 | **Revue post-vague 6** | `5166cf0` | Suites complètes Python 3.14 et parité CI Python 3.11, les 2 composants, `ruff`, `bash -n` et relecture parallèle | **2089 réussis** (2026 / 63) ; AUT-017 et COR-022 → COR-025 livrés, SEC-011 → SEC-014 fermés. M2 reste **non prononcé** faute de preuve GPU/nginx réelle 🔬 |
-| 2026-08-03 | AUT-018 | `codex/vague7-aut-018` | `pytest tests -q` (gateway) + 6 mutations rejouées | 2096 réussis (+70) ; matrice d'artefacts fournissable par l'opérateur, remplacement assumé de `DEFAULT_VARIANTS`, niveau de preuve `constat-opérateur`, URL d'archive exigée avant téléchargement, exemple livré non chargeable mais structurellement prouvé 🔬 |
+| 2026-08-03 | AUT-014 | `1d6ac5a`, `b540b38`, `e06b769` | `pytest tests -q` (gateway) + mutations rejouées **dans les deux sens** | **2034** après fusion (+8) ; artefact présent et attesté non retéléchargé, volume décompté, empreinte divergente bloquante. 3 rouges en retirant le raisonnement, 3 autres en *créditant trop* 🔬 |
+| 2026-08-03 | OPS-011, OPS-012, SEC-002 | `6cecb8c`, `7bc8328`, `9be630f` | Les 2 suites + `ruff` + `bash -n` + 10 mutations rejouées | **2089** après fusion (+55) ; prérequis dérivés du texte des scripts avec maillon d'exhaustivité, `--allow-no-gpu` à trois verdicts `doctor`, environnement généré durci et **chargé** par la vraie classe `Settings` 🔬 |
+| 2026-08-03 | COR-020 | `259ceb2`, `56fc20d`, `ad042e7` | `pytest tests -q` (gateway) + parité CI Python 3.11 | **2109** après fusion (+20) ; commentaires préservés, sauvegarde bornée à 5, `fsync` fichier **et** répertoire, mode et groupe restaurés, refus plutôt que réécriture globale. 17 rouges sur 20 en retirant le correctif 🔬 |
+| 2026-08-03 | SEC-009, COR-021, SEC-010 | `6f8f0ac`, `e6428cb`, `2a31fb3`, `f3a2173` | `pytest tests -q` (2 composants) + 5 mutations + **capture sur uvicorn réel** | **2205** après fusion (+96) ; SEC-008 était contournée en production, `_VERSION_RE` rendait un numéro de pilote comme numéro de build, 5 `assert` d'invariant supprimés sur 5 🔬 |
+| 2026-08-03 | AUT-018 | `78e0fd7` | `pytest tests -q` (gateway) + 7 mutations rejouées | **2276** après fusion (+70) ; matrice fournissable par l'opérateur, remplacement assumé de `DEFAULT_VARIANTS`, URL d'archive exigée avant téléchargement, exemple livré utile et **incapable de passer pour valide** 🔬 |
+| 2026-08-03 | SEC-016 | `bcc2f33` | `pytest tests -q` (gateway) + `crossplane` + 30 rouges par retrait | **2310** après fusion (+34) ; URI rédigée sur les **deux** blocs `server`, journal exploitable préservé, égalité stricte avec la liste d'uvicorn. **`nginx -t` non exécuté** — binaire absent, `skip` propre 🔬 |
+| 2026-08-03 | COR-026, COR-028, COR-029 | `71f3d72`, `1eb314b`, `694c017` | `pytest tests -q` (gateway) + 13 rouges par retrait | **2327** après fusion (+17) ; conditions M2 prouvées par appariement de **cible**, localisateur d'entrée unifié, refus d'écriture en 422 sur les trois verbes 🔬 |
+| 2026-08-03 | COR-030, TST-007, SEC-017, AUT-019, COR-027 | `b4140ca`, `f3bbc11`, `8d59ff3`, `ab6f9c3`, `661ddac` | `pytest tests -q` (2 composants) + 21 rouges par retrait | **2363** après fusion (+36) ; **dernier blocage de code de M2 levé**, garde-fou d'imports rendu voyant (2 tests d'absence étaient inertes), recoupement du manifeste raccordé au parcours 🔬 |
+| 2026-08-03 | **Vague 7** | `55b36fb` | Les 2 suites + `ruff` + `bash -n` sur les deux composants | **2426 réussis** (2363 + 1 `skip` / 63) ; 18 items livrés, **Lot B clos**, aucun blocage de code connu restant sur la route de M2. Jalon **toujours non prononcé** : preuve terrain seule manquante (§0.15.1) 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -1008,6 +1060,213 @@ l'hôte GPU mono-worker, traverser nginx et archiver le rapport complet. La
 distance restante est désormais opérationnelle, plus une lacune de raccord :
 **le système sait décrire, simuler et exécuter l'installation ; cette
 installation réelle n'a pas encore été faite.**
+
+> **Périmé par §0.15.1.** Cette évaluation date du 2026-08-01. Deux de ses
+> constats ont été démentis depuis : la matrice de variantes n'était pas
+> seulement dépourvue d'empreintes, elle ne portait **aucune URL d'archive
+> exploitable** (AUT-018) ; et la condition n°1 n'était pas seulement non
+> mesurée, elle était **impossible à prouver** même sur une installation réussie
+> (COR-030). Se reporter à §0.15.1.
+
+---
+
+### 0.15 Vague 7 — la clôture du code du jalon M2
+
+La vague 6 avait livré les exécuteurs. La vague 7 devait fermer ce qui restait
+entre eux et une installation réelle. Elle a livré **18 items** — 8 qui
+attendaient au backlog, 10 nés pendant la vague — et fait passer la suite de
+2089 à **2426 tests**.
+
+Le résultat qui compte n'est pas ce chiffre : c'est que **le Lot B est clos** et
+qu'il ne reste **aucun blocage de code connu** sur la route de M2. Trois
+verrous, tous découverts ou confirmés en implémentant, l'interdisaient encore :
+
+| Verrou | Ce qu'il empêchait | Fermé par |
+|---|---|---|
+| La matrice d'artefacts livrée ne porte ni empreinte ni URL d'archive, et `ResolverPolicy.variants` n'est atteignable que depuis du code Python | L'installateur de runtime **ne pouvait rien installer**, en configuration par défaut comme fournie | AUT-018 |
+| Le préflight `command -v nvidia-smi` d'`install.sh` refuse tout hôte sans GPU, sans échappatoire | Les **deux** déploiements réels ont dû contourner le script ; aucun run terrain ne pouvait valoir preuve *du script* | OPS-012 |
+| `to_plan_steps()` émet une `verify_artifact` runtime qui ne peut rien vérifier, et que l'applicateur saute | La condition n°1 de M2 sortait **insatisfaite sur une installation réussie** | COR-030 |
+
+#### Sept chantiers en parallèle, propriété exclusive des fichiers
+
+| Chantier | Items | Fichiers possédés | Tests |
+|---|---|---|---:|
+| AUT-014 | AUT-014 | `bootstrap/planner.py` | +8 |
+| OPS | OPS-011, OPS-012, SEC-002 | `deploy/*`, `doctor.py` | +55 |
+| COR-020 | COR-020 | `model_registry.py` | +20 |
+| SEC-009 | SEC-009, COR-021, SEC-010 | `llama_version.py`, `main.py`, `runtime_resolver.py` | +96 |
+| AUT-018 | AUT-018 | `runtime_variants.py`, `cli.py`, `production.py` | +70 |
+| COR-026 | COR-026, COR-028, COR-029 | `install_report.py`, `registry_writer.py`, `admin.py` | +17 |
+| SEC-016 | SEC-016 | `deploy/nginx.conf` | +34 |
+| SEC-017 | COR-030, TST-007, SEC-017, AUT-019, COR-027 | `planner.py`, `cli.py`, `runtime_resolver.py` | +36 |
+
+Un huitième chantier a porté COR-030 **sans écrire une ligne** : il a diagnostiqué
+le défaut, l'a localisé au fichier et à la ligne, l'a prouvé par quatre parcours
+bout en bout — et s'est **arrêté** en constatant que le correctif vivait dans un
+fichier possédé par un autre. Sa prescription a été transmise et appliquée telle
+quelle. C'est le meilleur usage qu'on puisse faire d'une règle de propriété
+exclusive : elle n'a pas seulement évité un conflit, elle a produit un
+diagnostic plus solide qu'un correctif écrit à la hâte.
+
+#### Trois défauts que 2089 tests verts n'avaient pas vus
+
+Ce sont les trois découvertes de la vague, et elles se ressemblent : dans chaque
+cas, le code faisait **exactement ce qu'on lui avait demandé**, et ce qu'on lui
+avait demandé était faux.
+
+**1. SEC-008 était intégralement contournée en production.** La règle la plus
+stricte du projet — ne jamais journaliser un nom d'utilisateur, sans quoi
+l'anonymisation RGPD est vide de sens — était violée à chaque requête admin. Pas
+par la query string, comme le supposait SEC-010 : `_redact_path()` ne la voit
+jamais, le middleware ne lui passant que `request.url.path`. Par le **journal
+d'accès d'uvicorn**, qui écrit chemin *et* requête sans rédaction, avec
+`--access-log` actif dans les deux unités systemd livrées. Capturé sur un
+uvicorn réel :
+
+```
+INFO: 127.0.0.1 - "GET /admin/usage?username=CANARI-PRENOM-NOM HTTP/1.1" 200 OK
+INFO: 127.0.0.1 - "GET /admin/users/CANARI-PRENOM-NOM HTTP/1.1" 200 OK
+```
+
+Invisible en test parce que **`TestClient` ne passe pas par le protocole HTTP
+d'uvicorn**. Le trou n'était pas dans le code testé : il était dans l'espace
+entre le code testé et le processus réel. Il a fallu lancer un vrai serveur pour
+le voir. SEC-016 a ensuite porté la même rédaction à nginx, où le serveur `:80`
+fuyait aussi — la redirection `301` journalise l'URI avant de rediriger.
+
+**2. `_VERSION_RE` produisait une attestation mensongère.** On croyait à un faux
+refus. En réalité, sur une sortie CUDA plausible :
+
+```
+ggml_cuda_init: found 1 CUDA devices, driver version 12040   →   build 12040
+```
+
+Un numéro de **pilote** lu comme numéro de **build**, satisfaisant n'importe
+quel plancher `LLAMA_SERVER_MIN_BUILD`. Le garde-fou anti-`GHSA-8947-pfff-2f3c`
+ne se contentait pas d'être inactif : il pouvait affirmer le contraire de la
+vérité. L'hypothèse laissée ouverte en §0.12 est vérifiée sur la forme.
+
+**3. Le rapport qui prononce le jalon prouvait sa condition n°1 par la mauvaise
+preuve.** `M2_CONDITIONS` déclarait `runtime_installed` sur
+`(install_runtime, verify_artifact)` **sans discriminer la cible** de l'étape.
+La vérification du GGUF d'un *modèle* comptait donc comme preuve que le
+*runtime* était installé. Un document dont l'unique fonction est de dire ce qui
+a été fait affirmait quelque chose que rien n'avait établi.
+
+#### Quatre garde-fous inertes, trouvés le même jour
+
+C'est la vraie leçon de la vague, et elle est plus inquiétante que les trois
+défauts ci-dessus.
+
+`runtime_resolver.module_toplevel_imports()` filtrait les nœuds AST sur
+`node.level == 0` : `from . import X` lui était **invisible**. Pire, `from
+bootstrap import X` — la forme réellement employée par `planner` et `applier` —
+ne rendait que `"bootstrap"`, interdit nulle part. **Trois des quatre écritures**
+d'un import de frère échappaient au garde-fou censé protéger le sens de
+dépendance du paquet. Inventaire des cinq analyseurs d'imports du dépôt : **deux
+réellement inertes**, un inerte en droit, un contourné à la main par AUT-018 qui
+s'était heurté au problème sans le nommer, **un seul correct**.
+
+S'y ajoutent, le même jour : une **fixture** de `test_bootstrap_install_report.py`
+qui donnait à chaque action une cible `cible-<action>`, grammaire qu'aucun
+producteur n'émet — la suite ne *pouvait pas* voir COR-026 ; un test d'existence
+d'options **aveugle à `secondary_opts` de Click**, donc à la face négative de
+tout drapeau à deux faces ; et `exit_code`/`verdict`, qui sont des **méthodes**
+et non des propriétés, de sorte qu'une assertion `rapport.exit_code == 3`
+compare un objet lié et **passe silencieusement au vert**.
+
+Un test vert ne prouve rien tant qu'on n'a pas cassé le code sous lui. Le
+protocole de mutation systématique — retirer le correctif, compter les rouges,
+le remettre — n'est pas un supplément de rigueur : c'est **le seul moyen connu**
+de distinguer un test qui contraint d'un test qui décore.
+
+#### Le motif qui revient : du code juste et inatteignable
+
+Quatre occurrences, désormais, du même défaut de conception — un module correct,
+testé, et qu'aucun parcours opérateur n'atteint :
+
+| Occurrence | Vague | Ce qui était inatteignable |
+|---|---|---|
+| AUT-004 | 5 | L'adaptateur LLMfit, sans option de CLI |
+| AUT-018 | 7 | `ResolverPolicy.variants`, l'échappatoire *documentée* de la matrice non épinglée |
+| SEC-017 | 7 | Le recoupement manifeste ↔ binaire de SEC-009b : `attested_binary_sha256()` sans aucun appelant |
+| AUT-019 | 7 | `allow_container`, `allow_local_build`, `allow_cpu_fallback` |
+
+À ce stade ce n'est plus une série de coïncidences, c'est une conséquence
+structurelle de la façon dont ce projet est bâti : les modules sont écrits avec
+leur contrat et leurs tests, et le **raccord** au parcours opérateur est une
+étape distincte que rien n'oblige à faire. **Une contre-mesure est à définir**
+— un test qui exige que chaque paramètre public d'une politique soit atteignable
+depuis la CLI serait le candidat évident, et il aurait attrapé les quatre.
+
+#### Ce que la vague 7 ne prétend pas avoir démontré
+
+- **Aucune installation réelle, toujours.** Transports HTTPS, sondes
+  `llama-server --version`, empreintes et horloges sont injectés partout. Aucune
+  archive amont n'a été téléchargée, aucun GPU sollicité, aucun binaire réel
+  sondé.
+- **Aucune empreinte SHA-256 amont réelle n'existe dans ce dépôt.** AUT-018
+  fournit le *moyen* d'en fournir ; les valeurs restent à relever. La condition
+  n°1 de M2 n'est donc plus une impasse de configuration — elle est une preuve
+  terrain manquante, ce qui n'est pas la même chose mais n'est pas non plus
+  acquis.
+- **`nginx.conf` a été modifiée et jamais validée par `nginx -t`.** Le binaire
+  est absent de l'hôte de développement ; le test l'exécute réellement quand il
+  est présent et se saute sinon. La configuration a été validée par
+  `crossplane`, le parseur officiel de nginx Inc. — contextes, arités,
+  tokenisation — mais **pas** la sémantique d'exécution : héritage
+  `server` → `location` d'`access_log`, priorité de l'`access_log off`, contenu
+  réel du journal d'erreur à `crit`. **Passer `nginx -t` avant tout reload.**
+  C'est un risque *introduit* par cette vague, pas hérité.
+- **La parité CI Python 3.11 n'a été rejouée que par un chantier sur huit**
+  (COR-020). Le reste est mesuré sur le venv local 3.14.
+- **`--allow-container` est descriptible mais non applicable** : `server_manager`
+  ne sait lancer que des sous-processus natifs. Le plan porte ce constat ;
+  AUT-019 ne l'a pas fermé.
+- **Le backend annoncé par une variante fournie n'est vérifiable par personne** :
+  `--version` ne dit pas avec quel backend le binaire a été compilé. Une archive
+  CPU étiquetée `cuda12` s'installerait en silence — le péché cardinal de §6,
+  ici seulement *signalé*, pas empêché.
+- **COR-020 n'a aucune couverture de concurrence** : le reparse comparatif
+  garantit la correction d'**une** écriture, il ne sérialise pas deux écrivains.
+- **Deux worktrees d'agent sur huit ont été livrés sur un HEAD antérieur à la
+  vague 6.** Les chantiers concernés l'ont détecté et reconstruit leur base ; les
+  chiffres de non-régression de ce document sont ceux mesurés **après fusion sur
+  la branche réelle**, pas ceux rapportés par les chantiers.
+
+#### 0.15.1 Sortie du jalon M2 — **toujours non prononcée**
+
+Conditions de §13 et leur état réel au 2026-08-03. **Cette table remplace
+§0.14.1.**
+
+| Condition M2 | État | Ce qui a changé en vague 7 |
+|---|---|---|
+| Runtime installé et vérifié | `[~]` | **Deux blocages levés.** AUT-018 rend la matrice épinglable par l'opérateur (elle ne portait ni empreinte ni URL d'archive) ; SEC-009b + SEC-017 font que le manifeste est réellement recoupé contre le binaire, sur le parcours et non plus seulement en test ; COR-030 rend la condition **prouvable**. Reste : aucune empreinte amont réelle, aucune installation exécutée |
+| Modèle téléchargé à révision figée | `[x]` | AUT-014 traite désormais le cas « déjà présent et attesté » sans reproposer le téléchargement ni mentir sur le volume |
+| Licence acceptée | `[~]` | Inchangé — relecture stricte (SEC-011), aucune acceptation réelle produite sur l'hôte cible |
+| Calibration effectuée | `[~]` | Inchangé — sondes concrètes, aucune mesure GPU terrain archivée |
+| Modèle préchauffé | `[~]` | Inchangé — raccord livré, jamais exécuté sur le modèle cible |
+| Appel E2E réussi | `[~]` | **Nouvelle réserve** : `nginx.conf` a changé (SEC-016) et n'a pas été validée par `nginx -t`. Le vrai chemin public reste à traverser |
+| Rapport final produit | `[x]` | COR-026 et COR-030 le rendent **juste** : chaque condition est prouvée par les étapes qui la concernent, cible comprise, et une installation réussie n'est plus classée `partial` |
+
+**Décision de sortie : toujours refusée, et pour une seule raison.** Ce n'est
+plus « la preuve terrain manque *et* le code bloque » : le code ne bloque plus.
+
+Ce qu'il faut faire, dans l'ordre :
+
+1. **Relever les empreintes amont réelles** de `llama-server` pour la plateforme
+   et le backend cibles, et les écrire dans un fichier `--runtime-variants` (le
+   modèle commenté est `gateway/deploy/runtime-variants.yaml.example`).
+2. **Passer `nginx -t`** sur la configuration livrée avant tout reload.
+3. Exécuter `bootstrap-apply --apply` sur l'hôte GPU mono-worker, à travers le
+   nginx de production.
+4. **Archiver le rapport** et traiter chaque écart terrain comme un item, au
+   lieu de prononcer le jalon sur les seuls tests.
+
+L'expérience de ce projet dit ce qui va se passer à l'étape 3 : les deux
+déploiements réels précédents ont chacun produit cinq à six items qu'aucun
+audit n'avait vus. Il serait imprudent de budgéter M2 comme si l'étape 3 était
+une formalité.
 
 ---
 
@@ -1890,7 +2149,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | COR-018 | `[ ]` | P2 | Cesser d'annoncer les modèles d'un nœud hors ligne | Pendant qu'un nœud est `online: false`, `/admin/cluster` ne présente plus ses `loaded_models` comme chargés : la liste est vidée ou explicitement marquée `unavailable`, et un test le verrouille avec un contrôle positif prouvant qu'elle sait afficher des modèles quand le nœud est en ligne. **Item ajouté le 2026-07-31** (§0.13), relevé une première fois au §0.10 et reproduit depuis : `online: false`, `consecutive_failures: 3`, et pourtant un modèle encore annoncé chargé. Le drapeau est juste, la liste ment — et c'est la liste qu'on lit en incident. |
 | COR-019 | `[ ]` | P1 | Rendre la queue d'admission cohérente entre local et cluster | Soit la queue est portée en mode cluster et `/v1/capacity` y répond comme en local, soit son indisponibilité devient une **limite documentée** dans `docs/api.md` et `AGENTS.md`, dont la phrase « le mode cluster garde le même comportement public que le mode local » est alors amendée. Un test doit verrouiller le choix retenu. **Item ajouté le 2026-07-31** (§0.13) : `/v1/capacity` renvoie `enabled: false, status: unavailable` en cluster **malgré** `CAPACITY_QUEUE_ENABLED=true`. Un client qui interroge la capacité reçoit donc deux contrats publics différents selon une topologie qu'il ne connaît pas. |
 | COR-020 | `[x]` | P1 | Préserver `models.yaml` lors des mutations admin | **Livré le 2026-08-03.** Une mutation par l'API admin ou le dashboard conserve les commentaires du fichier, produit une sauvegarde, écrit atomiquement avec `fsync`, et laisse les permissions inchangées. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-007 : `ModelRegistry._save()` réécrit le fichier entier par `yaml.dump`, ce qui efface les 55 lignes d'en-tête opérationnel du fichier livré — budget VRAM, table RAM hôte, procédure de réactivation de `minimax-m2.7` — et tous les commentaires d'entrée. Il ne sauvegarde pas, ne synchronise pas, et `NamedTemporaryFile` fait basculer le fichier en 0600 sans restaurer les permissions d'origine. Perte de données en production, aujourd'hui, sur un chemin emprunté par le dashboard. `bootstrap/registry_writer.py` montre la forme attendue : ajout textuel, reparse comparatif, refus plutôt que réécriture globale.  La persistance retouche désormais le texte du fichier : ajout en fin de document, retouche des seules lignes de champ qui changent (y compris dans `llama_params`), retrait du seul bloc d'une entrée supprimée. Reparse comparatif avant publication, et **refus** — HTTP 422, rien d'écrit, état mémoire restauré — quand le texte candidat ne rend pas le document attendu, quand l'entrée n'est pas identifiable, ou quand un champ non scalaire diverge du disque. Sauvegarde `*.pre-admin.*.bak` **bornée à 5**, `fsync` du fichier et du répertoire parent, mode, propriétaire et groupe rétablis. La politique d'écriture reste unique : `bootstrap/registry_writer.py` est réutilisé. |
-| COR-021 | `[ ]` | P2 | Ne pas porter d'invariant de production par `assert` | Aucun `assert` ne garde un invariant dont la violation doit produire une erreur nommée. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-017 : `runtime_resolver.ProvenanceManifest.build_number` et `to_decision()` s'appuient sur `assert match is not None` / `assert variant is not None`. Sous `python -O`, que rien n'interdit dans une unité systemd, ces gardes disparaissent et le refus explicite devient un `AttributeError` opaque. À rechercher ailleurs dans le dépôt avant de conclure. |
+| COR-021 | `[x]` | P2 | Ne pas porter d'invariant de production par `assert` | Aucun `assert` ne garde un invariant dont la violation doit produire une erreur nommée. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-017 : `runtime_resolver.ProvenanceManifest.build_number` et `to_decision()` s'appuient sur `assert match is not None` / `assert variant is not None`. Sous `python -O`, que rien n'interdit dans une unité systemd, ces gardes disparaissent et le refus explicite devient un `AttributeError` opaque. À rechercher ailleurs dans le dépôt avant de conclure. **Livré le 2026-08-03** : 5 `assert` d'invariant trouvés dans tout le dépôt — `runtime_resolver.build_number`, `runtime_resolver.to_decision`, `runtime_installer._executer`, `llmfit._from_manual_profile`, `llmfit._degraded` —, 0 laissé. Un item dont le critère est « aucun `assert` » ne se ferme pas à moitié : les trois derniers étaient hors du périmètre de fichiers du chantier et ont été traités quand même. Le test d'absence balaie l'AST des modules de production et porte son contrôle positif. Réserve : il prouve par lecture d'AST, non par exécution sous `python -O` — pytest dépend de la réécriture des `assert` et ne peut pas tourner sous `-O`. |
 | COR-022 | `[x]` | **P0** | Dénouer la chaîne de preuve du plan d'amorçage | **Livré le 2026-08-01.** Le plan produit, pour chaque modèle, le triplet adjacent `calibrate_model → enable_model → smoke_test`, puis `warmup_model`. Le pré-vol refuse un triplet non compensable. `enable_model` ouvre une obligation de rollback sur la seule preuve de calibration ; le smoke test ciblé produit le second volet, confirme sur disque, ou compense sur échec, preuve illisible, exception et annulation. Le fichier reste `enabled: false` pendant la fenêtre. Plans multi-modèles, succès, échec et rollback sont testés. |
 | COR-023 | `[x]` | **P0** | Synchroniser l'activation provisoire avec la gateway vivante | **Item ajouté et livré le 2026-08-01**, découvert en relisant COR-022 : écrire le YAML ne recharge pas le `ModelRegistry` d'un processus déjà lancé. La gateway mono-worker publie donc un snapshot calibré uniquement en mémoire via `bootstrap-sync`, sous digest et bail bornés. Rollback et expiration ferment l'admission **avant** le premier `await`, laissent finir les requêtes déjà pincées et déchargent sans forcer. Un unload raté reste fail-closed. Tombstones et idempotence couvrent réponse `confirm` perdue, rollback tardif et cycle ultérieur ; les mutations admin et les courses local/cluster sont testées. |
 | COR-024 | `[x]` | **P0** | Attendre une mutation disque déportée avant compensation | **Item ajouté et livré le 2026-08-01**, trouvé en relecture finale : annuler l'`await` d'un `asyncio.to_thread` ne tue pas le thread. L'applicateur protège désormais l'attente, laisse l'écriture ou la désactivation se terminer, puis propage l'annulation afin que le rollback observe l'état persistant final. La régression bloque réellement le thread et prouve que la tâche annulée ne rend pas la main avant lui. |
@@ -1922,6 +2181,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | AUT-016 | `[x]` | P0 | Installer le runtime résolu | L'artefact est vérifié avant d'être rendu exécutable, l'extraction d'archive est défensive, la bascule est atomique, la version est relue depuis le binaire posé et confrontée à l'épinglage, l'installation est idempotente et réversible, et un manifeste de provenance est écrit à côté du binaire. **Item ajouté le 2026-08-01** : trou du backlog découvert en ouvrant la vague 6. AUT-003 **résout** quelle variante de `llama-server` installer et s'arrête là ; aucun item ne portait l'installation elle-même, alors que le jalon M2 l'exige en **première** condition (« runtime installé et vérifié »). |
 | AUT-017 | `[x]` | **P0** | Implémenter les sondes de production du bootstrap | **Item livré le 2026-08-01.** `bootstrap-apply` câble les neuf actions depuis l'unique snapshot validé du plan : runtime strictement reconstruit, téléchargement, acceptations de licence explicites, registre, RAM/VRAM, processus de calibration, recette, warmup et rapport. `ADMIN_SECRET` vient d'un fichier privé non symlink ou de l'environnement, jamais d'argv ; la simulation n'en exige aucun. Origins fermées, admin limité à loopback, serveur de calibration identifié, nettoyage de processus et annulation couverts. |
 | AUT-018 | `[x]` | P0 | Rendre les variantes runtime épinglables par l'opérateur | `bootstrap-plan --runtime-variants FICHIER.yaml` charge une matrice d'artefacts fournie par l'opérateur ou par la CI, validée strictement et sans repli. **Item ajouté le 2026-08-03**, ouvert en vague 7 sur le constat de §0.14.1 : `DEFAULT_VARIANTS` ne porte aucune empreinte — choix juste — mais `ResolverPolicy.variants`, l'échappatoire que le résolveur documente, n'était atteignable que depuis du code Python (même défaut qu'AUT-004), et les `reference` de la matrice livrée désignent la **page de releases** du projet, pas une archive : `production.runtime_installer_from_plan` en faisait pourtant `archive_url`. En configuration par défaut, l'installateur n'installait donc rien et l'opérateur n'avait aucun moyen supporté d'y remédier. Le fichier **remplace** `DEFAULT_VARIANTS` (l'union laisserait un `local-build` livré l'emporter en silence sur une entrée dont le `platform` porte une faute de frappe), impose le niveau de preuve `constat-opérateur` — troisième valeur d'`evidence`, qu'un fichier ne peut pas s'attribuer autrement — et fait porter au plan un constat `info` nommant l'origine de la matrice. La politique d'URL réutilise `public_https` et y ajoute la contrainte qui manquait : le chemin doit désigner une archive extractible, sans chaîne de requête ni fragment. `production` l'applique aussi, pour refuser avant le téléchargement au lieu d'échouer après, au contrôle d'empreinte. Exemple livré dans `gateway/deploy/runtime-variants.yaml.example`, volontairement non chargeable : ses valeurs invérifiables portent le marqueur `REMPLACER`, et un test prouve à la fois qu'il refuse tel quel et que sa structure se charge une fois les marqueurs substitués (garde-fou COR-014). |
+| AUT-019 | `[x]` | P1 | Rendre pilotables les trois drapeaux de la politique de résolution | `bootstrap-plan` expose `--allow-container`, `--allow-local-build/--no-local-build` et `--allow-cpu-fallback`, et la politique retenue est **inscrite dans le plan** (`sections.runtime.data.policy`). **Item ajouté et livré le 2026-08-03**, découvert en livrant AUT-018. `ResolverPolicy` portait ces trois drapeaux qu'aucune option n'exposait : conséquence directe depuis AUT-018, un opérateur pouvait fournir une variante `official-container` correctement épinglée par digest et la voir **systématiquement** écartée — « mode conteneur non accepté par la politique ». Il avait le moyen de l'épingler et aucun moyen de l'autoriser. **Quatrième occurrence** du motif « code juste, inatteignable depuis le parcours réel », après AUT-004, AUT-018 et SEC-017. Le défaut qui compte est préservé : `allow_cpu_fallback` reste faux par défaut, parce que §6 exige que la dégradation GPU → CPU soit demandée et jamais subie. L'option ne la rend pas plus facile à obtenir par accident : elle exige `--pin-version`/`--pin-commit` comme `--runtime-variants`, elle émet `cpu_fallback_authorized` (`info`) **dès que l'autorisation est debout, même si le repli n'est pas emprunté** — un plan calculé sous une politique permissive ne doit pas se lire comme un plan calculé sous la politique par défaut —, et quand le repli est effectivement pris le planificateur porte l'annonce dans les **`notes`** de la section : `Repli CPU EMPRUNTÉ` et `CE PLAN EST DÉGRADÉ`. Le raccord par les notes n'est pas cosmétique : `data` n'est pas imprimé par le rendu humain, `notes` l'est, et un repli CPU qui ne se lirait que dans le JSON serait précisément le repli silencieux que §6 interdit. `production.runtime_resolution_from_plan` relit la politique aussi strictement que le reste du bloc — jeu de clés fermé, booléens stricts, égalité de rendu — pour que l'application ne puisse pas en changer. |
 
 | AUT-014 | `[x]` | P1 | Reconnaître un artefact déjà présent et vérifié | Quand un fichier du catalogue est **déjà présent** au chemin cible et que son SHA-256 correspond à l'entrée épinglée, le plan ne propose plus son téléchargement : l'étape devient une `verify_artifact` seule, le volume annoncé est décompté, et le motif est écrit dans le détail de l'étape. Un test doit couvrir les trois cas — absent, présent et conforme, présent mais **empreinte divergente** (qui doit rester bloquant, jamais silencieusement réutilisé). **Item ajouté le 2026-07-31** (§0.13), reproduit sur un hôte réel : le planificateur avait bien lu le header des deux GGUF présents — `local_inspection` non nulle — et proposait pourtant 837,1 Mio de téléchargement. L'information manquait au raisonnement, pas à la collecte. |
 
@@ -1943,19 +2203,20 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | ID | État | Priorité | Action | Critère d'acceptation |
 |---|---|---|---|---|
 | SEC-001 | `[ ]` | P0 | Vendoriser les assets admin et ajouter CSP | Dashboard fonctionnel hors ligne, aucune ressource tierce, CSP testée. **Reproduit sur hôte réel le 2026-07-31** (§0.13) : le HTML servi porte 4 références externes — `cdn.jsdelivr.net` pour chart.js et `fonts.googleapis.com` pour deux polices. Sur un réseau sans sortie Internet, le dashboard d'administration est donc inutilisable au moment précis où l'on en a besoin. |
-| SEC-002 | `[ ]` | P0 | Durcir l'environnement généré | Allowlist modèle, CORS explicite et build minimum visibles dans le fichier généré. |
+| SEC-002 | `[x]` | P0 | Durcir l'environnement généré | Allowlist modèle, CORS explicite et build minimum visibles dans le fichier généré. **Livré le 2026-08-03.** Le heredoc d'`install.sh` **omettait purement et simplement** les trois clés : `/etc/llm-gateway/env` étant le seul fichier chargé par systemd, un opérateur qui n'ouvre que celui-là ne les découvrait jamais. Toute installation issue du script tournait donc CORS ouvert, sans contrainte de répertoire sur les chemins GGUF alors que l'allowlist est implémentée et testée, et avec l'épinglage anti-`GHSA-8947-pfff-2f3c` inactif. Le test **charge** l'environnement généré avec la vraie classe `Settings` plutôt que d'y chercher les clés au `grep` — c'est la leçon de COR-014, où ces trois réglages précisément faisaient échouer le démarrage tels que documentés. `update.sh` signale les clés manquantes sans les poser : aucun hôte déjà déployé n'est durci par ce commit. **Reste ouvert** : `LLAMA_SERVER_MIN_BUILD` est posé à `0`, un script bash ne pouvant pas connaître le build de façon fiable — le garde-fou est désormais visible mais toujours inerte, suivi sous SEC-015. |
 | SEC-003 | `[ ]` | P0 | Verrouiller les dépendances | Installation reproductible, dépendances dev séparées, hashes ou artefacts contrôlés. |
 | SEC-004 | `[ ]` | P0 | Rendre l'audit CVE bloquant | Politique d'exception documentée avec expiration. |
 | SEC-005 | `[ ]` | P1 | Imposer l'intégrité des modèles approuvés | Aucun modèle catalogue ne charge sans SHA/provenance. |
 | SEC-006 | `[ ]` | P1 | Sécuriser le data-plane cluster | Prompts chiffrés ou réseau isolé attesté et contrôlé. |
 | SEC-007 | `[ ]` | P1 | Produire SBOM et attestations runtime | Chaque release et binaire redistribué possède provenance et notices. |
-| SEC-009 | `[ ]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version\|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. **Élargi le 2026-08-01** (§0.14), en livrant AUT-016 : `runtime_resolver._judge_existing_binary` accorde `reuse_existing` sur la foi d'un manifeste **qu'il ne recoupe jamais contre le binaire** — ni la version ni le commit déclarés ne sont confrontés à ce que rend `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. `runtime_installer` ferme le trou de son côté en recalculant l'empreinte à chaque passe ; le résolveur reste exposé. |
-| SEC-010 | `[ ]` | P2 | Rédiger la query string dans les journaux d'accès | Un nom d'utilisateur passé en paramètre de requête n'apparaît pas plus dans les journaux qu'un nom passé dans le chemin. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-009 : `main._redact_path()` redacte le **chemin**, pas la **requête**, alors que `GET /admin/usage?username=…` existe et est employé par `deploy/smoke_test.sh`. Le nom y est éphémère et généré, donc sans donnée personnelle — mais un opérateur qui interroge cette route avec un vrai nom écrirait ce nom au journal, ce que SEC-008 interdit. À confirmer par lecture de `_redact_path` avant d'écrire le correctif. |
+| SEC-009 | `[x]` | P1 | Unifier la politique fail-closed de `LLAMA_SERVER_MIN_BUILD` | Une version de `llama-server` illisible alors qu'un build minimal est exigé refuse le démarrage, quel que soit le chemin emprunté. **Item ajouté le 2026-07-31** (§0.12), découvert en livrant AUT-003 : la politique existe en trois endroits avec deux sémantiques — `doctor` est fail-closed comme l'exige §6, `main._validate_inference_runtime` et `llama_version.enforce_llama_min_build()` ne le sont pas. Une gateway démarrée sans passer par `doctor` peut donc servir sur un binaire inattestable (cf. GHSA-8947-pfff-2f3c). Couvre aussi l'hypothèse `_VERSION_RE` : le premier motif `version\|build` de la sortie peut être une ligne d'initialisation de backend, pas la ligne de build. **Élargi le 2026-08-01** (§0.14), en livrant AUT-016 : `runtime_resolver._judge_existing_binary` accorde `reuse_existing` sur la foi d'un manifeste **qu'il ne recoupe jamais contre le binaire** — ni la version ni le commit déclarés ne sont confrontés à ce que rend `--version`, et aucune empreinte du binaire n'est comparée. Un manifeste recopié d'un autre hôte, ou survivant à un remplacement manuel du binaire, vaut donc attestation de provenance. `runtime_installer` ferme le trou de son côté en recalculant l'empreinte à chaque passe ; le résolveur reste exposé. **Livré le 2026-08-03, et le défaut était l'inverse de celui décrit.** `_VERSION_RE` ne produisait pas un faux refus mais une **attestation mensongère** : sur une sortie CUDA plausible, `ggml_cuda_init: found 1 CUDA devices, driver version 12040` rendait build 12040 — un numéro de pilote lu comme numéro de build, satisfaisant n'importe quel plancher. L'hypothèse laissée ouverte en §0.12 est donc vérifiée sur la forme, sans binaire GPU. La politique fail-closed est unifiée sur les trois chemins, l'extraction est ancrée et refuse l'ambiguïté (deux lignes candidates contradictoires ⇒ `None`, donc un refus). Volet b : `_judge_existing_binary` recoupe désormais version, commit et empreinte du manifeste contre le binaire réellement posé. Le raccord de ce volet au parcours opérateur est SEC-017. |
+| SEC-010 | `[x]` | P2 | Rédiger la query string dans les journaux d'accès | Un nom d'utilisateur passé en paramètre de requête n'apparaît pas plus dans les journaux qu'un nom passé dans le chemin. **Item ajouté le 2026-08-01** (§0.14), découvert en livrant AUT-009 : `main._redact_path()` redacte le **chemin**, pas la **requête**, alors que `GET /admin/usage?username=…` existe et est employé par `deploy/smoke_test.sh`. Le nom y est éphémère et généré, donc sans donnée personnelle — mais un opérateur qui interroge cette route avec un vrai nom écrirait ce nom au journal, ce que SEC-008 interdit. À confirmer par lecture de `_redact_path` avant d'écrire le correctif. **Livré le 2026-08-03 — diagnostic confirmé sur le risque, faux sur le mécanisme.** `_redact_path()` ne voit jamais la query string : le middleware ne lui passe que `request.url.path`. La fuite réelle était le **journal d'accès d'uvicorn**, qui écrit `get_path_with_query_string(scope)` — chemin **et** requête — sans rédaction, avec `--access-log` actif dans les deux unités systemd livrées. Capturé sur un uvicorn réel avant correctif : `"GET /admin/usage?username=CANARI-PRENOM-NOM"` et `"GET /admin/users/CANARI-PRENOM-NOM"`. **SEC-008 était donc intégralement contournée en production, pour le chemin aussi**, et invisible en test parce que `TestClient` ne passe pas par le protocole HTTP d'uvicorn. Un filtre sur le logger `uvicorn.access` rédige les deux, sur liste d'autorisation (`from_date`, `to_date`, `limit`, `force`, `period`) donc fail-closed pour tout paramètre futur. La rédaction s'arrêtait à la gateway : SEC-016 la porte à nginx. |
 | SEC-011 | `[x]` | P1 | Relire strictement les acceptations de licence persistées | `accepted` exige un vrai booléen JSON et les cinq champs textuels de preuve exigent de vraies chaînes ; `"false"`, nombres, `null`, listes et objets sont refusés avant toute requête réseau. **Item ajouté et livré le 2026-08-01**, découvert pendant la revue de vague 6 : `bool("false")` valait `True` et transformait un refus sérialisé en consentement. |
 | SEC-012 | `[x]` | **P0** | Fermer le SSRF et le DNS rebinding du téléchargement runtime | Chaque saut de redirection est validé avant résolution et connexion ; HTTP, identifiants, loopback, link-local, réseaux privés, réponses DNS mixtes et adresses non globales sont refusés. La connexion TCP emploie l'adresse validée tout en conservant le hostname pour SNI et le certificat. **Item ajouté et livré le 2026-08-01**, découvert pendant la revue de vague 6 : `urllib` suivait la redirection avant que l'URL finale soit contrôlée. |
 | SEC-013 | `[x]` | P1 | Refuser les faux booléens dans `models.yaml` | `enabled` accepte uniquement un booléen YAML réel ; `"true"`, `"false"`, nombres, listes et objets sont refusés à la charge, y compris sur une entrée voisine pendant le calcul de capacité du bootstrap. **Item ajouté et livré le 2026-08-01** : les coercitions `bool(...)` rendaient toute chaîne non vide active. Le défaut historique `enabled` absent → `true` est conservé. |
 | SEC-014 | `[x]` | **P0** | Fermer le SSRF et le DNS rebinding du téléchargement des modèles | L'endpoint et chaque redirection HTTPS refusent identifiants, loopback, link-local, réseaux privés et adresses non globales ; toute réponse DNS mixte est refusée en bloc et la connexion TCP emploie exactement les adresses validées avec SNI/certificat sur le hostname d'origine. Le transport n'hérite d'aucun proxy d'environnement. **Item ajouté et livré le 2026-08-01**, découvert pendant la relecture finale parallèle : le SHA-256 protégeait la promotion du GGUF, pas l'effet réseau de la requête sortante. Le connecteur est partagé avec SEC-012 afin que les deux flux portent la même politique. |
-| AUT-019 | `[x]` | P1 | Rendre pilotables les trois drapeaux de la politique de résolution | `bootstrap-plan` expose `--allow-container`, `--allow-local-build/--no-local-build` et `--allow-cpu-fallback`, et la politique retenue est **inscrite dans le plan** (`sections.runtime.data.policy`). **Item ajouté et livré le 2026-08-03**, découvert en livrant AUT-018. `ResolverPolicy` portait ces trois drapeaux qu'aucune option n'exposait : conséquence directe depuis AUT-018, un opérateur pouvait fournir une variante `official-container` correctement épinglée par digest et la voir **systématiquement** écartée — « mode conteneur non accepté par la politique ». Il avait le moyen de l'épingler et aucun moyen de l'autoriser. **Quatrième occurrence** du motif « code juste, inatteignable depuis le parcours réel », après AUT-004, AUT-018 et SEC-017. Le défaut qui compte est préservé : `allow_cpu_fallback` reste faux par défaut, parce que §6 exige que la dégradation GPU → CPU soit demandée et jamais subie. L'option ne la rend pas plus facile à obtenir par accident : elle exige `--pin-version`/`--pin-commit` comme `--runtime-variants`, elle émet `cpu_fallback_authorized` (`info`) **dès que l'autorisation est debout, même si le repli n'est pas emprunté** — un plan calculé sous une politique permissive ne doit pas se lire comme un plan calculé sous la politique par défaut —, et quand le repli est effectivement pris le planificateur porte l'annonce dans les **`notes`** de la section : `Repli CPU EMPRUNTÉ` et `CE PLAN EST DÉGRADÉ`. Le raccord par les notes n'est pas cosmétique : `data` n'est pas imprimé par le rendu humain, `notes` l'est, et un repli CPU qui ne se lirait que dans le JSON serait précisément le repli silencieux que §6 interdit. `production.runtime_resolution_from_plan` relit la politique aussi strictement que le reste du bloc — jeu de clés fermé, booléens stricts, égalité de rendu — pour que l'application ne puisse pas en changer. |
+| SEC-015 | `[ ]` | P1 | Rendre effectif le plancher `LLAMA_SERVER_MIN_BUILD` après installation du runtime | Après un `bootstrap-apply` qui pose un runtime, l'environnement du service porte un plancher de build **non nul**, dérivé de la politique de sécurité et non de l'épinglage. **Item ajouté le 2026-08-03** : SEC-002 pose enfin la clé dans l'environnement généré, mais à `0` — un script bash ne peut pas connaître le build de façon fiable. Le garde-fou anti-`GHSA-8947-pfff-2f3c` est donc désormais **visible et toujours inerte** sur toute installation issue du script, ce qui prive SEC-009 de son effet sur ces hôtes. Piège à éviter, relevé en livrant AUT-018 : propager la **version installée** serait faux — `derive_min_build()` documente que le plancher doit accepter tout binaire au moins aussi patché, pas seulement celui que le bootstrap a posé. La valeur à propager est `sections.runtime.data.min_build` du plan, qui porte déjà `--min-build`. Périmètre à trancher : `bootstrap-apply` n'a aujourd'hui **aucune** capacité d'écriture d'environnement. |
+| SEC-016 | `[x]` | P1 | Rédiger l'URI dans les journaux d'accès nginx | **Item ajouté et livré le 2026-08-03**, découvert en livrant SEC-010 : la rédaction s'arrêtait à la gateway, nginx journalisant l'URI selon sa propre configuration. Deux `map` et un `log_format` dédié rédigent le chemin et la query string sur les **deux** blocs `server` — le `:80` fuyait aussi, la redirection `301` journalisant l'URI avant de rediriger. Le journal reste exploitable en incident : adresse, méthode, **forme de la route**, statut, volume, user-agent, plus la **durée** qui manquait à `combined`. `$http_referer` (qui pouvait recopier l'URI d'une page admin en contournant toute la rédaction du chemin) et `$remote_user` sont retirés. Le **journal d'erreur** est concerné et nginx n'a pas d'`error_log_format` : seule parade native, `error_log … crit;` sur la seule `location /admin/`, coût assumé et documenté. La liste des paramètres autorisés est comparée par **égalité stricte** à `main._LOGGABLE_QUERY_PARAMS` : modifier un côté fait rougir l'autre. Divergence unique et conservatrice — nginx ne sachant pas itérer sur les paramètres, il rédige la query entière, donc en révèle toujours moins qu'uvicorn. **Réserve** : `nginx -t` n'a pas pu être exécuté (nginx absent de l'hôte de développement, test `skip` propre) ; la conf a été validée par `crossplane`, le parseur officiel de nginx Inc. — contextes, arités et tokenisation, pas la sémantique d'exécution. |
 | SEC-017 | `[x]` | P1 | Raccorder le recoupement du manifeste au parcours de l'opérateur | `planner._resolve_runtime` relit le manifeste §6 posé à côté du binaire par `runtime_installer` (AUT-016) et le fournit au résolveur, de sorte que le recoupement version / commit / backend / empreinte de SEC-009 ait réellement lieu. **Item ajouté et livré le 2026-08-03**, découvert en relisant SEC-009. Le volet b de SEC-009 est juste et testé — `_judge_existing_binary` recoupe le manifeste contre le binaire au lieu de le croire sur parole, et `attested_binary_sha256()` extrait l'empreinte consignée — mais **aucun appelant ne fournissait jamais `existing_manifest`** : le planificateur ne passait que `existing_binary`. Le chemin corrigé n'était donc exercé que par les tests, et le trou, réel, restait **dormant** — il se serait ouvert silencieusement le jour où quelqu'un aurait raccordé la lecture. C'est la **troisième occurrence** du motif « code juste, inatteignable depuis le parcours réel » après AUT-004 et AUT-018. `read_existing_attestation()` porte la lecture, ne lève jamais, et rend un **constat nommé** par issue : `runtime_manifest_absent` (`info`, avec le chemin où le manifeste était attendu — cas nominal d'un binaire compilé à la main), `runtime_manifest_unreadable` (`warn` : droits, troncature, YAML invalide), `runtime_manifest_invalid` (`warn` : relu mais refusé par les règles de §6). Fail-closed dans les trois cas : `manifest` vaut `None`, l'absence ne vaut jamais attestation, et le refus de réutilisation vient du recoupement aval. `MANIFEST_FILENAME` vit désormais chez le **décideur** — c'est le résolveur qui définit le manifeste, et le sens de dépendance de `bootstrap/__init__.py` lui interdit d'importer l'installateur ; un test recoupe les deux constantes pour qu'elles ne divergent pas. La lecture disque est déportée hors de la boucle d'événements. |
 | SEC-008 | `[x]` | P1 | Ne pas journaliser les noms d'utilisateur | Aucun `log.*` de la gateway ne porte de nom d'utilisateur ; le chemin de requête est rédigé. **Item ajouté le 2026-07-30**, découvert en livrant COR-002 : anonymiser en base est sans effet si le journal garde une copie du nom. |
 
@@ -1978,8 +2239,8 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | OPS-008 | `[x]` | P1 | Armer réellement le timer de sauvegarde | Après `install.sh` puis après `update.sh`, `systemctl is-active llm-gateway-backup.timer` retourne `active` et le timer apparaît dans `list-timers`, sans reboot et sans déclencher de sauvegarde immédiate avant l'initialisation de la base. **Item ajouté le 2026-07-30** (§0.10) : `enable` sans `--now` laissait la sauvegarde quotidienne inerte jusqu'au prochain redémarrage. |
 | OPS-009 | `[x]` | P2 | Moderniser les directives nginx livrées | `nginx -t` ne produit aucun avertissement de dépréciation sur les versions supportées (`http2 on;` au lieu de `listen … ssl http2`). **Item ajouté le 2026-07-30** (§0.10) : le bruit à chaque reload masque les avertissements utiles. |
 | OPS-010 | `[~]` | P1 | Borner la rétention des venvs de release | Après N mises à jour successives, `gateway/deploy/update.sh` et `node_agent/deploy/update-agent.sh` laissent au plus 2 arborescences de venv (l'active et la précédente) et la cible du symlink n'est jamais supprimée. **Item ajouté le 2026-07-30** : sans purge, chaque mise à jour ajoutait ~200 Mo au disque du nœud, en silence. Rétention livrée et testée dans les deux scripts (`EVA_GATEWAY_VENV_KEEP` / `EVA_AGENT_VENV_KEEP`, défaut 2). **Reste à faire** : la même borne pour les sauvegardes `*.pre-migration.*.bak` d'OPS-006, suivie sous OPS-002. |
-| OPS-011 | `[ ]` | P1 | Aligner les prérequis documentés sur ce que les scripts exigent réellement | `docs/deployment.md` §1 liste **toutes** les commandes réclamées par les préflights d'`install.sh` et d'`install-agent.sh`, et un test dérive la liste attendue du code des scripts plutôt que de la recopier — sans quoi il rate la prochaine dépendance ajoutée. **Item ajouté le 2026-07-31** (§0.13) : `install-agent.sh` exige `rsync` (préflight ligne 76, usage lignes 122 et 126), le mot n'apparaît nulle part dans la documentation, et une Debian 13 minimale ne l'installe pas — l'installation d'un nœud neuf échoue au premier écran, sur une dépendance que rien n'annonce. |
-| OPS-012 | `[ ]` | P1 | Donner une échappatoire explicite au préflight GPU d'`install.sh` | `install.sh --mode local` accepte un hôte sans GPU via une option **explicite** (`--allow-no-gpu`), qui inscrit ce choix dans l'environnement généré et le fait remonter par `doctor` ; sans l'option, le refus actuel est conservé et son message dit quoi faire. Un test couvre les deux branches. **Item ajouté le 2026-07-31** (§0.13) : le préflight `command -v nvidia-smi` a bloqué **les deux** déploiements réels sur banc CPU (§0.10 puis §0.13), et les deux ont dû contourner le script. Un garde-fou que tout le monde contourne ne protège plus personne — il apprend seulement à passer outre. |
+| OPS-011 | `[x]` | P1 | Aligner les prérequis documentés sur ce que les scripts exigent réellement | `docs/deployment.md` §1 liste **toutes** les commandes réclamées par les préflights d'`install.sh` et d'`install-agent.sh`, et un test dérive la liste attendue du code des scripts plutôt que de la recopier — sans quoi il rate la prochaine dépendance ajoutée. **Item ajouté le 2026-07-31** (§0.13) : `install-agent.sh` exige `rsync` (préflight ligne 76, usage lignes 122 et 126), le mot n'apparaît nulle part dans la documentation, et une Debian 13 minimale ne l'installe pas — l'installation d'un nœud neuf échoue au premier écran, sur une dépendance que rien n'annonce. **Livré le 2026-08-03.** Six prérequis non documentés au-delà de `rsync` : `openssl`, `curl`, `git`, le `nvidia-smi` d'`update.sh`, et surtout **`sqlite3`** — absent, `install.sh` **n'arme pas** le timer de sauvegarde quotidienne, en silence. Le test tient par un chaînage à trois maillons, pas par une liste : les quatre points d'entrée déclarent leurs dépendances dans des tableaux bash nommés ; le test les **dérive du texte du script** ; et un troisième test exige que **tout `command -v` littéral figure dans un tableau**, si bien qu'une dépendance ajoutée à la main casse le test, revient dans le tableau, donc dans la dérivation, donc dans l'exigence de documentation. Sans ce maillon d'exhaustivité, la dérivation ne garantirait rien. |
+| OPS-012 | `[x]` | P1 | Donner une échappatoire explicite au préflight GPU d'`install.sh` | `install.sh --mode local` accepte un hôte sans GPU via une option **explicite** (`--allow-no-gpu`), qui inscrit ce choix dans l'environnement généré et le fait remonter par `doctor` ; sans l'option, le refus actuel est conservé et son message dit quoi faire. Un test couvre les deux branches. **Item ajouté le 2026-07-31** (§0.13) : le préflight `command -v nvidia-smi` a bloqué **les deux** déploiements réels sur banc CPU (§0.10 puis §0.13), et les deux ont dû contourner le script. Un garde-fou que tout le monde contourne ne protège plus personne — il apprend seulement à passer outre. **Livré le 2026-08-03**, et `doctor` distingue **trois** situations et non deux : GPU absent sans déclaration ⇒ `warn` / `nvidia_smi_unavailable` ; GPU absent avec `ALLOW_NO_GPU=true` ⇒ `skip` / `gpu_absence_declared` ; **GPU présent** avec `ALLOW_NO_GPU=true` ⇒ `warn` / `gpu_waiver_stale`. La troisième ligne empêche la renonciation de survivre au matériel qui la justifiait — sans elle, une future panne de pilote serait diagnostiquée comme un choix délibéré. Le `skip` plutôt qu'un `warn` permanent est délibéré : c'est l'avertissement qu'on apprend à ignorer qui avait discrédité le préflight d'origine. `doctor` lit la clé dans le **fichier brut** et non via `Settings` — ce n'est pas un réglage du service, c'est la trace d'une décision d'installation. |
 | TST-006 | `[x]` | P0 | Couvrir la construction du manager en mode cluster | Un test construit `model_manager._build_manager()` avec `CLUSTER_MODE=cluster` et un `nodes.yaml` minimal ; il échoue sur le code d'avant COR-015 et passe après. **Item ajouté le 2026-07-30** (§0.10) : 633 tests passaient alors que le mode cluster ne démarrait pas. Complète TST-005, qui vise le parcours E2E et non la construction à l'import. |
 | TST-007 | `[x]` | P1 | Rendre voyant le garde-fou d'isolation du résolveur | `runtime_resolver.module_toplevel_imports()` voit les imports de modules frères, quelle que soit leur syntaxe, et un test le prouve **par mutation** : les quatre écritures de `import public_https` rendent le garde-fou rouge. **Item ajouté et livré le 2026-08-03**, découvert en livrant AUT-018. La fonction filtrait sur `node.level == 0` : `from . import public_https` lui était invisible, et `from bootstrap import public_https` — la forme employée par `planner` et `applier` — ne rendait que « bootstrap », interdit nulle part. Le garde-fou n'aurait donc pas attrapé l'ajout qu'il existe précisément pour empêcher : faire entrer réseau et sous-processus par un frère, en contournant le sens de dépendance posé par `bootstrap/__init__.py`. AUT-018 l'avait constaté et **contourné** par une recherche sur le texte du module ; ce contournement était faux dans les deux sens — aveugle à la forme absolue, et rouge dès qu'un simple commentaire nomme l'import. Les trois écritures sont désormais ramenées à une forme canonique `bootstrap.<frère>`, et `FORBIDDEN_SIBLING_IMPORTS` complète `FORBIDDEN_IMPORTS` : un test de complétude **recalcule** la fermeture transitive « module du paquet qui atteint un import interdit » depuis les sources et échoue si elle diverge de la constante, de sorte que la liste ne puisse pas vieillir en silence. Deux autres analyseurs d'imports du dépôt portaient le même angle mort et ont été corrigés (`test_bootstrap_llmfit.py`, `test_bootstrap_catalog.py`) ; celui de `test_bootstrap_install_report.py` traitait déjà `node.level` correctement. |
 
