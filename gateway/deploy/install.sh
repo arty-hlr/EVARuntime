@@ -20,6 +20,8 @@ source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
 source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 # shellcheck source=gpu-preflight-lib.sh
 source "$SCRIPT_DIR/deploy/gpu-preflight-lib.sh"
+# shellcheck source=env-template-lib.sh
+source "$SCRIPT_DIR/deploy/env-template-lib.sh"
 
 usage() {
     cat <<EOF
@@ -310,64 +312,11 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     INTERNAL_KEY=$(python3 -c "import secrets; print('llmgw-internal-' + secrets.token_urlsafe(32))")
     ADMIN_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 
-    cat > "$CONFIG_FILE" << EOF
-# LLM Gateway UPPA — Configuration
-# Généré le $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-# Modifier selon votre environnement.
-# Les modèles (chemins, paramètres llama-server) sont dans $DATA_DIR/models.yaml
-
-# ── Chemins ───────────────────────────────────────────────────────────────────
-MODELS_CONFIG_PATH=${DATA_DIR}/models.yaml
-LLAMA_SERVER_BIN=/usr/local/bin/llama-server
-DB_PATH=${DATA_DIR}/gateway.db
-LOG_DIR=${LOG_DIR}
-
-# ── Pool de ports multi-modèles ───────────────────────────────────────────────
-BASE_LLAMA_PORT=8081
-MAX_LOADED_MODELS=5
-
-# ── Budget VRAM (L40S 48 GB — adapter selon GPU) ─────────────────────────────
-TOTAL_VRAM_GB=48.0
-VRAM_OVERHEAD_GB=2.0
-VRAM_SAFETY_MARGIN=0.05
-
-# ── Modèle par défaut (vide = premier modèle activé du registre) ─────────────
-DEFAULT_MODEL_ID=
-
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-IDLE_TIMEOUT_SECONDS=300
-MODEL_LOAD_TIMEOUT_SECONDS=180
-IDLE_CHECK_INTERVAL_SECONDS=30
-
-# ── Queue d'admission VRAM ───────────────────────────────────────────────────
-CAPACITY_QUEUE_ENABLED=true
-CAPACITY_QUEUE_TIMEOUT_SECONDS=120
-CAPACITY_QUEUE_MAX_WAITERS=100
-CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
-
-# ── Sécurité (NE PAS PARTAGER) ────────────────────────────────────────────────
-INTERNAL_API_KEY=${INTERNAL_KEY}
-ADMIN_SECRET=${ADMIN_SECRET}
-
-# ── Réseau ────────────────────────────────────────────────────────────────────
-GATEWAY_HOST=127.0.0.1
-GATEWAY_PORT=8000
-LLAMA_SERVER_HOST=127.0.0.1
-CUDA_VISIBLE_DEVICES=0
-
-# ── Rate limiting par défaut ───────────────────────────────────────────────────
-DEFAULT_RPM_LIMIT=20
-DEFAULT_MONTHLY_TOKEN_LIMIT=0
-
-# ── Cluster multi-nœuds (désactivé par défaut — activer avec --cluster) ───────
-CLUSTER_MODE=local
-# CLUSTER_NODES_PATH=${CONFIG_DIR}/nodes.yaml
-# AGENT_SECRET=CHANGE_ME_GENERATE_WITH_python3_-c_import_secrets;_print(secrets.token_urlsafe(32))
-# CLUSTER_REQUEST_TIMEOUT=10.0
-# CLUSTER_LOAD_TIMEOUT=300.0
-# CLUSTER_HEALTH_INTERVAL=10
-# CLUSTER_HEALTH_FAILURES_TO_OFFLINE=3
-EOF
+    # Le rendu vit dans deploy/env-template-lib.sh : il porte les trois
+    # durcissements de SEC-002 et il est exerçable en test, hors root.
+    deploy_render_env_file \
+        "$CONFIG_FILE" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" \
+        "$MODELS_DIR" "$SCRIPT_DIR/models.yaml" "$INTERNAL_KEY" "$ADMIN_SECRET"
 
     chmod 640 "$CONFIG_FILE"
     chown root:"$SERVICE_USER" "$CONFIG_FILE"

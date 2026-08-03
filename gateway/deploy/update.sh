@@ -99,6 +99,8 @@ source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
 source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 # shellcheck source=venv-retention-lib.sh
 source "$SCRIPT_DIR/deploy/venv-retention-lib.sh"
+# shellcheck source=env-template-lib.sh
+source "$SCRIPT_DIR/deploy/env-template-lib.sh"
 
 usage() {
     cat <<EOF
@@ -282,6 +284,25 @@ else
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
     [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
 fi
+# ── Durcissements absents d'un environnement antérieur à SEC-002 ──────────────
+# `update.sh` ne régénère JAMAIS /etc/llm-gateway/env : un hôte installé avant
+# SEC-002 n'aurait donc jamais ces clés. Elles ne sont PAS ajoutées d'autorité —
+# écrire « CORS_ALLOW_ORIGINS= » sur une installation qui sert un client
+# navigateur la casserait en silence, au milieu d'une mise à jour. On signale,
+# l'opérateur tranche.
+MISSING_HARDENING=()
+for hardening_key in "${DEPLOY_HARDENING_KEYS[@]}"; do
+    if ! grep -qE "^[[:space:]]*${hardening_key}=" "$CONFIG_FILE"; then
+        MISSING_HARDENING+=("$hardening_key")
+    fi
+done
+if (( ${#MISSING_HARDENING[@]} > 0 )); then
+    warn "Durcissements SEC-002 absents de $CONFIG_FILE : ${MISSING_HARDENING[*]}"
+    warn "→ Cette mise à jour ne les ajoute pas : les poser sans vous demander"
+    warn "  pourrait couper un client navigateur ou refuser le démarrage."
+    warn "→ Voir docs/deployment.md §5, puis « evaruntime doctor » avant de démarrer."
+fi
+
 info "Préflight validé; mise à jour en mode $EFFECTIVE_MODE."
 
 prepare_model_registry() {

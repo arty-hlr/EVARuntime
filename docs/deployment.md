@@ -450,6 +450,30 @@ se trouvent dans `models.yaml` (voir section 6).
 sudo nano /etc/llm-gateway/env
 ```
 
+### Les trois durcissements posés par l'installateur
+
+`install.sh` écrit trois réglages de sécurité dans le fichier généré. Ils y sont
+**visibles et commentés** : un réglage absent du fichier n'existe pas pour
+l'exploitant.
+
+| Clé | Valeur posée | Ce qu'elle protège |
+|---|---|---|
+| `ALLOWED_MODEL_DIRS` | le répertoire de modèles créé par l'installateur **plus** les répertoires déclarés par le registre livré | seuls des `.gguf` de ces répertoires peuvent être déclarés dans `models.yaml` — barrière contre un chemin arbitraire injecté par l'API admin |
+| `CORS_ALLOW_ORIGINS` | **vide** = aucune origine navigateur | `*` autoriserait n'importe quelle page web à parler à la gateway. L'API est consommée par des clients serveur, que CORS ne concerne pas, et le dashboard admin est servi depuis la même origine |
+| `LLAMA_SERVER_MIN_BUILD` | `0` (aucun enforcement) | plancher de version `llama-server` contre GHSA-8947-pfff-2f3c. **À relever** : `doctor` le signale à chaque exécution tant qu'il vaut 0 |
+
+Deux pièges d'exploitation :
+
+- **`ALLOWED_MODEL_DIRS` est validée sur TOUTES les entrées de `models.yaml`,
+  activées ou non.** Une seule entrée hors allowlist et le service **refuse de
+  démarrer**. C'est pour cela que la valeur posée est dérivée du registre que
+  l'installateur pose, et non écrite en dur. Restreignez-la dès que vos chemins
+  réels sont fixés, puis validez avec `evaruntime doctor` avant de démarrer.
+- **`update.sh` ne pose pas ces clés sur une installation antérieure.** Il les
+  **signale** en préflight : ajouter `CORS_ALLOW_ORIGINS=` d'autorité couperait
+  un client navigateur existant au milieu d'une mise à jour. À vous de trancher,
+  clé par clé.
+
 ### Paramètres critiques à vérifier
 
 ```bash
