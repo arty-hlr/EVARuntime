@@ -164,7 +164,10 @@ DEFAULT_BINARY_NAME = "llama-server"
 
 # Nom du manifeste §6, posé À CÔTÉ du binaire et non à la racine : c'est le
 # couple (binaire, manifeste) qui doit rester solidaire d'une release à l'autre.
-MANIFEST_FILENAME = "provenance.yaml"
+# La constante vit chez le DÉCIDEUR (SEC-017) : c'est le résolveur qui doit
+# savoir où relire le manifeste sans dépendre de l'exécuteur qui l'a écrit. On
+# la réemprunte ici plutôt que d'en tenir un second exemplaire à jour à la main.
+MANIFEST_FILENAME = runtime_resolver.MANIFEST_FILENAME
 
 CURRENT_LINK_NAME = "current"
 RELEASE_PREFIX = "release-"
