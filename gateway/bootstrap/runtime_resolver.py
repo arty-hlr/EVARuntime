@@ -149,8 +149,17 @@ EVIDENCE_SPEC = "constat-§6"
 # aucune page de release. À confirmer contre la matrice amont avant de s'en
 # servir en production.
 EVIDENCE_ASSUMPTION = "hypothèse-à-confirmer"
+# Relevé par l'opérateur — ou par une CI — puis fourni via `ResolverPolicy`
+# (AUT-018, chargeur `runtime_variants`). Ce n'est ni une affirmation de §6, qui
+# ne connaît aucune empreinte, ni une hypothèse de ce module : c'est un constat
+# EXTERNE, dont le niveau de preuve appartient à celui qui l'a relevé. Le
+# chargeur impose ce niveau et interdit à un fichier de se réclamer de §6 : une
+# empreinte fournie ne devient pas une affirmation de la spécification.
+EVIDENCE_OPERATOR = "constat-opérateur"
 
-_EVIDENCE_LEVELS: frozenset[str] = frozenset({EVIDENCE_SPEC, EVIDENCE_ASSUMPTION})
+_EVIDENCE_LEVELS: frozenset[str] = frozenset({
+    EVIDENCE_SPEC, EVIDENCE_ASSUMPTION, EVIDENCE_OPERATOR,
+})
 
 # ── Signature du clone superficiel (§0.10) ────────────────────────────────────
 #
@@ -884,6 +893,26 @@ async def resolve_runtime(
                 "(security_floor_build=0) : LLAMA_SERVER_MIN_BUILD sera généré à 0 et le "
                 "garde-fou supply-chain restera inerte (cf. GHSA-8947-pfff-2f3c). Renseignez "
                 "le premier build patché connu."
+            ),
+        ))
+
+    # Origine de la matrice employée (AUT-018). Un lecteur du plan ne doit jamais
+    # confondre la matrice LIVRÉE avec EVARuntime — qui ne porte aucune empreinte —
+    # et une matrice FOURNIE par l'opérateur. Le constat n'est émis que si des
+    # variantes opérateur sont présentes : sans lui, tous les plans par défaut
+    # gagneraient un constat qui ne leur apprend rien.
+    operator_variants = tuple(v for v in policy.variants if v.evidence == EVIDENCE_OPERATOR)
+    if operator_variants:
+        findings.append(schema.Finding(
+            code="runtime_variants_operator_supplied",
+            level="info",
+            message=(
+                f"Matrice d'artefacts fournie par l'opérateur : {len(operator_variants)} variante(s) "
+                f"sur {len(policy.variants)} portent un constat opérateur et non la matrice livrée "
+                f"avec EVARuntime ({', '.join(v.label() for v in operator_variants)}). Leur empreinte "
+                "sera recontrôlée à l'installation ; en revanche, rien ici ne prouve que l'archive "
+                "désignée contient un llama-server compilé pour le backend annoncé — `--version` ne "
+                "le dit pas."
             ),
         ))
 
