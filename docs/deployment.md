@@ -954,6 +954,9 @@ tail -f /var/log/llm-gateway/llama-server.log
 
 # Filtrer les erreurs uniquement
 sudo journalctl -u llm-gateway -p err --since "1 hour ago"
+
+# Journal d'accès nginx — fichier DÉDIÉ, format rédigé (§16)
+tail -f /var/log/nginx/llm-gateway-access.log
 ```
 
 ---
@@ -2218,10 +2221,86 @@ La `location /v1/` est scindée :
 > dérivée du `load_timeout_seconds` maximal du registre, voir l'en-tête de
 > `gateway/deploy/nginx.conf`).
 
+### Journal d'accès rédigé — aucun nom d'utilisateur en clair (SEC-016)
+
+**Le problème.** La règle du projet est catégorique : ne jamais journaliser un
+`username`, un email ou le champ libre `notes`. L'anonymisation RGPD
+(`DELETE /admin/users/{username}`, §DEC-001) est vide de sens si un journal en
+garde copie. Le filtre posé sur `uvicorn.access` couvre la gateway, mais **nginx
+est devant et tient son propre journal** : son format `combined` par défaut écrit
+`$request`, c'est-à-dire la ligne de requête brute — méthode, URI complète *et*
+query string. Deux appels d'administration parfaitement normaux écrivaient donc
+le nom en clair dans `/var/log/nginx/access.log` :
+
+```
+10.1.2.3 - - [03/Aug/2026:11:22:33 +0200] "GET /admin/users/Jean-Dupont HTTP/1.1" 200 412 "-" "curl/8.4.0"
+10.1.2.3 - - [03/Aug/2026:11:22:34 +0200] "GET /admin/usage?username=Jean-Dupont HTTP/1.1" 200 8104 "-" "curl/8.4.0"
+```
+
+**La réponse.** *Pas* `access_log off` : couper le journal fermerait la fuite et
+rendrait tout diagnostic d'incident impossible. `nginx.conf` remplace `$request`
+par une reconstruction rédigée, via deux `map` et un `log_format eva_redacted` :
+
+```
+10.1.2.3 [03/Aug/2026:11:22:33 +0200] "GET /admin/users/<redacted> HTTP/1.1" 200 412 0.042 "curl/8.4.0"
+10.1.2.3 [03/Aug/2026:11:22:34 +0200] "GET /admin/usage?<redacted> HTTP/1.1" 200 8104 0.310 "curl/8.4.0"
+```
+
+Ce qui **reste** : adresse cliente, horodatage, méthode, forme de la route,
+protocole, statut, volume, durée (`$request_time`, absent de `combined` et
+précieux sur une passerelle d'inférence), user-agent. Ce qui **disparaît** :
+le seul segment de chemin et les seules valeurs de paramètres susceptibles de
+porter un nom.
+
+| Élément | Règle |
+|---------|-------|
+| Chemin | `map $uri $eva_log_path` — `/admin/users/<nom>` et `/admin/users/<nom>/keys` deviennent `/admin/users/<redacted>[/keys]`. Dérivé de `$uri` (pourcent-décodé), donc `/admin/users/%4Aean` est rédigé lui aussi. |
+| Query string | `map $args $eva_log_args` — **liste d'autorisation** : `from_date`, `to_date`, `limit`, `force`, `period` restent lisibles, **tout le reste est rédigé**, y compris un paramètre ajouté demain. |
+| Corps | Jamais journalisé. `$request_body` ne doit pas être ajouté : `email` et `notes` y transitent. |
+| `$http_referer`, `$remote_user` | Retirés de `combined` : le premier peut recopier l'URI d'une page admin, le second serait un identifiant si un `auth_basic` était ajouté. |
+
+La liste d'autorisation est **la même** que celle du filtre uvicorn
+(`_LOGGABLE_QUERY_PARAMS` dans `gateway/main.py`, SEC-010) — une seule politique,
+pas deux. Une seule divergence, assumée et toujours dans le sens conservateur :
+nginx ne sait pas itérer sur les paramètres dans un `map`, il décide donc sur la
+query string **entière**. Sur `?username=X&limit=50`, uvicorn journalise
+`username=<redacted>&limit=50`, nginx journalise `<redacted>` — nginx en dit
+moins, jamais plus. Si vous modifiez la liste d'un côté, modifiez l'autre :
+`gateway/tests/test_nginx_access_log_redaction.py` compare les deux et rougit
+sinon.
+
+**Fichier dédié.** Le journal part dans `/var/log/nginx/llm-gateway-access.log`
+et non dans `access.log`, pour ne pas mélanger deux formats dans un même fichier.
+Aucune configuration de rotation à ajouter : le logrotate nginx de Debian/Ubuntu
+porte sur `/var/log/nginx/*.log`. Les `access_log off` de `/health` et `/ready`
+sont **conservés** (sondes appelées en boucle).
+
+**Journal d'erreur.** nginx n'a pas d'équivalent de `log_format` pour son journal
+d'erreur : le format est figé dans le code et chaque ligne de niveau `error`
+traîne un contexte `request: "GET /admin/users/<nom> HTTP/1.1"` — l'URI brute,
+hors de portée des `map`. La seule parade native est le seuil : `location /admin/`
+porte `error_log /var/log/nginx/error.log crit;`. Conséquence à connaître —
+sur `/admin/` uniquement, trois messages disparaissent du journal d'erreur :
+`access forbidden by rule` (le filtrage IP campus), `upstream timed out` et
+`connect() failed`. Les événements correspondants restent visibles dans le
+journal d'accès rédigé sous leur statut (403, 502, 504), avec l'adresse cliente
+et la durée ; seul le commentaire de nginx est perdu. Les routes `/v1/*` gardent
+un journal d'erreur complet : leurs URI sont fixes et ne portent aucune donnée
+personnelle, et c'est là que se diagnostiquent les incidents d'inférence.
+
 Recharger après modification :
 
 ```bash
 sudo nginx -t && sudo nginx -s reload
+```
+
+Vérification manuelle de la rédaction, après reload :
+
+```bash
+curl -sk -H "X-Admin-Secret: $ADMIN_SECRET" \
+     "https://llm.eva.univ-pau.fr/admin/usage?username=CANARI-Prenom-Nom" >/dev/null
+sudo grep -c 'CANARI' /var/log/nginx/llm-gateway-access.log   # doit afficher 0
+sudo tail -1 /var/log/nginx/llm-gateway-access.log            # doit montrer « ?<redacted> »
 ```
 
 ---
