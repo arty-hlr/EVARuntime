@@ -47,15 +47,63 @@ l'artefact ne protège de rien ; activer avant d'avoir calibré publie une capac
 supposée ; préchauffer avant la recette conserverait en mémoire un modèle dont
 aucun token n'a encore été prouvé. La recette est donc exécutée par modèle,
 pendant une activation provisoire explicitement réversible (DEC-010).
+
+Ce que le plan peut prouver d'un artefact déjà présent — AUT-014
+----------------------------------------------------------------
+Sur le second déploiement réel, les deux GGUF du catalogue étaient DÉJÀ sur
+l'hôte, leur en-tête avait été lu par `gguf_meta`, et le plan annonçait quand
+même 837,1 Mio de téléchargement. L'information manquait au raisonnement, pas à
+la collecte.
+
+L'arbitrage tient dans une asymétrie : au moment du plan, la **divergence** d'un
+artefact se prouve pour rien, sa **conformité** ne se prouve pas sans le relire
+en entier.
+
+- Prouver qu'un fichier est FAUX coûte un `stat()` : une taille différente de
+  celle épinglée interdit mathématiquement au SHA-256 de correspondre. Le plan
+  le fait donc lui-même, et en fait un **bloqueur** — jamais une réutilisation
+  silencieuse, jamais un écrasement.
+- Prouver qu'un fichier est BON coûte la lecture intégrale de ses octets.
+  Hacher 40 Gio à chaque `bootstrap-plan` — commande qui n'écrit rien, qu'on
+  relance à volonté et que `doctor` appelle — échangerait un défaut d'affichage
+  contre un défaut de conception. Le plan ne hache donc **rien** : il exige une
+  ATTESTATION, le manifeste de provenance écrit par AUT-006 après vérification
+  octet à octet de l'ensemble complet contre les empreintes du catalogue.
+
+Le SHA-256 lui-même reste confronté au catalogue à l'application, par l'étape
+`verify_artifact` — qui, elle, lit bien tous les octets. Rien n'est troqué :
+le hachage est déplacé du plan (lecture seule, rapide, rejouable) vers
+l'application (une fois, au moment où l'artefact est mis en service).
+
+Quand les trois conditions sont réunies — ensemble complet, tailles conformes,
+manifeste cohérent —, l'étape `download_model` **disparaît** du plan, son volume
+est décompté du total, et le motif est écrit dans le détail de la
+`verify_artifact` qui reste seule. Dans tous les autres cas le téléchargement
+reste proposé : le téléchargeur revérifiera et ne transférera rien s'il n'y a
+rien à transférer, ce qui est le comportement conservateur.
+
+Pourquoi ce module importe `downloader`, alors que M1 n'exécute rien
+--------------------------------------------------------------------
+`provenance_path()` et `manifest_problems()` sont des fonctions pures, sans
+effet de bord, qui DÉFINISSENT ce qu'est un manifeste cohérent. Les réécrire ici
+créerait une seconde définition, et c'est toujours celle qui n'a pas été mise à
+jour qui laisse passer un artefact périmé : le plan crédirait une attestation que
+`verify_artifact` refuserait ensuite, produisant un plan applicable et voué à
+l'échec. C'est le raisonnement que `bootstrap/__init__.py` tient déjà pour
+`runtime_installer` → `runtime_resolver`, ici dans l'autre sens. Le jour où la
+séparation M1/M2 doit être rétablie strictement, ces deux fonctions ont leur
+place dans un module de contrat partagé, pas recopiées des deux côtés.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
 from bootstrap import catalog as catalog_mod
+from bootstrap import downloader as downloader_mod
 from bootstrap import gguf_meta
 from bootstrap import inventory as inventory_mod
 from bootstrap import llmfit as llmfit_mod
@@ -358,11 +406,46 @@ def _load_catalog(options: PlannerOptions) -> tuple[catalog_mod.Catalog | None, 
 # ── Étape 5 : sélection ───────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
+class ArtifactState:
+    """
+    Ce que le plan CONSTATE de l'ensemble déjà posé sur le disque (AUT-014).
+
+    Aucun champ n'est le résultat d'un hachage : tout vient de `stat()` et de la
+    relecture d'un manifeste JSON. Voir l'arbitrage en tête de module.
+    """
+    entry_id: str
+    expected: tuple[str, ...] = ()
+    present: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
+    divergent: tuple[str, ...] = ()
+    unsized: tuple[str, ...] = ()
+    attestation_path: str = ""
+    attestation_problems: tuple[str, ...] = ()
+    attested: bool = False
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "entry_id": self.entry_id,
+            "expected": list(self.expected),
+            "present": list(self.present),
+            "missing": list(self.missing),
+            "divergent": list(self.divergent),
+            "unsized": list(self.unsized),
+            "attestation_path": self.attestation_path,
+            "attestation_problems": list(self.attestation_problems),
+            "attested": self.attested,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class ModelChoice:
     """Un modèle retenu, avec ce qui a permis de le retenir."""
     entry: catalog_mod.CatalogEntry
     reason: str
     inspection: dict[str, Any] | None = None
+    artifact: ArtifactState | None = None
 
 
 @dataclass(frozen=True)
@@ -444,6 +527,19 @@ def _select_models(
             replace(choice, inspection=_inspection_for(choice, inspection))
             for choice in retained
         )
+
+    # AUT-014 — le rapprochement avec le disque vient APRÈS la sélection : il ne
+    # sert pas à retenir ou écarter un modèle, seulement à savoir ce qu'il reste
+    # réellement à faire pour celui qui est retenu.
+    retained = tuple(
+        replace(choice, artifact=_reconcile_artifact(choice.entry, options.models_dir))
+        for choice in retained
+    )
+    findings.extend(
+        _divergence_finding(choice.artifact)
+        for choice in retained
+        if choice.artifact is not None and choice.artifact.divergent
+    )
 
     return Selection(
         retained=retained,
@@ -593,6 +689,129 @@ def _inspection_for(
     return None
 
 
+# ── Artefacts déjà présents (AUT-014) ─────────────────────────────────────────
+
+def _reconcile_artifact(entry: catalog_mod.CatalogEntry, models_dir: Path) -> ArtifactState:
+    """
+    Confronte l'ensemble du catalogue à ce qui est réellement au chemin cible.
+
+    Ordre des verdicts, du plus grave au plus favorable — et il n'est pas
+    interchangeable :
+
+    1. **taille divergente** : le fichier porte le nom définitif mais pas la
+       taille épinglée. Son SHA-256 ne PEUT pas correspondre ; c'est une preuve,
+       pas une présomption. Bloquant, et ni réutilisé ni écrasé ;
+    2. **ensemble incomplet** : un GGUF splitté ou un couple poids + `mmproj`
+       est indivisible (§8). Créditer la moitié présente reviendrait à annoncer
+       un volume que rien n'atteste — un ensemble à moitié posé n'a d'ailleurs
+       jamais de manifeste, celui-ci n'étant écrit qu'en dernier. Le
+       téléchargement reste donc proposé **en entier** ;
+    3. **taille non épinglée** : sans `size_bytes` au catalogue, on ne peut rien
+       conclure d'un `stat()`. Conservateur ;
+    4. **pas d'attestation exploitable** : fichiers en place, tailles conformes,
+       mais aucun manifeste cohérent. Le plan ne présume pas de la conformité
+       qu'il n'a pas vérifiée ; le téléchargeur revérifiera, et ne transférera
+       rien s'il n'y a rien à transférer ;
+    5. **attesté** : tout est là, aux tailles du catalogue, et un manifeste
+       cohérent dit que ces octets ont été confrontés aux empreintes épinglées.
+       Le téléchargement disparaît du plan.
+    """
+    expected = tuple(f.name for f in entry.files)
+    present: list[str] = []
+    missing: list[str] = []
+    divergent: list[str] = []
+    unsized: list[str] = []
+
+    for cfile in entry.files:
+        target = models_dir / cfile.name
+        try:
+            size = target.stat().st_size if target.is_file() else None
+        except OSError:
+            # Un fichier présent mais illisible n'est pas une conformité : il est
+            # traité comme absent, et le téléchargement restera proposé.
+            size = None
+        if size is None:
+            missing.append(cfile.name)
+            continue
+        present.append(cfile.name)
+        if cfile.size_bytes is None:
+            unsized.append(cfile.name)
+        elif size != cfile.size_bytes:
+            divergent.append(cfile.name)
+
+    attestation = downloader_mod.provenance_path(models_dir, entry.id)
+    base = ArtifactState(
+        entry_id=entry.id,
+        expected=expected,
+        present=tuple(present),
+        missing=tuple(missing),
+        divergent=tuple(divergent),
+        unsized=tuple(unsized),
+        attestation_path=str(attestation),
+    )
+
+    if divergent:
+        return replace(base, reason=(
+            f"{', '.join(divergent)} : présent(s) au chemin cible mais de taille "
+            "différente de celle épinglée par le catalogue — le SHA-256 ne peut pas "
+            "correspondre"
+        ))
+
+    if missing:
+        if present:
+            return replace(base, reason=(
+                f"ensemble incomplet : {len(present)}/{len(expected)} fichier(s) présent(s), "
+                f"manque {', '.join(missing)}. L'ensemble est indivisible (§8) : rien n'est "
+                "décompté et le téléchargement reste proposé en entier"
+            ))
+        return replace(base, reason="aucun fichier de l'ensemble n'est présent au chemin cible")
+
+    if unsized:
+        return replace(base, reason=(
+            f"{', '.join(unsized)} : présent(s), mais le catalogue n'épingle pas leur taille — "
+            "rien ne permet de conclure sans relire tous leurs octets"
+        ))
+
+    problems = downloader_mod.manifest_problems(_read_attestation(attestation), entry)
+    if problems:
+        return replace(base, attestation_problems=problems, reason=(
+            "fichiers présents et de taille conforme, mais aucune attestation de "
+            f"vérification exploitable ({' ; '.join(problems)}) — le plan ne présume pas "
+            "d'une empreinte qu'il n'a pas vérifiée, le téléchargement reste proposé et "
+            "revérifiera sans rien transférer s'il n'y a rien à transférer"
+        ))
+
+    return replace(base, attested=True, reason=(
+        f"les {len(expected)} fichier(s) de l'ensemble sont déjà au chemin cible, à la "
+        "taille épinglée, et le manifeste de provenance atteste qu'ils ont été confrontés "
+        "octet à octet aux empreintes du catalogue — aucun octet à retélécharger"
+    ))
+
+
+def _read_attestation(path: Path) -> dict[str, Any] | None:
+    """Relit le manifeste de provenance. Une absence est normale, pas une erreur."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _divergence_finding(state: ArtifactState) -> schema.Finding:
+    """Un artefact provablement faux bloque le plan. Il n'est jamais réparé pour l'opérateur."""
+    return schema.Finding(
+        code="artefact_local_divergent",
+        level="fail",
+        message=(
+            f"« {state.entry_id} » : {', '.join(state.divergent)} — un fichier porte déjà "
+            "le nom définitif au chemin cible, mais sa taille diffère de celle épinglée par "
+            "le catalogue : son empreinte SHA-256 ne peut pas correspondre. Le plan ne le "
+            "réutilise pas et ne propose pas de l'écraser — déplacez-le ou supprimez-le "
+            "vous-même après avoir compris d'où il vient, puis régénérez le plan."
+        ),
+    )
+
+
 # ── Section « modèles retenus » ───────────────────────────────────────────────
 
 def _models_section(selection: Selection, options: PlannerOptions) -> schema.PlanSection:
@@ -615,6 +834,7 @@ def _models_section(selection: Selection, options: PlannerOptions) -> schema.Pla
                 "resources": choice.entry.resources.to_dict(),
                 "runtime_defaults": choice.entry.runtime.defaults.to_dict(),
                 "local_inspection": choice.inspection,
+                "local_artifact": choice.artifact.to_dict() if choice.artifact else None,
             }
             for choice in selection.retained
         ],
@@ -720,27 +940,49 @@ def _model_steps(choice: ModelChoice, options: PlannerOptions) -> list[schema.Pl
             reversible=True,
         ))
 
+    # AUT-014 — un ensemble déjà en place ET attesté ne se retéléchargue pas :
+    # l'étape `download_model` disparaît, son volume avec elle, et la
+    # `verify_artifact` qui reste seule porte le motif. Voir l'arbitrage en tête
+    # de module : le plan ne hache rien, il exige une attestation.
+    state = choice.artifact
+    attested = state is not None and state.attested
     files = ", ".join(f.name for f in entry.files)
-    steps.append(schema.PlanStep(
-        order=0,
-        action=schema.ACTION_DOWNLOAD_MODEL,
-        target=f"{entry.repo_id}@{entry.revision}",
-        detail=(
-            f"Télécharger l'ensemble indivisible ({files}) vers {target_dir}, à révision "
-            f"figée, par fichier temporaire puis renommage atomique."
-        ),
-        requires_root=True,
-        reversible=True,
-        estimated_bytes=entry.files.total_bytes,
-    ))
+
+    if not attested:
+        etat_local = (
+            f" État local : {state.reason}."
+            if state is not None and state.present and state.reason
+            else ""
+        )
+        steps.append(schema.PlanStep(
+            order=0,
+            action=schema.ACTION_DOWNLOAD_MODEL,
+            target=f"{entry.repo_id}@{entry.revision}",
+            detail=(
+                f"Télécharger l'ensemble indivisible ({files}) vers {target_dir}, à révision "
+                f"figée, par fichier temporaire puis renommage atomique.{etat_local}"
+            ),
+            requires_root=True,
+            reversible=True,
+            estimated_bytes=entry.files.total_bytes,
+        ))
 
     steps.append(schema.PlanStep(
         order=0,
         action=schema.ACTION_VERIFY_ARTIFACT,
         target=entry.id,
         detail=(
-            "Vérifier le SHA-256 de chaque fichier de l'ensemble contre le catalogue, "
-            "avant toute mise en service. Un écart annule l'installation du modèle."
+            (
+                f"Aucun téléchargement proposé : {state.reason}. "  # type: ignore[union-attr]
+                "Cette étape reste la seule preuve d'intégrité : elle relit les octets et "
+                "confronte le SHA-256 de chaque fichier de l'ensemble au catalogue, avant "
+                "toute mise en service. Un écart annule l'installation du modèle."
+            )
+            if attested else
+            (
+                "Vérifier le SHA-256 de chaque fichier de l'ensemble contre le catalogue, "
+                "avant toute mise en service. Un écart annule l'installation du modèle."
+            )
         ),
         requires_root=False,
         reversible=True,
