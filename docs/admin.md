@@ -1008,6 +1008,12 @@ mémoire de la gateway est restauré* :
   donc la divergence vient d'une édition manuelle et l'écraser serait une perte
   de données.
 
+Ces refus se lisent de la **même façon sur les trois verbes** (COR-029) :
+`POST`, `PATCH` et `DELETE` répondent tous `422` avec le message de refus dans
+`detail`. C'est ce message qui dit quoi corriger ; jusqu'à COR-029, `DELETE` le
+perdait dans un `500` au corps générique. Un identifiant inconnu reste, lui, un
+`404` — ce n'est pas la même panne et elle ne se répare pas pareil.
+
 Dans tous ces cas, corrigez le fichier à la main puis redémarrez la gateway (le
 registre relit `models.yaml` au démarrage). La gateway ne se rabat **jamais** sur
 une réécriture globale.

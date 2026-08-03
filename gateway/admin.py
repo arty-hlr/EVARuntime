@@ -822,6 +822,13 @@ async def delete_model(
         model_manager.registry.remove(model_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        # COR-029 — un refus d'écriture (`RegistryWriteRefused`, qui hérite de
+        # `ValueError` à dessein) se traite ici comme sur POST et PATCH : 422 et
+        # le message. Sans cette branche, il ressortait en 500 au corps
+        # générique, et la phrase qui dit à l'opérateur POURQUOI on a refusé —
+        # donc quoi corriger dans son fichier — était perdue.
+        raise HTTPException(status_code=422, detail=str(exc))
 
     log.info("Admin : modèle '%s' supprimé du registre", model_id)
     return {"message": f"Modèle '{model_id}' supprimé du registre."}
