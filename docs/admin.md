@@ -1794,6 +1794,47 @@ dans le document d'architecture.
 > relecture et avec `--apply`. `install.sh` reste chargé de poser le socle
 > système (utilisateur, venv, systemd, nginx et secrets).
 
+### Artefacts déjà présents sur l'hôte
+
+Sur une réinstallation, une bascule de branche ou un hôte de test, les GGUF du
+catalogue sont souvent **déjà là**. Le plan le constate et adapte sa séquence —
+il ne propose jamais de retélécharger ce qu'il sait déjà en place et vérifié.
+
+Trois situations, trois conduites :
+
+| État constaté au chemin cible | Ce que le plan propose |
+|---|---|
+| Ensemble complet, tailles conformes, manifeste de provenance cohérent | L'étape `download_model` **disparaît** ; son volume est décompté du total annoncé ; la `verify_artifact` reste seule et porte le motif |
+| Un fichier présent dont la **taille diffère** de celle épinglée | **Bloqueur** `artefact_local_divergent` : le plan sort en code 1, sans aucune étape. Le fichier n'est ni réutilisé ni écrasé — déplacez-le ou supprimez-le vous-même, puis régénérez le plan |
+| Tout autre cas — ensemble incomplet, taille non épinglée, manifeste absent ou périmé | Le téléchargement reste proposé **en entier**. L'ensemble est indivisible (§8) : une moitié présente n'est jamais créditée |
+
+La séquence devient alors, pour ce modèle :
+
+```text
+   2. [verify_artifact] qwen2.5-0.5b-instruct-q4_k_m
+      Aucun téléchargement proposé : les 1 fichier(s) de l'ensemble sont déjà au chemin cible, à la taille épinglée, et le manifeste de provenance atteste qu'ils ont été confrontés octet à octet aux empreintes du catalogue — aucun octet à retélécharger. Cette étape reste la seule preuve d'intégrité : elle relit les octets et confronte le SHA-256 de chaque fichier de l'ensemble au catalogue, avant toute mise en service. Un écart annule l'installation du modèle.
+```
+
+> **`bootstrap-plan` ne hache aucun octet.** Relire un GGUF de 40 Gio à chaque
+> planification transformerait une commande rapide et rejouable — appelée aussi
+> par `doctor` — en opération de plusieurs minutes. La conformité est donc
+> **attestée**, pas recalculée : le plan s'appuie sur le manifeste de provenance
+> écrit par un téléchargement vérifié antérieur, et c'est l'étape
+> `verify_artifact`, à l'application, qui relit réellement les octets et
+> confronte les empreintes. La **divergence**, elle, se prouve pour rien : une
+> taille différente interdit mathématiquement au SHA-256 de correspondre, et le
+> plan la traite lui-même.
+>
+> Conséquence à connaître : si les fichiers sont bien là mais qu'aucun manifeste
+> ne les atteste — GGUF recopiés à la main, par exemple —, le plan continue de
+> proposer le téléchargement. Ce n'est pas un gaspillage : le téléchargeur
+> revérifie et ne transfère rien s'il n'y a rien à transférer, puis écrit le
+> manifeste manquant.
+
+Le détail complet est lisible dans la sortie JSON, sous
+`sections[].data.retained[].local_artifact` : fichiers attendus, présents,
+manquants, divergents, chemin de l'attestation et motif en clair.
+
 ### Sortie JSON
 
 ```bash
