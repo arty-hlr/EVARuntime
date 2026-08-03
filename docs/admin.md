@@ -2207,6 +2207,28 @@ Deux propriétés à connaître :
   dit, parce que c'est exactement ce qu'un lecteur pressé prendrait pour un fait
   vérifié six mois plus tard.
 
+#### Ce qui prouve quoi (COR-026)
+
+L'action `verify_artifact` sert **deux domaines** : l'archive de `llama-server`
+et les ensembles de GGUF. Une étape ne prouve donc une condition que si sa
+**cible** appartient au domaine de cette condition — la vérification du GGUF
+d'un modèle ne prouve rien du runtime, et réciproquement. Une vérification dont
+la cible n'est rattachable à aucun domaine ne prouve rien du tout, et le rapport
+écrit pourquoi.
+
+Conséquence pratique, sur un hôte où les GGUF étaient **déjà présents et
+attestés** : `bootstrap-plan` n'émet plus d'étape `download_model` (AUT-014), et
+la condition « Modèle en place à révision figée » est alors tenue par la seule
+`verify_artifact` du modèle. Le rapport écrit littéralement *« aucune étape
+"download_model" n'était au programme »* — à ne pas confondre avec *« rien
+n'atteste cette condition »*, qui reste le verdict quand aucune vérification
+n'a eu lieu. Les deux se lisent différemment parce qu'ils ne se réparent pas de
+la même façon.
+
+Élargir ce que le rapport sait voir ne l'a pas rendu plus complaisant : une
+vérification en échec, sautée, simulée ou jamais tentée laisse sa condition
+**non satisfaite**, exactement comme avant.
+
 `bootstrap-apply` ne remplace pas `doctor` (§8). `doctor` répond à « cet hôte
 peut-il démarrer **maintenant** ? » en sondant le système vivant ; le rapport
 d'installation répond à « qu'a produit **cette** installation, et qu'est-ce qui
