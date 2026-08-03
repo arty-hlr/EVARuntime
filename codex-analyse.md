@@ -28,8 +28,8 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 |---|---|
 | **Où en est-on** | Jalons **M0 et M1 atteints**, M1 ayant été **exercé sur deux VMs réelles** (§0.13). La vague 6 a livré les sept modules d'exécution de M2 et son applicateur (§0.14). La **vague 7 a fermé les 18 items qui empêchaient encore ce parcours d'aboutir** (§0.15) : il ne reste **aucun blocage de code connu** sur la route du jalon |
 | **Ce qui bloque** | **Uniquement la preuve terrain.** Les trois blocages de code que la vague 6 laissait ouverts sont fermés : l'opérateur peut désormais **épingler son runtime** (AUT-018, la matrice livrée ne portait ni empreinte ni URL d'archive — l'installateur ne pouvait rien installer), `install.sh` accepte un hôte **sans GPU** par option explicite (OPS-012, qui avait fait contourner le script aux deux déploiements réels), et la condition n°1 du jalon **peut enfin être prouvée** (COR-030) |
-| **Ce qui vient ensuite** | Relever les **empreintes amont réelles** de `llama-server` dans un fichier `--runtime-variants`, puis exécuter `bootstrap-apply --apply` sur l'hôte cible mono-worker avec GPU et nginx de production. Passer `nginx -t` **avant tout reload** : `nginx.conf` a été modifiée par SEC-016 et n'a jamais été validée par le vrai binaire. Archiver le rapport et traiter tout écart terrain, au lieu de prononcer M2 sur les seuls tests |
-| **Santé des tests** | **2426 tests verts** (2363 gateway dont 1 `skip` propre + 63 node_agent), `ruff` et `bash -n` propres sur les deux composants. **+337 tests** pendant la seule vague 7 |
+| **Ce qui vient ensuite** | Relever les **empreintes amont réelles** de `llama-server` dans un fichier `--runtime-variants`, puis exécuter `bootstrap-apply --apply` sur l'hôte cible mono-worker avec GPU et nginx de production. Archiver le rapport et traiter tout écart terrain, au lieu de prononcer M2 sur les seuls tests |
+| **Santé des tests** | **2427 tests verts en CI** (2364 gateway + 63 node_agent), `ruff` et `bash -n` propres sur les deux composants. **+337 tests** pendant la seule vague 7. En local, un `skip` de plus : la machine de développement macOS n'a pas nginx, les runners CI si |
 | **Reste à faire** | 31 items sur 93 (§0.3). Le Lot B — bootstrap automatisé — est **intégralement livré**. Aucun P0 ouvert hors des lots performance et sécurité amont |
 | **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
 | **Ce que la vague 7 a appris** | Trois défauts de **sécurité et d'honnêteté** que 2089 tests verts n'avaient pas vus : SEC-008 était **intégralement contournée en production** par le journal d'accès d'uvicorn ; `_VERSION_RE` produisait une **attestation mensongère** de build plutôt qu'un refus ; et le rapport qui **prononce** le jalon prouvait sa condition n°1 par la vérification d'un GGUF de modèle. Aucun n'était visible en test — voir §0.15 |
@@ -78,9 +78,9 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir. **§0.15.1 remplace
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **2363** 🔬 (+ 1 `skip`) |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **2364** 🔬 (2363 + 1 `skip` en local) |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **2426** 🔬 |
+| **Total** | — | **354** | **2427** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
@@ -89,9 +89,18 @@ vague 5**, **+832 par la vague 6 et sa revue**, puis **+337 par la vague 7**,
 tous des régressions rouges avant correctif et vertes après. Les scripts de
 déploiement passent `bash -n`.
 
-L'unique `skip` est celui de SEC-016 : le test exécute réellement `nginx -t`
+L'unique `skip` local est celui de SEC-016 : le test exécute réellement `nginx -t`
 sur une configuration dérivée quand le binaire est présent, et se saute proprement
-sinon. Il **n'a pas encore trouvé de binaire** — voir la réserve de §0.15.
+sinon. La machine de développement macOS de ce dépôt n'a pas nginx ; **les
+runners CI GitHub, si**. Le test y est donc exécuté à chaque passe, et il passe.
+
+Ce détail a coûté un aller-retour de CI, et il valait la peine : la première
+passe a échoué **après** que nginx eut répondu `syntax is ok`, sur
+`open() "/run/nginx.pid" failed (13: Permission denied)` — le harnais ne
+déportait pas le fichier de pid, inaccessible à un utilisateur non privilégié.
+Le défaut était dans le test, pas dans la configuration. Sa docstring affirmait
+par ailleurs que « c'est le cas des runners CI » de ne pas avoir nginx : une
+affirmation confortable, jamais vérifiée, et fausse. Les deux sont corrigés.
 
 La vague 6 a produit **191 mutations appliquées et rejouées** — le code
 réellement cassé, la suite relancée, la garde remise. **Onze ont survécu** au
@@ -1210,14 +1219,15 @@ depuis la CLI serait le candidat évident, et il aurait attrapé les quatre.
   n°1 de M2 n'est donc plus une impasse de configuration — elle est une preuve
   terrain manquante, ce qui n'est pas la même chose mais n'est pas non plus
   acquis.
-- **`nginx.conf` a été modifiée et jamais validée par `nginx -t`.** Le binaire
-  est absent de l'hôte de développement ; le test l'exécute réellement quand il
-  est présent et se saute sinon. La configuration a été validée par
-  `crossplane`, le parseur officiel de nginx Inc. — contextes, arités,
-  tokenisation — mais **pas** la sémantique d'exécution : héritage
-  `server` → `location` d'`access_log`, priorité de l'`access_log off`, contenu
-  réel du journal d'erreur à `crit`. **Passer `nginx -t` avant tout reload.**
-  C'est un risque *introduit* par cette vague, pas hérité.
+- **`nginx.conf` est validée par `nginx -t`, mais sa sémantique d'exécution ne
+  l'est pas.** Cette réserve a changé de statut en cours d'ouverture de PR : le
+  chantier la donnait pour non validée, l'hôte de développement n'ayant pas
+  nginx — mais **les runners CI l'ont**, et la CI exécute donc réellement le
+  test à chaque passe. La syntaxe, les regex de `map` comprises, est acceptée
+  par un vrai nginx. Ce qui reste **non démontré** : l'héritage
+  `server` → `location` d'`access_log`, la priorité de l'`access_log off`, et
+  le contenu réel du journal d'erreur à `crit`. `nginx -t` valide ce que nginx
+  sait lire, pas ce qu'il écrira au reload.
 - **La parité CI Python 3.11 n'a été rejouée que par un chantier sur huit**
   (COR-020). Le reste est mesuré sur le venv local 3.14.
 - **`--allow-container` est descriptible mais non applicable** : `server_manager`
@@ -1246,7 +1256,7 @@ Conditions de §13 et leur état réel au 2026-08-03. **Cette table remplace
 | Licence acceptée | `[~]` | Inchangé — relecture stricte (SEC-011), aucune acceptation réelle produite sur l'hôte cible |
 | Calibration effectuée | `[~]` | Inchangé — sondes concrètes, aucune mesure GPU terrain archivée |
 | Modèle préchauffé | `[~]` | Inchangé — raccord livré, jamais exécuté sur le modèle cible |
-| Appel E2E réussi | `[~]` | **Nouvelle réserve** : `nginx.conf` a changé (SEC-016) et n'a pas été validée par `nginx -t`. Le vrai chemin public reste à traverser |
+| Appel E2E réussi | `[~]` | `nginx.conf` a changé (SEC-016) et est désormais **validée par `nginx -t` en CI**, runners GitHub livrant le binaire. Reste inchangé : le vrai chemin public n'a jamais été traversé par la recette, et la sémantique d'exécution de la configuration n'est pas démontrée |
 | Rapport final produit | `[x]` | COR-026 et COR-030 le rendent **juste** : chaque condition est prouvée par les étapes qui la concernent, cible comprise, et une installation réussie n'est plus classée `partial` |
 
 **Décision de sortie : toujours refusée, et pour une seule raison.** Ce n'est
@@ -2216,7 +2226,7 @@ d'éviter les boucles de rollback dues à une machine momentanément chargée.
 | SEC-013 | `[x]` | P1 | Refuser les faux booléens dans `models.yaml` | `enabled` accepte uniquement un booléen YAML réel ; `"true"`, `"false"`, nombres, listes et objets sont refusés à la charge, y compris sur une entrée voisine pendant le calcul de capacité du bootstrap. **Item ajouté et livré le 2026-08-01** : les coercitions `bool(...)` rendaient toute chaîne non vide active. Le défaut historique `enabled` absent → `true` est conservé. |
 | SEC-014 | `[x]` | **P0** | Fermer le SSRF et le DNS rebinding du téléchargement des modèles | L'endpoint et chaque redirection HTTPS refusent identifiants, loopback, link-local, réseaux privés et adresses non globales ; toute réponse DNS mixte est refusée en bloc et la connexion TCP emploie exactement les adresses validées avec SNI/certificat sur le hostname d'origine. Le transport n'hérite d'aucun proxy d'environnement. **Item ajouté et livré le 2026-08-01**, découvert pendant la relecture finale parallèle : le SHA-256 protégeait la promotion du GGUF, pas l'effet réseau de la requête sortante. Le connecteur est partagé avec SEC-012 afin que les deux flux portent la même politique. |
 | SEC-015 | `[ ]` | P1 | Rendre effectif le plancher `LLAMA_SERVER_MIN_BUILD` après installation du runtime | Après un `bootstrap-apply` qui pose un runtime, l'environnement du service porte un plancher de build **non nul**, dérivé de la politique de sécurité et non de l'épinglage. **Item ajouté le 2026-08-03** : SEC-002 pose enfin la clé dans l'environnement généré, mais à `0` — un script bash ne peut pas connaître le build de façon fiable. Le garde-fou anti-`GHSA-8947-pfff-2f3c` est donc désormais **visible et toujours inerte** sur toute installation issue du script, ce qui prive SEC-009 de son effet sur ces hôtes. Piège à éviter, relevé en livrant AUT-018 : propager la **version installée** serait faux — `derive_min_build()` documente que le plancher doit accepter tout binaire au moins aussi patché, pas seulement celui que le bootstrap a posé. La valeur à propager est `sections.runtime.data.min_build` du plan, qui porte déjà `--min-build`. Périmètre à trancher : `bootstrap-apply` n'a aujourd'hui **aucune** capacité d'écriture d'environnement. |
-| SEC-016 | `[x]` | P1 | Rédiger l'URI dans les journaux d'accès nginx | **Item ajouté et livré le 2026-08-03**, découvert en livrant SEC-010 : la rédaction s'arrêtait à la gateway, nginx journalisant l'URI selon sa propre configuration. Deux `map` et un `log_format` dédié rédigent le chemin et la query string sur les **deux** blocs `server` — le `:80` fuyait aussi, la redirection `301` journalisant l'URI avant de rediriger. Le journal reste exploitable en incident : adresse, méthode, **forme de la route**, statut, volume, user-agent, plus la **durée** qui manquait à `combined`. `$http_referer` (qui pouvait recopier l'URI d'une page admin en contournant toute la rédaction du chemin) et `$remote_user` sont retirés. Le **journal d'erreur** est concerné et nginx n'a pas d'`error_log_format` : seule parade native, `error_log … crit;` sur la seule `location /admin/`, coût assumé et documenté. La liste des paramètres autorisés est comparée par **égalité stricte** à `main._LOGGABLE_QUERY_PARAMS` : modifier un côté fait rougir l'autre. Divergence unique et conservatrice — nginx ne sachant pas itérer sur les paramètres, il rédige la query entière, donc en révèle toujours moins qu'uvicorn. **Réserve** : `nginx -t` n'a pas pu être exécuté (nginx absent de l'hôte de développement, test `skip` propre) ; la conf a été validée par `crossplane`, le parseur officiel de nginx Inc. — contextes, arités et tokenisation, pas la sémantique d'exécution. |
+| SEC-016 | `[x]` | P1 | Rédiger l'URI dans les journaux d'accès nginx | **Item ajouté et livré le 2026-08-03**, découvert en livrant SEC-010 : la rédaction s'arrêtait à la gateway, nginx journalisant l'URI selon sa propre configuration. Deux `map` et un `log_format` dédié rédigent le chemin et la query string sur les **deux** blocs `server` — le `:80` fuyait aussi, la redirection `301` journalisant l'URI avant de rediriger. Le journal reste exploitable en incident : adresse, méthode, **forme de la route**, statut, volume, user-agent, plus la **durée** qui manquait à `combined`. `$http_referer` (qui pouvait recopier l'URI d'une page admin en contournant toute la rédaction du chemin) et `$remote_user` sont retirés. Le **journal d'erreur** est concerné et nginx n'a pas d'`error_log_format` : seule parade native, `error_log … crit;` sur la seule `location /admin/`, coût assumé et documenté. La liste des paramètres autorisés est comparée par **égalité stricte** à `main._LOGGABLE_QUERY_PARAMS` : modifier un côté fait rougir l'autre. Divergence unique et conservatrice — nginx ne sachant pas itérer sur les paramètres, il rédige la query entière, donc en révèle toujours moins qu'uvicorn. **Validé par `nginx -t` en CI** : contrairement à ce que le chantier supposait, les runners GitHub livrent nginx et le test s'y exécute réellement — la syntaxe, regex de `map` comprises, est acceptée. La première passe de CI a d'ailleurs échoué **après** un `syntax is ok`, sur `open() "/run/nginx.pid" failed` : le harnais ne déportait pas le fichier de pid, défaut du test et non de la configuration. **Réserve maintenue** : `nginx -t` valide ce que nginx sait lire, pas ce qu'il écrira au reload — héritage `server` → `location` d'`access_log`, priorité de l'`access_log off` et contenu réel du journal d'erreur à `crit` restent non démontrés. |
 | SEC-017 | `[x]` | P1 | Raccorder le recoupement du manifeste au parcours de l'opérateur | `planner._resolve_runtime` relit le manifeste §6 posé à côté du binaire par `runtime_installer` (AUT-016) et le fournit au résolveur, de sorte que le recoupement version / commit / backend / empreinte de SEC-009 ait réellement lieu. **Item ajouté et livré le 2026-08-03**, découvert en relisant SEC-009. Le volet b de SEC-009 est juste et testé — `_judge_existing_binary` recoupe le manifeste contre le binaire au lieu de le croire sur parole, et `attested_binary_sha256()` extrait l'empreinte consignée — mais **aucun appelant ne fournissait jamais `existing_manifest`** : le planificateur ne passait que `existing_binary`. Le chemin corrigé n'était donc exercé que par les tests, et le trou, réel, restait **dormant** — il se serait ouvert silencieusement le jour où quelqu'un aurait raccordé la lecture. C'est la **troisième occurrence** du motif « code juste, inatteignable depuis le parcours réel » après AUT-004 et AUT-018. `read_existing_attestation()` porte la lecture, ne lève jamais, et rend un **constat nommé** par issue : `runtime_manifest_absent` (`info`, avec le chemin où le manifeste était attendu — cas nominal d'un binaire compilé à la main), `runtime_manifest_unreadable` (`warn` : droits, troncature, YAML invalide), `runtime_manifest_invalid` (`warn` : relu mais refusé par les règles de §6). Fail-closed dans les trois cas : `manifest` vaut `None`, l'absence ne vaut jamais attestation, et le refus de réutilisation vient du recoupement aval. `MANIFEST_FILENAME` vit désormais chez le **décideur** — c'est le résolveur qui définit le manifeste, et le sens de dépendance de `bootstrap/__init__.py` lui interdit d'importer l'installateur ; un test recoupe les deux constantes pour qu'elles ne divergent pas. La lecture disque est déportée hors de la boucle d'événements. |
 | SEC-008 | `[x]` | P1 | Ne pas journaliser les noms d'utilisateur | Aucun `log.*` de la gateway ne porte de nom d'utilisateur ; le chemin de requête est rédigé. **Item ajouté le 2026-07-30**, découvert en livrant COR-002 : anonymiser en base est sans effet si le journal garde une copie du nom. |
 
