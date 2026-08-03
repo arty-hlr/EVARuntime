@@ -22,6 +22,8 @@ source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 source "$SCRIPT_DIR/deploy/gpu-preflight-lib.sh"
 # shellcheck source=env-template-lib.sh
 source "$SCRIPT_DIR/deploy/env-template-lib.sh"
+# shellcheck source=code-layout-lib.sh
+source "$SCRIPT_DIR/deploy/code-layout-lib.sh"
 
 usage() {
     cat <<EOF
@@ -267,13 +269,7 @@ info "Python $PYTHON_VERSION OK."
 # ── 4. Copie du code source ───────────────────────────────────────────────────
 
 info "Copie du code source vers $INSTALL_DIR…"
-# Copier tous les fichiers Python
-cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
-
-# Package cluster/ — requis en CLUSTER_MODE=cluster (importé par model_manager)
-mkdir -p "$INSTALL_DIR/cluster"
-cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
+deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"
 
 # Fichiers statiques (dashboard admin servi par /admin/dashboard)
 if [[ -d "$SCRIPT_DIR/static" ]]; then
@@ -284,7 +280,8 @@ fi
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR"
 chmod -R 640 "$INSTALL_DIR"/*.py
 chmod 640 "$INSTALL_DIR/cluster"/*.py
-chmod 750 "$INSTALL_DIR/cluster"
+chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
+chmod 750 "$INSTALL_DIR/cluster" "$INSTALL_DIR/bootstrap"
 if [[ -d "$INSTALL_DIR/static" ]]; then
     find "$INSTALL_DIR/static" -type d -exec chmod 755 {} \;
     find "$INSTALL_DIR/static" -type f -exec chmod 644 {} \;

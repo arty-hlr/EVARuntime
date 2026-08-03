@@ -534,6 +534,27 @@ def test_un_marqueur_de_preuve_reconnu_n_est_pas_une_hypothese():
     assert rapport.hypotheses() == ()
 
 
+def test_un_constat_operateur_n_est_pas_reclasse_en_hypothese():
+    """Le niveau produit par AUT-018 appartient au contrat partagé du plan."""
+    plan = plan_document(sections=(
+        section_runtime(
+            evidence=sc.EVIDENCE_OPERATOR,
+            note="Empreinte relevée par sha256sum le 2026-08-03.",
+        ),
+    ))
+    rapport = ir.build_install_report(
+        plan_document=plan,
+        execution_report=journal(plan, [ex.STEP_DONE] * len(ACTIONS_M2)),
+        now=horloge(),
+    )
+
+    claims = rapport.evidence_claims()
+    assert len(claims) == 1, "contrôle positif : le rapport voit le constat opérateur"
+    assert claims[0].marker == sc.EVIDENCE_OPERATOR
+    assert claims[0].verified is True
+    assert rapport.hypotheses() == ()
+
+
 def test_une_hypothese_declaree_reste_visible():
     plan = plan_document(sections=(
         section_runtime(evidence="hypothèse-à-confirmer", note="Archive supposée publiée."),

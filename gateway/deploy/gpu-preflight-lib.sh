@@ -19,6 +19,15 @@
 # `gateway/doctor.py` lit EXACTEMENT cette clé (doctor.GPU_WAIVER_ENV_KEY).
 GPU_WAIVER_ENV_KEY="ALLOW_NO_GPU"
 
+# Même grammaire que `doctor.gpu_waiver_declared()`. La décision ne doit pas
+# changer selon que le fichier d'environnement est lu par Python ou par bash.
+deploy_gpu_waiver_declared() {
+    case "${1:-}" in
+        1|true|TRUE|True|yes|YES|Yes|on|ON|On) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # deploy_gpu_verdict <mode> <allow_no_gpu> [commande_de_sonde]
 #
 # Écrit le verdict sur stdout et retourne 0 :
@@ -42,7 +51,7 @@ deploy_gpu_verdict() {
         printf 'detected\n'
         return 0
     fi
-    if [[ "$allow_no_gpu" == true ]]; then
+    if deploy_gpu_waiver_declared "$allow_no_gpu"; then
         printf 'waived\n'
         return 0
     fi

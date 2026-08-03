@@ -733,16 +733,17 @@ class ModelRegistry:
 
         `precedent` est l'état mémoire d'avant la mutation : un refus le restaure,
         pour qu'une écriture refusée ne laisse jamais la mémoire en avance sur le
-        disque.
+        disque. Il sert aussi de verrou optimiste : si le sens du fichier a changé
+        depuis son chargement, la mutation refuse d'écraser l'édition concurrente.
         """
         try:
-            self._write_preserving_layout()
+            self._write_preserving_layout(precedent)
         except Exception as exc:
             self._models = precedent
             log.error("Échec de la sauvegarde du registre %s : %s", self._path, exc)
             raise
 
-    def _write_preserving_layout(self) -> None:
+    def _write_preserving_layout(self, precedent: dict[str, ModelDefinition]) -> None:
         """Corps de `_save()`, sans la restauration mémoire (cf. sa docstring)."""
         rw = _text_write_policy()
         horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -755,7 +756,7 @@ class ModelRegistry:
                 "écrit : la gateway ne remplace pas un registre qu'elle ne comprend pas."
             ) from exc
 
-        texte, attendu = self._plan_registry_text(rw, document, horodatage)
+        texte, attendu = self._plan_registry_text(rw, document, horodatage, precedent)
 
         if document.exists and texte == document.text:
             # Mutation sans effet sur le disque (valeur réécrite à l'identique) :
@@ -778,7 +779,13 @@ class ModelRegistry:
 
     # ── Planification de l'écriture ───────────────────────────────────────────
 
-    def _plan_registry_text(self, rw, document, horodatage: str) -> tuple[str, dict]:
+    def _plan_registry_text(
+        self,
+        rw,
+        document,
+        horodatage: str,
+        precedent: dict[str, ModelDefinition],
+    ) -> tuple[str, dict]:
         """
         Rend `(texte candidat, document attendu)` pour l'état mémoire courant.
 
@@ -802,6 +809,8 @@ class ModelRegistry:
                     "déjà incohérent, la gateway n'y touchera pas."
                 )
             positions[identifiant] = position
+
+        self._assert_disk_matches_precedent(brutes, positions, precedent)
 
         retires = [identifiant for identifiant in positions if identifiant not in self._models]
         ajoutes = [identifiant for identifiant in self._models if identifiant not in positions]
@@ -854,6 +863,60 @@ class ModelRegistry:
         attendu = copy.deepcopy(document.data) if document.exists else {}
         attendu["models"] = restantes
         return texte, attendu
+
+    def _assert_disk_matches_precedent(
+        self,
+        brutes: list[dict],
+        positions: dict[str, int],
+        precedent: dict[str, ModelDefinition],
+    ) -> None:
+        """
+        Refuse une mutation si le registre a changé depuis son chargement.
+
+        Les commentaires peuvent évoluer : ils ne changent pas le document YAML
+        normalisé et seront préservés par la retouche textuelle. Une différence
+        de valeur, d'entrée ajoutée ou supprimée est en revanche une édition
+        concurrente ; la gateway ne peut pas distinguer une intention opérateur
+        d'un ancien snapshot mémoire, donc elle demande un `reload()` explicite.
+        """
+        ids_disque = set(positions)
+        ids_precedents = set(precedent)
+        if ids_disque != ids_precedents:
+            ajoutes = sorted(ids_disque - ids_precedents)
+            retires = sorted(ids_precedents - ids_disque)
+            details = []
+            if ajoutes:
+                details.append(f"entrées ajoutées sur disque : {ajoutes}")
+            if retires:
+                details.append(f"entrées retirées du disque : {retires}")
+            raise RegistryWriteRefused(
+                f"{self._path} a changé depuis son chargement ({'; '.join(details)}). "
+                "La mutation admin est refusée pour ne pas écraser une édition concurrente ; "
+                "rechargez le registre puis rejouez-la. Rien n'a été écrit."
+            )
+
+        for identifiant, modele_precedent in precedent.items():
+            brute = brutes[positions[identifiant]]
+            try:
+                actuel = self._parse_entry(brute).to_dict()
+            except (ValueError, TypeError) as exc:
+                raise RegistryWriteRefused(
+                    f"{self._path} : l'entrée « {identifiant} » modifiée sur disque n'est "
+                    f"plus lisible ({exc}). Rien n'a été écrit."
+                ) from exc
+            attendu = modele_precedent.to_dict()
+            if actuel == attendu:
+                continue
+            champs = sorted(
+                champ for champ in set(actuel) | set(attendu)
+                if actuel.get(champ) != attendu.get(champ)
+            )
+            raise RegistryWriteRefused(
+                f"{self._path} : l'entrée « {identifiant} » a changé depuis son chargement "
+                f"(champs : {champs}). La mutation admin est refusée pour ne pas écraser "
+                "une édition concurrente ; rechargez le registre puis rejouez-la. Rien n'a "
+                "été écrit."
+            )
 
     def _entry_delta(
         self, brute: dict, model: ModelDefinition

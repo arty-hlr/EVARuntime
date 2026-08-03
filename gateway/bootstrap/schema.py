@@ -86,6 +86,13 @@ FindingLevel = Literal["info", "warn", "fail"]
 _STATUSES: frozenset[str] = frozenset({"ok", "warn", "fail", "skip"})
 _LEVELS: frozenset[str] = frozenset({"info", "warn", "fail"})
 
+# Niveaux de preuve partagés par les producteurs du plan et son rapport final.
+# Les centraliser dans le contrat évite qu'un nouveau constat devienne une
+# hypothèse simplement parce qu'un consommateur maintient sa propre liste.
+EVIDENCE_SPEC = "constat-§6"
+EVIDENCE_ASSUMPTION = "hypothèse-à-confirmer"
+EVIDENCE_OPERATOR = "constat-opérateur"
+
 # Sections attendues d'un plan complet. Une section absente n'est pas une erreur
 # de structure — le plan la déclare `skip` avec sa raison — mais le nom, lui,
 # doit appartenir à cet ensemble : c'est ce qui empêche deux producteurs de

@@ -394,3 +394,50 @@ def test_refus_quand_un_champ_non_scalaire_diverge_du_disque(tmp_path):
         registre.update("m1", vram_gb=9.0)
 
     assert chemin.read_text(encoding="utf-8") == avant
+
+
+def test_refus_quand_un_scalaire_diverge_du_disque(tmp_path):
+    """
+    Une édition manuelle de description ne doit pas être annulée par une mise à
+    jour admin de vram_gb construite depuis l'ancien snapshot mémoire.
+    """
+    registre, chemin = _simple_registry(
+        tmp_path, [_entry(description="description chargée", enabled=False)]
+    )
+    chemin.write_text(
+        yaml.safe_dump({
+            "models": [_entry(description="édition opérateur", enabled=False)]
+        }),
+        encoding="utf-8",
+    )
+    avant = chemin.read_text(encoding="utf-8")
+
+    with pytest.raises(RegistryWriteRefused, match="édition concurrente"):
+        registre.update("m1", vram_gb=9.0)
+
+    assert chemin.read_text(encoding="utf-8") == avant
+    assert registre.get("m1").description == "description chargée"
+    assert registre.get("m1").vram_gb == 5.0
+
+    # Après rechargement explicite, l'intention opérateur fait partie du nouveau
+    # snapshot et une mutation indépendante la préserve.
+    registre.reload()
+    registre.update("m1", vram_gb=9.0)
+    relu = ModelRegistry(config_path=chemin).get("m1")
+    assert relu.description == "édition opérateur"
+    assert relu.vram_gb == 9.0
+
+
+def test_une_edition_concurrente_de_commentaire_reste_autorisee(tmp_path):
+    """Le verrou optimiste porte sur le sens YAML, pas sur la mise en page."""
+    registre, chemin = _simple_registry(tmp_path, [_entry()])
+    chemin.write_text(
+        "# commentaire ajouté pendant l'exécution\n" + chemin.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    registre.update("m1", vram_gb=9.0)
+
+    texte = chemin.read_text(encoding="utf-8")
+    assert "# commentaire ajouté pendant l'exécution" in texte
+    assert ModelRegistry(config_path=chemin).get("m1").vram_gb == 9.0

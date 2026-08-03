@@ -101,6 +101,10 @@ source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 source "$SCRIPT_DIR/deploy/venv-retention-lib.sh"
 # shellcheck source=env-template-lib.sh
 source "$SCRIPT_DIR/deploy/env-template-lib.sh"
+# shellcheck source=gpu-preflight-lib.sh
+source "$SCRIPT_DIR/deploy/gpu-preflight-lib.sh"
+# shellcheck source=code-layout-lib.sh
+source "$SCRIPT_DIR/deploy/code-layout-lib.sh"
 
 usage() {
     cat <<EOF
@@ -268,12 +272,22 @@ fi
 [[ -f "$CONFIG_FILE" ]] || error "Configuration introuvable : $CONFIG_FILE"
 required=()
 required+=("${UPDATE_REQUIRED_COMMANDS[@]}")
-[[ "$EFFECTIVE_MODE" == "cluster" ]] || required+=("${UPDATE_REQUIRED_COMMANDS_LOCAL[@]}")
 [[ "$RUN_SMOKE_TEST" != true ]] || required+=("${UPDATE_REQUIRED_COMMANDS_SMOKE[@]}")
 for command_name in "${required[@]}"; do
     command -v "$command_name" &>/dev/null || \
         error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
+UPDATE_ALLOW_NO_GPU="$(deploy_env_value "$CONFIG_FILE" "$GPU_WAIVER_ENV_KEY")"
+UPDATE_GPU_VERDICT="$(
+    deploy_gpu_verdict \
+        "$EFFECTIVE_MODE" "$UPDATE_ALLOW_NO_GPU" "${UPDATE_REQUIRED_COMMANDS_LOCAL[0]}"
+)" || error "Préflight local : hôte sans GPU et absence non assumée dans $CONFIG_FILE."
+if [[ "$UPDATE_GPU_VERDICT" == "waived" ]]; then
+    warn "Hôte SANS GPU : dérogation persistée respectée ($GPU_WAIVER_ENV_KEY=true)."
+elif [[ "$UPDATE_GPU_VERDICT" == "detected" ]] && \
+        deploy_gpu_waiver_declared "$UPDATE_ALLOW_NO_GPU"; then
+    warn "GPU détecté mais $GPU_WAIVER_ENV_KEY=true subsiste : doctor signalera cette renonciation périmée."
+fi
 if [[ "$RUN_SMOKE_TEST" == true ]]; then
     [[ -f "$SMOKE_TEST_SCRIPT" ]] || \
         error "Préflight : recette du premier token introuvable ($SMOKE_TEST_SCRIPT). Utilisez --skip-smoke-test en connaissance de cause."
@@ -351,16 +365,19 @@ restore_previous_service_unit() {
 
 restore_code_snapshot() {
     local snapshot="$1"
-    cp "$snapshot"/*.py "$INSTALL_DIR/"
-    cp "$snapshot/requirements.txt" "$INSTALL_DIR/"
-    rm -rf "$INSTALL_DIR/cluster" "$INSTALL_DIR/static"
-    [[ ! -d "$snapshot/cluster" ]] || cp -a "$snapshot/cluster" "$INSTALL_DIR/cluster"
+    deploy_restore_gateway_code "$snapshot" "$INSTALL_DIR"
+    rm -rf "$INSTALL_DIR/static"
     [[ ! -d "$snapshot/static" ]] || cp -a "$snapshot/static" "$INSTALL_DIR/static"
-    rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
     chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
     [[ ! -d "$INSTALL_DIR/cluster" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+    [[ ! -d "$INSTALL_DIR/bootstrap" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/bootstrap"
     [[ ! -d "$INSTALL_DIR/static" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/static"
     chmod 640 "$INSTALL_DIR"/*.py
+    [[ ! -d "$INSTALL_DIR/cluster" ]] || chmod 750 "$INSTALL_DIR/cluster"
+    [[ ! -d "$INSTALL_DIR/cluster" ]] || chmod 640 "$INSTALL_DIR/cluster"/*.py
+    [[ ! -d "$INSTALL_DIR/bootstrap" ]] || chmod 750 "$INSTALL_DIR/bootstrap"
+    [[ ! -d "$INSTALL_DIR/bootstrap" ]] || \
+        chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
     chmod 644 "$INSTALL_DIR/requirements.txt"
 }
 
@@ -557,9 +574,7 @@ fi
 # checkout Git de l'opérateur et ne le laisse pas en detached HEAD.
 CODE_SNAPSHOT="$BACKUP_DIR/code-pre-update-$(date +%Y%m%d-%H%M%S)-${BEFORE:0:8}"
 mkdir -p "$CODE_SNAPSHOT"
-cp "$INSTALL_DIR"/*.py "$CODE_SNAPSHOT/"
-cp "$INSTALL_DIR/requirements.txt" "$CODE_SNAPSHOT/"
-[[ ! -d "$INSTALL_DIR/cluster" ]] || cp -a "$INSTALL_DIR/cluster" "$CODE_SNAPSHOT/cluster"
+deploy_snapshot_gateway_code "$INSTALL_DIR" "$CODE_SNAPSHOT"
 [[ ! -d "$INSTALL_DIR/static" ]] || cp -a "$INSTALL_DIR/static" "$CODE_SNAPSHOT/static"
 UNIT_SNAPSHOT="$CODE_SNAPSHOT/llm-gateway.service"
 [[ ! -f /etc/systemd/system/llm-gateway.service ]] || cp -a /etc/systemd/system/llm-gateway.service "$UNIT_SNAPSHOT"
@@ -598,23 +613,17 @@ prepare_model_registry
 
 section "2/5  Synchronisation du code source"
 CODE_MUTATED=true
-cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
-
-# Package cluster/ — requis en CLUSTER_MODE=cluster (importé par model_manager)
-mkdir -p "$INSTALL_DIR/cluster"
-cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
-
-# Purger le bytecode obsolète (modules renommés ou supprimés entre versions)
-rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
+deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"
 
 chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/bootstrap"
 chmod 640 "$INSTALL_DIR"/*.py "$INSTALL_DIR/cluster"/*.py
-chmod 750 "$INSTALL_DIR/cluster"
+chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
+chmod 750 "$INSTALL_DIR/cluster" "$INSTALL_DIR/bootstrap"
 chmod 644 "$INSTALL_DIR/requirements.txt"
 
-info "Fichiers Python copiés (gateway + cluster/)."
+info "Fichiers Python copiés (gateway + cluster/ + bootstrap/)."
 
 # ── 3. Synchronisation des fichiers statiques ─────────────────────────────────
 

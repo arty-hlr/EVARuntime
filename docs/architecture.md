@@ -103,8 +103,12 @@ S'y ajoutent une sauvegarde horodatée et bornée
 du registre lui-même, le `fsync` du fichier **et** du répertoire parent — sans
 lequel le renommage n'est pas durable —, et la restauration du mode, du
 propriétaire et du groupe après `os.replace`. Un refus restaure l'état mémoire :
-la gateway ne reste jamais en avance sur son disque. Détails opérationnels et
-liste des refus : `docs/admin.md`.
+la gateway ne reste jamais en avance sur son disque. Un verrou optimiste compare
+en outre le document relu au snapshot qui précédait la mutation : toute édition
+sémantique concurrente, scalaire comprise, provoque un refus explicite plutôt
+qu'un écrasement ; une retouche de commentaire seule reste permise et préservée.
+Ce garde ne remplace pas un verrou inter-processus entre deux gateways écrivant
+le même fichier. Détails opérationnels et liste des refus : `docs/admin.md`.
 
 La seule superposition à cette vérité est l'activation provisoire de
 `bootstrap-apply` : un snapshot validé peut être publié **en mémoire** dans le

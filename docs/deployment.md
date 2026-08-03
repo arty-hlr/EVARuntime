@@ -439,6 +439,12 @@ L'option écrit `ALLOW_NO_GPU=true` dans `/etc/llm-gateway/env`. Conséquences :
 - rien d'autre ne change : aucun offload GPU, `TOTAL_VRAM_GB` et les attentes de
   latence sont à adapter à la main.
 
+`update.sh` relit cette décision avant son préflight : en mode local,
+`nvidia-smi` reste obligatoire par défaut, mais une installation portant déjà
+`ALLOW_NO_GPU=true` reste mise à jour sans nouvelle option ni modification du
+script. Sans cette trace persistée, la mise à jour conserve le refus historique
+et explique comment déclarer le banc CPU par `install.sh --allow-no-gpu`.
+
 En mode cluster, l'option est sans objet — l'orchestrateur n'a jamais de GPU
 local — et le script le dit.
 
@@ -447,7 +453,8 @@ Le script effectue automatiquement :
 1. Création de l'utilisateur système `llmservice` (sans shell, sans home)
 2. Ajout au groupe `render,video` pour l'accès GPU
 3. Création des répertoires (`/opt/llm-gateway`, `/var/lib/llm-gateway`, `/var/log/llm-gateway`, `/etc/llm-gateway`)
-4. Copie du code source et création du virtualenv Python
+4. Copie du code source (`gateway`, `cluster/` et `bootstrap/` avec son
+   catalogue) et création du virtualenv Python
 5. Installation des dépendances Python
 6. **Génération automatique des secrets** (`INTERNAL_API_KEY`, `ADMIN_SECRET`) dans `/etc/llm-gateway/env`
 7. Copie du registre dans `/var/lib/llm-gateway/models.yaml` (writable par le
@@ -1031,6 +1038,10 @@ curl -s "$GW/admin/metrics/llama" \
 ### Mettre à jour le code de la gateway
 
 ```bash
+# Charger d'abord le script de mise à jour de la release visée. Un script bash
+# déjà en cours conserve son ancienne version même si son propre git pull réussit.
+git pull --ff-only
+
 # Conserve automatiquement le mode installé
 bash gateway/deploy/update.sh --dry-run
 sudo bash gateway/deploy/update.sh
@@ -1044,10 +1055,16 @@ En cluster, cette commande met à jour **l'orchestrateur uniquement**. Exécuter
 ensuite `node_agent/deploy/update-agent.sh` sur chaque nœud GPU; aucun code n'est
 poussé à distance par l'orchestrateur.
 
+Le `git pull` explicite avant l'invocation est important quand la release modifie
+`update.sh` lui-même : le processus déjà lancé ne peut pas remplacer son propre
+code en mémoire. Le script conserve tout de même son `git pull --ff-only` interne
+comme garde-fou contre une révision arrivée entre la vérification et l'exécution.
+
 Ce que fait le script :
 
 1. Refuse un checkout sale puis exécute `git pull --ff-only`
-2. Synchronise les fichiers Python et `requirements.txt` vers `/opt/llm-gateway/`
+2. Synchronise les modules racine, `cluster/`, `bootstrap/` avec son catalogue et
+   `requirements.txt` vers `/opt/llm-gateway/`
 3. Synchronise le répertoire `static/` (dashboard HTML…)
 4. Construit un **nouveau venv**, installe les dépendances et exige `pip check`;
    l'ancien venv reste intact jusqu'au redémarrage

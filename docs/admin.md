@@ -1012,10 +1012,10 @@ mémoire de la gateway est restauré* :
   style « flow » (`models: [{...}]`), identifiant présent plusieurs fois ;
 - le texte candidat, reparsé, ne rend **pas** le document attendu — par exemple
   une clé dupliquée dans une entrée, où YAML retient la dernière ;
-- un champ **non scalaire** diverge entre le disque et la mémoire
-  (`capabilities`, `speculative`, `path`) : aucune mutation admin ne les change,
-  donc la divergence vient d'une édition manuelle et l'écraser serait une perte
-  de données.
+- le sens de `models.yaml` diverge du snapshot chargé par la gateway, scalaire
+  ou non scalaire, entrée ajoutée ou retirée : c'est une édition concurrente et
+  l'écraser avec l'ancien état mémoire serait une perte de données. Une
+  modification de **commentaire seulement** reste autorisée et préservée.
 
 Ces refus se lisent de la **même façon sur les trois verbes** (COR-029) :
 `POST`, `PATCH` et `DELETE` répondent tous `422` avec le message de refus dans

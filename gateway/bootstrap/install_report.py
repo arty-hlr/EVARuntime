@@ -316,7 +316,8 @@ class ConditionOutcome:
 # deux niveaux « établis » de la Convention de suivi (§1). `🧭` — jugement
 # d'architecture à confirmer — n'y figure volontairement pas.
 EVIDENCE_VERIFIED_MARKERS: frozenset[str] = frozenset({
-    "constat-§6",
+    schema.EVIDENCE_SPEC,
+    schema.EVIDENCE_OPERATOR,
     "🔬",
     "📖",
 })

@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEPLOY_DIR = REPO_ROOT / "gateway" / "deploy"
 GPU_LIB = DEPLOY_DIR / "gpu-preflight-lib.sh"
 INSTALL_SH = DEPLOY_DIR / "install.sh"
+UPDATE_SH = DEPLOY_DIR / "update.sh"
 
 # Nom de commande garanti absent du PATH : sert de « pas de GPU » déterministe.
 ABSENT_PROBE = "evaruntime-nvidia-smi-absent"
@@ -103,6 +104,14 @@ def test_allow_no_gpu_lets_a_cpu_host_through() -> None:
     assert result.stdout.strip() == "waived"
 
 
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_shell_and_doctor_accept_the_same_truthy_waiver_values(value) -> None:
+    result = run_verdict("local", value, ABSENT_PROBE)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "waived"
+    assert gpu_waiver_declared({GPU_WAIVER_ENV_KEY: value})
+
+
 def test_option_does_not_lie_about_a_host_that_has_a_gpu() -> None:
     """La sonde passe avant l'échappatoire : `--allow-no-gpu` ne masque pas un GPU."""
     result = run_verdict("local", "true", PRESENT_PROBE)
@@ -131,6 +140,18 @@ def test_install_script_wires_the_option() -> None:
         "Le choix n'est pas inscrit dans l'environnement généré : doctor ne "
         "pourra pas le distinguer d'une panne de pilote (OPS-012)."
     )
+
+
+def test_update_respects_the_persisted_cpu_only_waiver() -> None:
+    """Une installation CPU acceptée doit rester maintenable par update.sh."""
+    text = UPDATE_SH.read_text(encoding="utf-8")
+    assert 'source "$SCRIPT_DIR/deploy/gpu-preflight-lib.sh"' in text
+    assert 'deploy_env_value "$CONFIG_FILE" "$GPU_WAIVER_ENV_KEY"' in text
+    assert "deploy_gpu_verdict" in text
+    assert 'required+=("${UPDATE_REQUIRED_COMMANDS_LOCAL[@]}")' not in text, (
+        "update.sh exige encore nvidia-smi avant de pouvoir lire la dérogation persistée"
+    )
+    assert "dérogation persistée respectée" in text
 
 
 @pytest.mark.parametrize(

@@ -146,18 +146,18 @@ _BACKEND_BUILD_FLAG: dict[str, str] = {
 # ── Niveaux de preuve de la matrice d'artefacts ───────────────────────────────
 
 # Affirmé par `codex-analyse.md` §6.
-EVIDENCE_SPEC = "constat-§6"
+EVIDENCE_SPEC = schema.EVIDENCE_SPEC
 # Plausible, non vérifié : ce module n'a pas d'accès réseau et ne consulte donc
 # aucune page de release. À confirmer contre la matrice amont avant de s'en
 # servir en production.
-EVIDENCE_ASSUMPTION = "hypothèse-à-confirmer"
+EVIDENCE_ASSUMPTION = schema.EVIDENCE_ASSUMPTION
 # Relevé par l'opérateur — ou par une CI — puis fourni via `ResolverPolicy`
 # (AUT-018, chargeur `runtime_variants`). Ce n'est ni une affirmation de §6, qui
 # ne connaît aucune empreinte, ni une hypothèse de ce module : c'est un constat
 # EXTERNE, dont le niveau de preuve appartient à celui qui l'a relevé. Le
 # chargeur impose ce niveau et interdit à un fichier de se réclamer de §6 : une
 # empreinte fournie ne devient pas une affirmation de la spécification.
-EVIDENCE_OPERATOR = "constat-opérateur"
+EVIDENCE_OPERATOR = schema.EVIDENCE_OPERATOR
 
 _EVIDENCE_LEVELS: frozenset[str] = frozenset({
     EVIDENCE_SPEC, EVIDENCE_ASSUMPTION, EVIDENCE_OPERATOR,
