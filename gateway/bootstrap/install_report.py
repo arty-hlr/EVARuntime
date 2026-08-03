@@ -513,8 +513,8 @@ def _evaluate_condition(
             proof=(
                 "aucune étape du journal ne porte "
                 + _liste(condition.actions)
-                + _clause_hors_domaine(condition, hors_domaine)
                 + " : rien n'atteste cette condition, dans un sens ni dans l'autre"
+                + _clause_hors_domaine(condition, hors_domaine)
             ),
             actions=actions,
         )
@@ -583,9 +583,9 @@ def _evaluate_condition(
         # cible de cette condition, et le rapport le dit mot pour mot.
         preuve = (
             "aucune étape " + _liste(condition.actions) + " n'était au programme ; "
-            + f"{len(concernés)} étape(s) " + _liste(condition.shared_actions)
-            + " ont abouti sur la cible de cette condition et l'attestent : "
-            + ", ".join(str(o) for o in orders)
+            "la condition est attestée autrement : étape(s) "
+            + ", ".join(str(o) for o in orders) + " " + _liste(condition.shared_actions)
+            + ", sur la cible de cette condition, appliquée(s) ou déjà satisfaite(s)"
         )
 
     return ConditionOutcome(
@@ -670,11 +670,11 @@ def _clause_hors_domaine(condition: M2Condition, ecartees: Sequence[dict]) -> st
         if isinstance(r.get("order"), int) and not isinstance(r.get("order"), bool)
     )
     return (
-        f" ; l'étape ou les étapes {orders} portent bien "
+        f" — l'étape ou les étapes {orders} portent bien "
         + _liste(condition.shared_actions)
         + ", mais leur cible n'est celle d'aucune étape "
         + _liste(condition.anchor_actions)
-        + " — elles attestent un autre domaine"
+        + " : elles attestent un autre domaine"
     )
 
 
