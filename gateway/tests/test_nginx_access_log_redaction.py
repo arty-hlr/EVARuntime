@@ -15,6 +15,24 @@ réellement employé par l'artefact : `map` (clé `default`, clé exacte, clé r
 `nginx -t`, qui est exécuté pour de vrai par le dernier test quand un binaire
 nginx est disponible (`skip` propre sinon).
 
+Ce qu'aucun test de ce fichier ne prouve, et comment cela a été vérifié À LA MAIN
+au moment d'écrire SEC-016 — à refaire si les `map` changent, aucun runner de ce
+dépôt n'ayant nginx :
+
+    python -m pip install crossplane          # parseur officiel de nginx Inc.
+    python -c "import crossplane; print(crossplane.parse('nginx.conf'))"
+
+`crossplane` a confirmé deux choses que le moteur ci-dessous ne peut pas dire :
+(1) il tokenise les `map` livrés EXACTEMENT comme `parse_maps` ci-dessous — mêmes
+clés, mêmes valeurs, mêmes guillemets retirés ; (2) en mode `strict`, avec les
+corps de `map` vidés, tout le reste de la conf passe la table de directives de
+nginx (nom, contexte, arité) — dont `log_format` au niveau `http`,
+`access_log … eva_redacted` au niveau `server` et `error_log … crit` dans une
+`location`. Le mode `strict` ne sait pas lire un corps de `map` : il rejette
+aussi l'exemple canonique de la documentation nginx, ce n'est donc pas un signal.
+Reste non vérifié sans binaire nginx : la sémantique PCRE exacte des regex de
+`map` (les constructions employées sont communes à PCRE et à `re`).
+
 Règle CLAUDE.md appliquée : chaque test qui assère une ABSENCE porte un contrôle
 positif. Ici ils sont de deux natures — un contrôle sur le format d'origine
 (`combined` fuit le canari, donc le détecteur voit quelque chose) et un contrôle
