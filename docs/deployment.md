@@ -140,6 +140,27 @@ Sans `--pin-version`/`--pin-commit`, le plan sort **bloqué** et ne propose aucu
 des options et des exit codes :
 [guide administrateur, section 9](admin.md#9-planificateur-damorçage--bootstrap-plan).
 
+Épingler la version ne suffit pas à rendre le plan **applicable** : la matrice
+d'artefacts livrée avec EVARuntime ne porte aucune empreinte et aucune URL
+d'archive, de sorte que seule la voie du build local y est éligible. Pour que
+`bootstrap-apply` installe réellement un runtime, fournissez votre propre matrice
+avec `--runtime-variants`, à partir du modèle commenté
+`gateway/deploy/runtime-variants.yaml.example` :
+
+```bash
+cp gateway/deploy/runtime-variants.yaml.example /etc/evaruntime/runtime-variants.yaml
+# relever les vraies empreintes — le fichier refuse de se charger tant que les
+# marqueurs REMPLACER y figurent
+./.venv/bin/python cli.py bootstrap-plan --json \
+    --pin-version b6210 --pin-commit <sha_git> --min-build 6120 \
+    --runtime-variants /etc/evaruntime/runtime-variants.yaml \
+    --models-dir /models > /tmp/plan.json
+```
+
+Le fichier **remplace** la matrice livrée : redéclarez-y la variante
+`local-build` si vous voulez conserver cette voie. Champs, contrôles et méthode
+de relevé : [guide administrateur, section 9](admin.md#épingler-son-runtime----runtime-variants).
+
 Si `--models-dir` contient déjà les GGUF du catalogue et qu'un manifeste de
 provenance les atteste, le plan **ne propose pas de les retélécharger** : l'étape
 `download_model` disparaît, le volume annoncé est décompté, et seule la

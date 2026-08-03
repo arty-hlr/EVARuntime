@@ -1,0 +1,112 @@
+# Matrice d'artefacts `llama-server` fournie par l'opérateur — AUT-018, §6.
+#
+# CE FICHIER NE SE CHARGE PAS TEL QUEL, ET C'EST VOULU.
+# Chaque valeur que nous ne pouvons pas connaître porte le marqueur `REMPLACER`.
+# Le chargeur (`gateway/bootstrap/runtime_variants.py`) le reconnaît et refuse le
+# fichier en le nommant. Ce n'est pas une omission : livrer un exemple muni
+# d'empreintes plausibles reviendrait à publier des SHA-256 inventés, que
+# quelqu'un finirait par recopier en production. Un fichier qui refuse est un
+# désagrément ; une empreinte inventée transforme la vérification d'intégrité en
+# théâtre.
+#
+# La STRUCTURE de ce fichier est néanmoins tenue pour vraie : un test du dépôt
+# remplace les marqueurs par des valeurs bien formées et vérifie que tout le
+# reste se charge sans un seul ajustement (défaut inverse déjà rencontré sous
+# COR-014 : des exemples livrés qui n'étaient chargeables par rien).
+#
+# ── À quoi il sert ────────────────────────────────────────────────────────────
+#
+# La matrice livrée avec EVARuntime (`runtime_resolver.DEFAULT_VARIANTS`) ne
+# porte AUCUNE empreinte, parce qu'aucune n'a été vérifiée dans ce dépôt. Seules
+# ses variantes `local-build` sont donc éligibles, et aucune ne porte d'URL
+# d'archive exploitable. Ce fichier est la façon supportée de fournir les vôtres :
+#
+#   evaruntime bootstrap-plan --json \
+#     --pin-version bNNNNN --pin-commit <sha> --min-build NNNN \
+#     --runtime-variants /etc/evaruntime/runtime-variants.yaml
+#
+# ── Il REMPLACE la matrice livrée, il ne s'y ajoute pas ───────────────────────
+#
+# Ce que vous écrivez ici est l'intégralité de ce que le résolveur examinera.
+# Conséquence à ne pas manquer : si vous voulez conserver la possibilité d'un
+# build local, redéclarez-la (voir la dernière entrée). Le remplacement est
+# délibéré — en union, une faute de frappe dans `platform` rendrait votre entrée
+# épinglée invisible et un `local-build` livré l'emporterait en silence.
+#
+# ── Comment relever les valeurs (aucune ne se devine) ─────────────────────────
+#
+# Archive de release, empreinte et taille :
+#
+#   curl -fL -o llama.zip \
+#     https://github.com/ggml-org/llama.cpp/releases/download/<version>/<archive>
+#   sha256sum llama.zip        # -> artifact_sha256
+#   stat -c%s llama.zip        # -> approx_bytes
+#
+# Recoupez la somme avec celle publiée par la release amont. Une somme calculée
+# sur un fichier que vous venez de télécharger ne prouve que la cohérence du
+# transfert ; c'est le recoupement avec la source qui prouve la provenance.
+#
+# Digest d'image conteneur :
+#
+#   docker buildx imagetools inspect ghcr.io/ggml-org/llama.cpp:server-cuda
+#   # -> container_digest, sous la forme sha256:<64 hex>
+#
+# ── Ce que le champ `evidence` doit contenir ──────────────────────────────────
+#
+# Il est obligatoire et il n'est pas décoratif. Une variante fournie ici est un
+# CONSTAT OPÉRATEUR : le plan et le rapport d'installation la présenteront comme
+# tel, jamais comme une affirmation de la spécification. Écrivez ce que vous avez
+# réellement fait, pas ce que vous supposez. Par exemple :
+#
+#   evidence: "Archive téléchargée le 2026-08-03 depuis la release amont,
+#              sha256sum recoupé avec la ligne correspondante de SHA256SUMS
+#              publiée par le projet. Extraction contrôlée sur un hôte de recette."
+#
+# Ne mettez jamais de nom de personne ici : le champ est recopié dans le plan et
+# dans les journaux.
+
+variants_version: 1
+
+variants:
+  # ── Archive officielle ──────────────────────────────────────────────────────
+  # Le chemin doit désigner un FICHIER d'archive (.zip, .tar.gz, .tar.xz…).
+  # Une page de releases est refusée : elle serait téléchargée puis rejetée au
+  # contrôle d'empreinte. Ni chaîne de requête ni fragment ne sont admis — une
+  # URL présignée y transporterait un secret jusque dans le plan et les journaux.
+  - source: "official-release"
+    backend: "cpu"
+    platform: "linux-x86_64"
+    reference: "https://github.com/ggml-org/llama.cpp/releases/download/REMPLACER-VERSION/llama-REMPLACER-VERSION-bin-ubuntu-x64.zip"
+    artifact_sha256: "REMPLACER-64-HEX"
+    approx_bytes: REMPLACER-TAILLE-EN-OCTETS
+    evidence: "REMPLACER-CONSTAT — décrivez le relevé, voir l'en-tête de ce fichier"
+    recorded_on: REMPLACER-DATE
+
+  # ── Image officielle GHCR ───────────────────────────────────────────────────
+  # `reference` désigne le dépôt, `container_digest` est le seul épinglage qui
+  # compte : un tag peut être réécrit, un digest non.
+  #
+  # ATTENTION : `server_manager` ne sait lancer que des sous-processus natifs.
+  # Une variante conteneur est descriptible par le plan et n'est PAS applicable
+  # aujourd'hui ; elle n'est de surcroît examinée que si la politique accepte le
+  # mode conteneur. Conservée ici pour montrer la forme attendue.
+  - source: "official-container"
+    backend: "cuda12"
+    platform: "linux-x86_64"
+    reference: "ghcr.io/ggml-org/llama.cpp:server-cuda"
+    container_digest: "sha256:REMPLACER-64-HEX"
+    evidence: "REMPLACER-CONSTAT — décrivez le relevé, voir l'en-tête de ce fichier"
+    recorded_on: REMPLACER-DATE
+
+  # ── Build local ─────────────────────────────────────────────────────────────
+  # Aucune empreinte : elle n'existe qu'après la construction. Aucune URL non
+  # plus : rien n'est téléchargé. La reproductibilité vient du couple
+  # --pin-version / --pin-commit, inscrit au manifeste de provenance.
+  #
+  # À redéclarer si vous voulez conserver cette voie : ce fichier REMPLACE la
+  # matrice livrée.
+  - source: "local-build"
+    backend: "cuda12"
+    platform: "linux-x86_64"
+    evidence: "REMPLACER-CONSTAT — décrivez la toolchain vérifiée sur cet hôte"
+    recorded_on: REMPLACER-DATE

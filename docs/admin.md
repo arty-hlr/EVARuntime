@@ -1661,6 +1661,7 @@ cd /opt/llm-gateway
 | `--pin-version` | Version llama.cpp épinglée, au format « bNNNNN » | aucune |
 | `--pin-commit` | Commit git correspondant à `--pin-version` | aucun |
 | `--min-build` | Premier build patché connu — plancher de sécurité | `0` |
+| `--runtime-variants` | Matrice d'artefacts `llama-server` épinglée par l'opérateur (YAML) — **remplace** la matrice livrée | matrice livrée |
 | `--llmfit-bin` | Binaire LLMfit à consulter | recherché dans le `PATH` |
 | `--llmfit-version` | Version LLMfit attendue — va de pair avec `--llmfit-sha256` | aucune |
 | `--llmfit-sha256` | Empreinte attendue du binaire LLMfit (64 hex minuscules) | aucune |
@@ -1756,6 +1757,95 @@ n'est caché, seule la séquence est retenue. Pour débloquer, fournir la versio
 ./venv/bin/python cli.py bootstrap-plan \
     --pin-version b6210 --pin-commit <sha_git> --min-build 6120
 ```
+
+### Épingler son runtime — `--runtime-variants`
+
+`--pin-version`/`--pin-commit` disent **quelle version** installer. Ils ne disent
+pas **quel artefact** : c'est le rôle de la matrice d'artefacts, qui associe un
+couple (backend, plateforme) à une archive, une image ou un build local.
+
+La matrice **livrée** avec EVARuntime ne porte **aucune empreinte**. C'est
+délibéré : aucune n'a été vérifiée dans ce dépôt, et en inventer une
+transformerait le contrôle d'intégrité en théâtre. Deux conséquences à connaître :
+
+- seules ses variantes `local-build` sont éligibles — les autres apparaissent
+  dans les motifs de rejet du plan avec la mention « non épinglé » ;
+- aucune de ses variantes ne porte d'URL d'archive exploitable. Un plan produit
+  sans `--runtime-variants` est lisible et honnête, mais `bootstrap-apply` ne
+  peut pas en installer de runtime.
+
+Fournir sa propre matrice se fait avec un fichier YAML :
+
+```bash
+./venv/bin/python cli.py bootstrap-plan --json \
+    --pin-version b6210 --pin-commit <sha_git> --min-build 6120 \
+    --runtime-variants /etc/evaruntime/runtime-variants.yaml
+```
+
+Le modèle commenté est livré dans **`gateway/deploy/runtime-variants.yaml.example`**.
+Il ne se charge pas tel quel, et c'est voulu : les valeurs que le dépôt ne peut
+pas connaître y portent le marqueur `REMPLACER`, que le chargeur reconnaît et
+nomme dans son refus. Copiez-le, relevez les vraies valeurs, chargez-le.
+
+**Le fichier remplace la matrice livrée, il ne s'y ajoute pas.** Ce que vous y
+écrivez est l'intégralité de ce que le résolveur examinera. Si vous voulez
+conserver la voie du build local, redéclarez-la explicitement. Le remplacement
+est délibéré : en union, une faute de frappe dans `platform` rendrait votre
+entrée épinglée invisible et une variante `local-build` livrée l'emporterait en
+silence — vous liriez un plan réussi qui ignore intégralement votre épinglage.
+
+Champs, par source :
+
+| Source | `reference` | `artifact_sha256` | `container_digest` | `approx_bytes` |
+|---|---|---|---|---|
+| `official-release`, `evaruntime-build` | URL HTTPS d'**archive** | obligatoire | interdit | obligatoire |
+| `official-container` | `hôte/chemin:tag` | interdit | obligatoire | facultatif |
+| `local-build` | interdit | interdit | interdit | interdit |
+
+`evidence` et `recorded_on` sont obligatoires dans **tous** les cas. Ils ne sont
+pas décoratifs : une variante fournie ici est un **constat opérateur**, et le
+plan la présentera comme tel — jamais comme une affirmation de la spécification.
+Écrivez comment vous avez relevé l'empreinte, pas ce que vous supposez, et n'y
+mettez aucun nom de personne : le champ est recopié dans le plan et les journaux.
+
+Relever les valeurs :
+
+```bash
+curl -fL -o llama.zip \
+  https://github.com/ggml-org/llama.cpp/releases/download/<version>/<archive>
+sha256sum llama.zip   # -> artifact_sha256
+stat -c%s llama.zip   # -> approx_bytes
+
+docker buildx imagetools inspect ghcr.io/ggml-org/llama.cpp:server-cuda
+                      # -> container_digest, sous la forme sha256:<64 hex>
+```
+
+Recoupez la somme avec celle publiée par la release amont. Une somme calculée sur
+un fichier que vous venez de télécharger ne prouve que la cohérence du transfert ;
+c'est le recoupement avec la source qui prouve la provenance.
+
+La validation est **fail-closed et sans repli** : un fichier malformé fait sortir
+la commande en code `2` (erreur d'usage) sans produire de plan. Il ne retombe
+**jamais** sur la matrice livrée — un opérateur qui fournit un fichier attend que
+ce fichier soit employé, pas qu'il soit ignoré. Sont refusés, entre autres : une
+URL non HTTPS, une URL portant des identifiants ou une chaîne de requête (elle
+transporterait un secret jusque dans le plan et les journaux), une URL qui ne
+désigne pas une archive — une page de releases en est une —, une empreinte qui
+n'est pas 64 hexadécimaux minuscules, un champ hors schéma, deux entrées pour le
+même couple (source, backend, plateforme).
+
+`--runtime-variants` exige `--pin-version` et `--pin-commit` : la matrice dit
+quel artefact installer, l'épinglage dit quelle version il porte, et le manifeste
+de provenance a besoin des deux.
+
+L'option n'existe que sur `bootstrap-plan`. `bootstrap-apply` reconstruit la
+décision depuis le plan relu : c'est le plan qui porte la variante retenue, son
+empreinte et son URL, et rien ne se redécide au moment d'appliquer.
+
+Enfin, ce que fournir une matrice **ne fait pas** : cela n'autorise aucun repli
+CPU tacite (§6 reste appliqué à l'identique), et cela ne prouve pas que l'archive
+désignée contient un `llama-server` compilé pour le backend annoncé —
+`--version` ne le dit pas. Le plan porte ce constat.
 
 ### Exemple de sortie humaine
 

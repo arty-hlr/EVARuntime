@@ -428,6 +428,35 @@ avoir. Avec la politique par défaut, seules les variantes `local-build` sont do
 éligibles ; les autres apparaissent dans les motifs de rejet avec la mention
 « non épinglé », qui est l'information utile.
 
+Ses `reference` d'archive ne valent pas davantage : elles désignent la **page de
+releases** du projet, pas un artefact. Même munie d'une empreinte, la matrice
+livrée ne donnerait à `runtime_installer` aucune URL téléchargeable. L'opérateur
+fournit donc la sienne — `bootstrap-plan --runtime-variants`, chargée par
+`gateway/bootstrap/runtime_variants.py`, modèle dans
+`gateway/deploy/runtime-variants.yaml.example`. Trois propriétés structurent ce
+chargeur :
+
+- il **remplace** la matrice livrée au lieu de s'y ajouter. En union, une faute
+  de frappe dans `platform` rendrait l'entrée épinglée invisible et un
+  `local-build` livré l'emporterait en silence : l'opérateur lirait un plan
+  réussi qui ignore son épinglage ;
+- il est **fail-closed** : un fichier malformé refuse en bloc et ne se replie
+  jamais sur `DEFAULT_VARIANTS` ni sur ses seules entrées valides ;
+- il impose le niveau de preuve `constat-opérateur` — troisième valeur d'`evidence`.
+  Un fichier ne peut pas se réclamer de `constat-§6` : §6 ne connaît aucune
+  empreinte, et lui laisser l'autorité de la spécification annulerait la
+  distinction constat/hypothèse dont vit le rapport d'installation. Le plan porte
+  un constat `info` nommant l'origine des variantes employées.
+
+La politique d'URL vit dans ce chargeur et non dans le résolveur : elle réutilise
+`bootstrap/public_https.py`, donc `socket` et `http.client`, que le garde-fou
+d'isolation de `runtime_resolver` interdit précisément d'y faire entrer. Elle
+ajoute à la politique publique HTTPS trois contraintes — le chemin doit désigner
+une archive extractible, sans chaîne de requête ni fragment — et
+`production.runtime_installer_from_plan` l'applique désormais aussi, pour refuser
+une URL inexploitable **avant** le téléchargement plutôt qu'après, au contrôle
+d'empreinte.
+
 Usage opérationnel de la commande : [guide administrateur](admin.md#9-planificateur-damorçage--bootstrap-plan).
 Catalogue de modèles approuvés : [guide de déploiement](deployment.md#catalogue-de-modèles-approuvés-amorçage).
 
