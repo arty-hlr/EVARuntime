@@ -73,10 +73,28 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 
 Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité
 **persistante** pour tous les modèles disponibles sur la gateway. Il est lu au
-démarrage et peut être modifié en
-direct via l'API admin (écriture atomique : temp + rename). Il vit sous
+démarrage et peut être modifié en direct via l'API admin. Il vit sous
 `/var/lib`, writable par `llmservice`, tandis que secrets et topologie restent
 sous `/etc/llm-gateway`, non writable par le service.
+
+**Une mutation admin ne resérialise pas le fichier** (COR-020). Elle le
+**retouche textuellement** : ajout en fin de document, retouche des seules lignes
+de champ qui changent, retrait du seul bloc d'une entrée supprimée. Le texte
+candidat est reparsé et comparé au document attendu ; s'il ne signifie pas
+exactement ce qui était prévu, l'écriture est **refusée** plutôt que remplacée
+par une réécriture globale — celle-ci détruirait les commentaires
+d'exploitation du fichier, qui sont de la documentation. C'est la politique
+d'AUT-007 (`bootstrap/registry_writer.py`), réutilisée par `model_registry.py`
+pour qu'il n'existe qu'**une** politique d'écriture de `models.yaml`.
+
+S'y ajoutent une sauvegarde horodatée et bornée
+(`models.yaml.pre-admin.<stamp>.bak`, 5 conservées, motif distinct des
+`*.pre-bootstrap.*` du bootstrap), une écriture atomique validée par le chargeur
+du registre lui-même, le `fsync` du fichier **et** du répertoire parent — sans
+lequel le renommage n'est pas durable —, et la restauration du mode, du
+propriétaire et du groupe après `os.replace`. Un refus restaure l'état mémoire :
+la gateway ne reste jamais en avance sur son disque. Détails opérationnels et
+liste des refus : `docs/admin.md`.
 
 La seule superposition à cette vérité est l'activation provisoire de
 `bootstrap-apply` : un snapshot validé peut être publié **en mémoire** dans le
