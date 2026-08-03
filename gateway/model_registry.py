@@ -971,12 +971,15 @@ def _entry_bounds(lignes: list[str], model_id: str) -> tuple[int, int, int]:
     """
     Bornes textuelles de l'entrée `model_id` : (début, fin exclue, indentation des champs).
 
-    Pourquoi ne pas réutiliser `registry_writer._entry_block_bounds` : celui-ci
-    ancre sa recherche sur une ligne « - id: <model_id> », donc sur des entrées
-    dont `id` est la PREMIÈRE clé. C'est vrai du `models.yaml` livré et de ce que
-    le bootstrap écrit, mais pas d'un fichier produit par `yaml.safe_dump`, qui
-    trie les clés par ordre alphabétique et place `capabilities` en tête. Le
-    chemin admin doit adresser le fichier de l'exploitant tel qu'il est.
+    Localisateur de référence, pour le chemin admin comme pour le bootstrap :
+    `registry_writer._entry_block_bounds` délègue ici depuis COR-028. Il ancrait
+    auparavant sa recherche sur une ligne « - id: <model_id> », donc sur des
+    entrées dont `id` est la PREMIÈRE clé. C'est vrai du `models.yaml` livré et
+    de ce que le bootstrap écrit, mais pas d'un fichier produit par
+    `yaml.safe_dump`, qui trie les clés par ordre alphabétique et place
+    `capabilities` en tête — c'est-à-dire pas d'un fichier déjà passé par une
+    mutation admin d'avant COR-020. L'étape `enable_model` du parcours
+    d'amorçage refusait donc sur un registre pourtant valide.
 
     On délimite donc les éléments de la séquence, puis on cherche la ligne `id:`
     à l'indentation des champs À L'INTÉRIEUR de chaque élément. Zéro ou plusieurs
