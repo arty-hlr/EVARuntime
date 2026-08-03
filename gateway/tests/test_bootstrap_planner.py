@@ -1000,7 +1000,15 @@ def _options_de_la_commande(nom: str = "bootstrap-plan") -> set[str]:
 
     groupe = typer.main.get_command(cli.app)
     commande = groupe.commands[nom]  # type: ignore[attr-defined]
-    return {opt for param in commande.params for opt in getattr(param, "opts", ())}
+    # `secondary_opts` porte la face NÉGATIVE d'un drapeau booléen
+    # (`--allow-local-build/--no-local-build`). L'omettre rendait l'introspection
+    # aveugle à la moitié des options d'un drapeau à deux faces — et un test
+    # d'existence adossé à elle serait passé au vert sans rien prouver.
+    return {
+        opt
+        for param in commande.params
+        for opt in (*getattr(param, "opts", ()), *getattr(param, "secondary_opts", ()))
+    }
 
 
 def test_cli_expose_l_epinglage_llmfit(tmp_path):
@@ -1189,3 +1197,167 @@ def test_un_manifeste_absent_illisible_ou_incoherent_porte_son_constat(
     assert code in codes, codes
     # Fail-closed : sur un hôte GPU, aucune de ces trois issues ne conserve le binaire.
     assert section.data["reuse_existing"] is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUT-019 — les trois drapeaux de politique sont pilotables et visibles
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `ResolverPolicy` porte `allow_container`, `allow_local_build` et
+# `allow_cpu_fallback`, qu'aucune option n'exposait. Depuis AUT-018, un opérateur
+# pouvait fournir une variante `official-container` correctement épinglée par
+# digest et la voir systématiquement écartée : il avait le moyen de l'épingler et
+# aucun moyen de l'autoriser.
+
+_PIN = ("--pin-version", "b6800", "--pin-commit", "a" * 40, "--min-build", "6600")
+
+
+def test_cli_expose_les_trois_drapeaux_de_politique():
+    options = _options_de_la_commande()
+    for option in ("--allow-container", "--allow-local-build", "--no-local-build",
+                   "--allow-cpu-fallback"):
+        assert option in options, f"{option} absente de la CLI"
+
+
+def _politique_du_plan(document) -> dict:
+    section = next(s for s in document["sections"] if s["name"] == sc.SECTION_RUNTIME)
+    return section["data"]["policy"]
+
+
+def test_la_politique_retenue_est_inscrite_dans_le_plan(tmp_path):
+    """
+    AUT-019 — un plan doit dire sous quelles règles il a été calculé.
+
+    « Aucune variante GPU sûre » ne veut pas dire la même chose selon que le
+    conteneur était accepté ou non ; relire un plan sans sa politique, c'est le
+    comparer à un autre sans savoir que les règles différaient.
+    """
+    resultat = _invoke(tmp_path, "--json", *_PIN)
+    defaut = _politique_du_plan(json.loads(resultat.output))
+    assert defaut == {
+        "allow_container": False, "allow_local_build": True, "allow_cpu_fallback": False,
+    }
+
+    resultat = _invoke(
+        tmp_path, "--json", *_PIN, "--allow-container", "--allow-cpu-fallback",
+        "--no-local-build",
+    )
+    assert _politique_du_plan(json.loads(resultat.output)) == {
+        "allow_container": True, "allow_local_build": False, "allow_cpu_fallback": True,
+    }
+
+
+def test_une_variante_conteneur_epinglee_reste_ecartee_sans_l_option(tmp_path):
+    """Le défaut, tel qu'il se produisait : épinglée correctement, et jamais retenue."""
+    plan = _plan(_options(tmp_path, resolver_policy=runtime_mod.ResolverPolicy(
+        release=_release(), variants=(_variante_conteneur(),),
+    )))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is False
+    assert any("allow_container=False" in r for r in section.data["rejected"])
+
+
+def test_une_variante_conteneur_epinglee_est_retenue_avec_l_option(tmp_path):
+    """Le correctif : l'opérateur peut enfin autoriser ce qu'il a épinglé."""
+    plan = _plan(_options(tmp_path, resolver_policy=runtime_mod.ResolverPolicy(
+        release=_release(), variants=(_variante_conteneur(),), allow_container=True,
+    )))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is True
+    assert section.data["variant"]["source"] == runtime_mod.SOURCE_OFFICIAL_CONTAINER
+    assert section.data["policy"]["allow_container"] is True
+
+
+def _variante_conteneur() -> runtime_mod.ArtifactVariant:
+    return runtime_mod.ArtifactVariant(
+        source=runtime_mod.SOURCE_OFFICIAL_CONTAINER,
+        backend="cuda12",
+        platform="linux-x86_64",
+        evidence=runtime_mod.EVIDENCE_OPERATOR,
+        evidence_note="Digest relevé par l'opérateur pour ce test.",
+        container_digest="sha256:" + "b" * 64,
+    )
+
+
+def _politique_cpu(**kwargs) -> runtime_mod.ResolverPolicy:
+    """Aucune variante GPU : seule une variante CPU épinglée reste disponible."""
+    return runtime_mod.ResolverPolicy(
+        release=_release(),
+        variants=(runtime_mod.ArtifactVariant(
+            source=runtime_mod.SOURCE_OFFICIAL_RELEASE,
+            backend="cpu",
+            platform="linux-x86_64",
+            evidence=runtime_mod.EVIDENCE_OPERATOR,
+            evidence_note="Empreinte relevée par l'opérateur pour ce test.",
+            artifact_sha256="e" * 64,
+        ),),
+        **kwargs,
+    )
+
+
+def test_sans_autorisation_le_repli_cpu_reste_refuse(tmp_path):
+    """Le défaut qui compte : `allow_cpu_fallback` est faux, et le reste."""
+    plan = _plan(_options(tmp_path, resolver_policy=_politique_cpu()))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is False
+    assert section.data["degraded"] is False
+    assert "cpu_fallback_refused" in {f.code for f in section.findings}
+    # Aucune note : une politique par défaut n'a rien à annoncer.
+    assert section.notes == ()
+
+
+def test_un_repli_cpu_autorise_et_non_emprunte_se_voit_quand_meme(tmp_path):
+    """
+    L'autorisation seule est déjà une information : un plan calculé sous une
+    politique permissive ne doit pas se lire comme un plan calculé sous la
+    politique par défaut, même quand le repli n'a pas servi.
+    """
+    plan = _plan(_options(tmp_path, resolver_policy=runtime_mod.ResolverPolicy(
+        release=_release(), allow_cpu_fallback=True,  # matrice livrée : local-build cuda12 gagne
+    )))
+    section = _section_runtime(plan)
+
+    assert section.data["degraded"] is False
+    assert section.data["variant"]["backend"] == "cuda12"
+    assert "cpu_fallback_authorized" in {f.code for f in section.findings}
+    assert any("non emprunté" in n for n in section.notes), section.notes
+
+
+def test_un_repli_cpu_autorise_et_emprunte_est_annonce_en_toutes_lettres(tmp_path):
+    """
+    §6 : aucun repli CPU ne doit être silencieux. Quand il est autorisé ET pris,
+    le plan doit le dire dans ce que l'opérateur LIT — `data` n'est pas imprimé
+    par le rendu humain, `notes` l'est.
+    """
+    plan = _plan(_options(tmp_path, resolver_policy=_politique_cpu(allow_cpu_fallback=True)))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is True
+    assert section.data["degraded"] is True
+    assert section.data["variant"]["backend"] == "cpu"
+
+    codes = {f.code for f in section.findings}
+    assert {"cpu_fallback_authorized", "cpu_fallback_degraded"} <= codes
+    assert section.status == "warn"
+
+    texte = "\n".join(section.notes)
+    assert "EMPRUNTÉ" in texte
+    assert "CE PLAN EST DÉGRADÉ" in texte
+
+    # Et le rendu humain — ce que l'opérateur voit réellement — le porte aussi.
+    rendu = sc.render_human(plan, strict=False)
+    assert "CE PLAN EST DÉGRADÉ" in rendu
+
+
+def test_les_options_de_politique_exigent_un_epinglage(tmp_path):
+    """
+    Autoriser une branche de §6 sans épingler de version ne résout rien : la
+    commande le dit au lieu de laisser croire que l'option a été prise en compte.
+    """
+    for option in ("--allow-container", "--allow-cpu-fallback", "--no-local-build"):
+        resultat = _invoke(tmp_path, option)
+        assert resultat.exit_code == sc.EXIT_USAGE, option
+        assert "--pin-version" in _sans_ansi(resultat.output)

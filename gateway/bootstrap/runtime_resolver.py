@@ -994,6 +994,17 @@ class RuntimeResolution:
     findings: tuple[schema.Finding, ...]
     rejected: tuple[str, ...]
 
+    # AUT-019 — la politique effectivement retenue, recopiée dans la décision.
+    #
+    # Ces trois drapeaux gouvernent quelles branches de §6 ont été ouvertes. Les
+    # laisser dans `ResolverPolicy` seulement, c'est-à-dire dans l'invocation,
+    # rendait le plan non interprétable : « aucune variante GPU sûre » ne veut pas
+    # dire la même chose selon que le conteneur était accepté ou non, et un repli
+    # CPU autorisé n'est pas un détail de ligne de commande.
+    allow_container: bool = False
+    allow_local_build: bool = True
+    allow_cpu_fallback: bool = False
+
     @property
     def backend(self) -> str | None:
         return self.variant.backend if self.variant else None
@@ -1025,6 +1036,11 @@ class RuntimeResolution:
             "variant": self.variant.to_dict() if self.variant else None,
             "manifest": self.manifest.to_dict() if self.manifest else None,
             "rejected": list(self.rejected),
+            "policy": {
+                "allow_container": self.allow_container,
+                "allow_local_build": self.allow_local_build,
+                "allow_cpu_fallback": self.allow_cpu_fallback,
+            },
         }
 
 
@@ -1087,6 +1103,37 @@ async def resolve_runtime(
     findings: list[schema.Finding] = []
     rejected: list[str] = []
     min_build = derive_min_build(policy.release)
+
+    # AUT-019 — la politique voyage avec la décision, sur TOUS les chemins de
+    # sortie. Un refus doit être aussi interprétable qu'un succès : « aucune
+    # variante GPU sûre » ne veut pas dire la même chose selon que le conteneur
+    # était accepté ou non.
+    politique = {
+        "allow_container": policy.allow_container,
+        "allow_local_build": policy.allow_local_build,
+        "allow_cpu_fallback": policy.allow_cpu_fallback,
+    }
+
+    # AUT-019 — un repli CPU AUTORISÉ se voit, qu'il soit emprunté ou non.
+    #
+    # §6 interdit le repli CPU silencieux. Le constat `cpu_fallback_degraded`
+    # couvre le cas où il est effectivement pris ; il ne couvre pas le cas, tout
+    # aussi important pour un relecteur, où l'autorisation était debout et n'a pas
+    # servi. Un plan relu six mois plus tard doit dire sous quelle politique il a
+    # été calculé, sans quoi on le compare à un autre plan sans savoir que les
+    # règles n'étaient pas les mêmes.
+    if policy.allow_cpu_fallback:
+        findings.append(schema.Finding(
+            code="cpu_fallback_authorized",
+            level="info",
+            message=(
+                "Le repli CPU est AUTORISÉ pour cette résolution (allow_cpu_fallback=True). "
+                "Ce n'est pas le défaut : §6 exige que la dégradation GPU → CPU soit demandée, "
+                "jamais subie. Si aucune variante GPU sûre n'est trouvée, une variante CPU sera "
+                "retenue et le plan sortira DÉGRADÉ — vérifiez le drapeau « degraded » de cette "
+                "section avant d'appliquer."
+            ),
+        ))
 
     if min_build == 0:
         findings.append(schema.Finding(
@@ -1157,6 +1204,7 @@ async def resolve_runtime(
                 summary=verdict.summary,
                 findings=schema.merge_findings(findings),
                 rejected=tuple(rejected),
+                **politique,
             )
         reuse_existing = verdict.reuse
 
@@ -1182,6 +1230,7 @@ async def resolve_runtime(
             ),
             findings=schema.merge_findings(findings),
             rejected=tuple(rejected),
+            **politique,
         )
 
     # ── Étapes 1 à 5 : sélection d'une variante ───────────────────────────────
@@ -1202,6 +1251,7 @@ async def resolve_runtime(
             summary=selection.summary,
             findings=schema.merge_findings(findings),
             rejected=tuple(rejected),
+            **politique,
         )
 
     variant = selection.variant
@@ -1284,6 +1334,7 @@ async def resolve_runtime(
         summary=summary,
         findings=schema.merge_findings(findings),
         rejected=tuple(rejected),
+        **politique,
     )
 
 

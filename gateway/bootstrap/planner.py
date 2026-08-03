@@ -191,7 +191,7 @@ async def build_plan(options: PlannerOptions) -> schema.BootstrapPlan:
             rationale="aucune politique de release n'a été fournie au planificateur",
         ))
     else:
-        sections.append(runtime_mod.to_plan_section(resolution))
+        sections.append(_runtime_section(resolution))
         decisions.append(runtime_mod.to_decision(resolution))
 
     advice = llmfit_mod.run_llmfit(options.llmfit_config)
@@ -343,6 +343,52 @@ async def _resolve_runtime(
             (attestation.finding,), resolution.findings,
         ))
     return resolution
+
+
+def _runtime_section(resolution: runtime_mod.RuntimeResolution) -> schema.PlanSection:
+    """
+    Section `runtime`, augmentée de la politique retenue en clair.
+
+    AUT-019 — le producteur ne peut pas le faire lui-même : les drapeaux vivent
+    dans `data`, que le rendu humain n'imprime pas, alors que `notes` l'est. Sans
+    ce raccord, un opérateur lirait « repli CPU » sans jamais lire qu'il l'avait
+    autorisé, ni sous quelles règles le reste du plan a été calculé. C'est le même
+    raccord que `_recommendation_section` fait pour les limites de LLMfit.
+
+    Une politique par défaut ne produit aucune note : un constat qui n'apprend
+    rien apprend au lecteur à ne plus lire les constats.
+    """
+    section = runtime_mod.to_plan_section(resolution)
+
+    lignes: list[str] = []
+    if resolution.allow_container:
+        lignes.append(
+            "Mode conteneur ACCEPTÉ (--allow-container) : les images officielles épinglées par\n"
+            "digest entrent dans l'ordre de résolution. `server_manager` ne sait pas encore\n"
+            "lancer de conteneur — le plan est descriptible, son application ne l'est pas."
+        )
+    if not resolution.allow_local_build:
+        lignes.append(
+            "Build local REFUSÉ (--no-local-build) : l'étape 4 de §6 est fermée. Sur la matrice\n"
+            "livrée avec EVARuntime, qui ne porte aucune empreinte, il ne reste alors aucune\n"
+            "variante éligible et la résolution échouera."
+        )
+    if resolution.allow_cpu_fallback:
+        entete = (
+            "Repli CPU EMPRUNTÉ" if resolution.degraded else "Repli CPU AUTORISÉ, non emprunté"
+        )
+        lignes.append(
+            f"{entete} (--allow-cpu-fallback). Ce n'est pas le défaut : §6 exige que la\n"
+            "dégradation GPU → CPU soit demandée, jamais subie. Une installation CPU démarre,\n"
+            "répond et passe le smoke test ; son TTFT ne se verra qu'en production, et le\n"
+            "`vram_gb` de models.yaml n'aura plus de sens."
+            + (
+                "\nCE PLAN EST DÉGRADÉ : le GPU de cet hôte ne sera pas utilisé."
+                if resolution.degraded else ""
+            )
+        )
+
+    return replace(section, notes=section.notes + tuple(lignes)) if lignes else section
 
 
 def _no_release_policy_section(options: PlannerOptions) -> schema.PlanSection:
