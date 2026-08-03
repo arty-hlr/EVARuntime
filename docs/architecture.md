@@ -320,6 +320,17 @@ Trois inversions seraient des défauts, pas des goûts :
 - **préchauffer avant la recette** conserverait en mémoire un modèle dont aucun
   token n'a encore été prouvé.
 
+`verify_artifact` est une action à **deux domaines**, et un seul l'emploie. Pour
+les GGUF du catalogue, elle suit `download_model` et relit réellement les octets.
+Pour l'archive de `llama-server`, elle **n'existe pas** : le plan ne l'émet pas
+(COR-030). La raison est qu'à ce numéro d'étape l'archive n'est pas encore
+téléchargée — c'est `install_runtime` qui la récupère puis confronte son empreinte
+avant d'extraire quoi que ce soit. Une étape qui ne peut rien vérifier était
+sautée par l'applicateur, et une étape sautée ne prouve rien : la condition n°1 du
+jalon M2 retombait `unsatisfied` sur une installation pourtant réussie, et
+`bootstrap-apply` sortait en code 3. L'empreinte attendue est donc inscrite dans le
+détail de l'étape `install_runtime`, qui est celle qui la contrôle.
+
 `smoke_test` est exécutée **pour chaque modèle**, immédiatement après son
 activation provisoire. Elle traverse le chemin public réel (nginx → gateway →
 `llama-server`) et ferme la transition DEC-010 : succès, la preuve complète
@@ -368,6 +379,14 @@ Aucune valeur estimée ne doit être recopiée telle quelle dans le `vram_gb` du
 registre. `calibrate_model` est l'étape qui remplace l'estimation par des pics
 observés et **propose** un `vram_gb` sans l'appliquer silencieusement ; tant
 qu'elle n'a pas eu lieu, l'entrée reste `enabled: false`.
+
+Les « paramètres » de cette chaîne sont ceux du modèle inspecté, et de lui seul :
+`ctx_size`, `parallel` et les types de cache KV viennent des `runtime.defaults` de
+**son** entrée de catalogue (COR-027). Le poste dominant de l'estimation est le
+cache KV, proportionnel au produit `ctx_size × parallel` : appliquer à un modèle
+les réglages d'un autre — ce que faisait le planificateur au-delà du premier
+modèle retenu — produit un chiffre faux de plusieurs ordres de grandeur, et faux
+dans le sens de la sous-estimation quand le premier modèle est le plus modeste.
 
 ### LLMfit : conseiller, jamais autorité
 
@@ -827,6 +846,25 @@ Mo ne prouverait rien.
 
 Quand `--version` ne rend pas de commit, ce recoupement-là est simplement omis :
 on ne peut pas le faire, on ne l'invente pas. Les autres restent.
+
+##### D'où vient le manifeste confronté (SEC-017)
+
+Ces six confrontations n'ont de valeur que si un manifeste leur est réellement
+fourni. Elles ne l'étaient pas : `planner._resolve_runtime` ne passait au
+résolveur que le chemin du binaire, jamais son manifeste, et le recoupement
+n'avait donc lieu que dans les tests. Le planificateur relit désormais le
+`provenance.yaml` que `runtime_installer` pose **à côté du binaire**, et en tire
+trois issues dégradées, chacune portant son constat dans le plan :
+
+| Constat | Cause | Conséquence |
+|---|---|---|
+| `runtime_manifest_absent` (`info`) | aucun fichier au chemin attendu — cas nominal d'un binaire compilé à la main | pas d'attestation ; le constat dit **où** le manifeste était attendu |
+| `runtime_manifest_unreadable` (`warn`) | droits insuffisants, fichier tronqué, YAML invalide | pas d'attestation |
+| `runtime_manifest_invalid` (`warn`) | relu, mais refusé par les règles de §6 | pas d'attestation |
+
+Fail-closed dans les trois cas : **l'absence de manifeste ne vaut jamais
+attestation**. Un manifeste approximatif vaut d'ailleurs moins que pas de
+manifeste, précisément parce qu'on lui fait confiance.
 
 #### Aucun invariant de production porté par un `assert` (COR-021)
 

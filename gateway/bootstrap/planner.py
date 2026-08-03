@@ -96,6 +96,7 @@ place dans un module de contrat partagé, pas recopiées des deux côtés.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field, replace
@@ -190,7 +191,7 @@ async def build_plan(options: PlannerOptions) -> schema.BootstrapPlan:
             rationale="aucune politique de release n'a été fournie au planificateur",
         ))
     else:
-        sections.append(runtime_mod.to_plan_section(resolution))
+        sections.append(_runtime_section(resolution))
         decisions.append(runtime_mod.to_decision(resolution))
 
     advice = llmfit_mod.run_llmfit(options.llmfit_config)
@@ -311,12 +312,83 @@ async def _resolve_runtime(
         release=options.release_policy  # type: ignore[arg-type]
     )
     profile = runtime_mod.hardware_profile_from_mapping(hardware.to_dict())
-    return await runtime_mod.resolve_runtime(
+
+    # SEC-017 — relire le manifeste posé à côté du binaire par `runtime_installer`.
+    #
+    # Sans ce raccord, `existing_manifest` restait toujours `None` sur le parcours
+    # opérateur : le recoupement manifeste ↔ binaire livré par SEC-009 — version,
+    # commit, backend, empreinte — n'était exercé que par les tests, et le
+    # résolveur accordait `reuse_existing` sans confronter la moindre attestation.
+    # La lecture est déportée hors de la boucle d'événements : c'est un accès
+    # disque, court mais bloquant.
+    attestation: runtime_mod.ExistingAttestation | None = None
+    if options.existing_binary is not None:
+        attestation = await asyncio.to_thread(
+            runtime_mod.read_existing_attestation, options.existing_binary
+        )
+
+    resolution = await runtime_mod.resolve_runtime(
         profile,
         policy,
         installed_at=options.generated_at,
         existing_binary=options.existing_binary,
+        existing_manifest=attestation.manifest if attestation else None,
+        existing_binary_sha256=attestation.binary_sha256 if attestation else None,
     )
+
+    # Le constat de lecture précède ceux de la résolution : il dit ce qu'on a
+    # trouvé sur disque, les autres disent ce qu'on en conclut.
+    if attestation is not None and attestation.finding is not None:
+        return replace(resolution, findings=schema.merge_findings(
+            (attestation.finding,), resolution.findings,
+        ))
+    return resolution
+
+
+def _runtime_section(resolution: runtime_mod.RuntimeResolution) -> schema.PlanSection:
+    """
+    Section `runtime`, augmentée de la politique retenue en clair.
+
+    AUT-019 — le producteur ne peut pas le faire lui-même : les drapeaux vivent
+    dans `data`, que le rendu humain n'imprime pas, alors que `notes` l'est. Sans
+    ce raccord, un opérateur lirait « repli CPU » sans jamais lire qu'il l'avait
+    autorisé, ni sous quelles règles le reste du plan a été calculé. C'est le même
+    raccord que `_recommendation_section` fait pour les limites de LLMfit.
+
+    Une politique par défaut ne produit aucune note : un constat qui n'apprend
+    rien apprend au lecteur à ne plus lire les constats.
+    """
+    section = runtime_mod.to_plan_section(resolution)
+
+    lignes: list[str] = []
+    if resolution.allow_container:
+        lignes.append(
+            "Mode conteneur ACCEPTÉ (--allow-container) : les images officielles épinglées par\n"
+            "digest entrent dans l'ordre de résolution. `server_manager` ne sait pas encore\n"
+            "lancer de conteneur — le plan est descriptible, son application ne l'est pas."
+        )
+    if not resolution.allow_local_build:
+        lignes.append(
+            "Build local REFUSÉ (--no-local-build) : l'étape 4 de §6 est fermée. Sur la matrice\n"
+            "livrée avec EVARuntime, qui ne porte aucune empreinte, il ne reste alors aucune\n"
+            "variante éligible et la résolution échouera."
+        )
+    if resolution.allow_cpu_fallback:
+        entete = (
+            "Repli CPU EMPRUNTÉ" if resolution.degraded else "Repli CPU AUTORISÉ, non emprunté"
+        )
+        lignes.append(
+            f"{entete} (--allow-cpu-fallback). Ce n'est pas le défaut : §6 exige que la\n"
+            "dégradation GPU → CPU soit demandée, jamais subie. Une installation CPU démarre,\n"
+            "répond et passe le smoke test ; son TTFT ne se verra qu'en production, et le\n"
+            "`vram_gb` de models.yaml n'aura plus de sens."
+            + (
+                "\nCE PLAN EST DÉGRADÉ : le GPU de cet hôte ne sera pas utilisé."
+                if resolution.degraded else ""
+            )
+        )
+
+    return replace(section, notes=section.notes + tuple(lignes)) if lignes else section
 
 
 def _no_release_policy_section(options: PlannerOptions) -> schema.PlanSection:
@@ -661,21 +733,50 @@ def _inspect_local(
     `inspect_paths` rend alors `skip`. Quand un fichier est déjà là (réinstallation,
     hôte de test), son header vaut mieux que l'estimation déclarée du catalogue :
     il vient du fichier réel.
+
+    COR-027 — chaque modèle est estimé avec SES réglages
+    ----------------------------------------------------
+    L'estimation d'empreinte dépend du `ctx_size`, du `parallel` et des types de
+    cache KV : c'est le cache KV qui domine le calcul, et il est proportionnel au
+    produit des deux premiers. Ce module employait `retained[0].entry.runtime.defaults`
+    pour **tous** les GGUF inspectés : avec `--max-models 2`, le second modèle
+    était estimé avec les réglages du premier. Deux modèles aux `defaults`
+    différents produisaient donc un chiffre faux pour le second, et faux dans une
+    direction imprévisible — sous-estimé si le premier est plus modeste, ce qui
+    est le sens dangereux.
+
+    Chaque modèle est donc inspecté avec ses propres entrées, et les résultats
+    sont concaténés dans l'ordre des chemins.
+
+    Le statut, le résumé et les constats, eux, ne dépendent **que** de la
+    lisibilité des fichiers — jamais des réglages. Ils sont donc calculés une
+    seule fois, sur l'ensemble, par `gguf_meta` lui-même : redériver sa grille
+    ici en créerait une seconde définition, et c'est toujours celle qu'on oublie
+    de mettre à jour qui finit par mentir.
     """
     if not retained:
         return None
-    paths = [
+
+    entries: list[dict[str, Any]] = []
+    for choice in retained:
+        defaults = choice.entry.runtime.defaults
+        part = gguf_meta.inspect_paths(
+            [options.models_dir / file.name for file in choice.entry.files],
+            gguf_meta.EstimationInputs(
+                ctx_size=defaults.ctx_size,
+                parallel=defaults.parallel,
+                cache_type_k=defaults.cache_type_k,
+                cache_type_v=defaults.cache_type_v,
+            ),
+        )
+        entries.extend(part.entries)
+
+    ensemble = gguf_meta.inspect_paths([
         options.models_dir / file.name
         for choice in retained
         for file in choice.entry.files
-    ]
-    defaults = retained[0].entry.runtime.defaults
-    return gguf_meta.inspect_paths(paths, gguf_meta.EstimationInputs(
-        ctx_size=defaults.ctx_size,
-        parallel=defaults.parallel,
-        cache_type_k=defaults.cache_type_k,
-        cache_type_v=defaults.cache_type_v,
-    ))
+    ])
+    return replace(ensemble, entries=tuple(entries))
 
 
 def _inspection_for(

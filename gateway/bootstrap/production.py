@@ -54,6 +54,13 @@ _RUNTIME_DATA_KEYS = frozenset({
     "backend_candidates", "targeted_backend", "selected_backend",
     "gpu_vendor", "gpu_count", "driver_version", "cuda_major",
     "min_build", "observed_build", "variant", "manifest", "rejected",
+    # AUT-019 — la politique du résolveur voyage dans le plan. La reconstruction
+    # doit la relire aussi strictement que le reste : c'est elle qui dit si un
+    # repli CPU était autorisé, et l'application ne doit pas pouvoir en changer.
+    "policy",
+})
+_POLICY_KEYS = frozenset({
+    "allow_container", "allow_local_build", "allow_cpu_fallback",
 })
 _VARIANT_KEYS = frozenset({
     "source", "backend", "platform", "evidence", "evidence_note",
@@ -223,6 +230,8 @@ def runtime_resolution_from_plan(document: Mapping[str, Any]) -> runtime_resolve
     rejected = data["rejected"]
     if not isinstance(rejected, list) or any(not isinstance(v, str) for v in rejected):
         raise ProductionWiringError("runtime.rejected doit être une liste de chaînes")
+    politique = _object(data["policy"], "sections.runtime.data.policy")
+    _closed(politique, _POLICY_KEYS, "sections.runtime.data.policy")
     findings_raw = section.get("findings")
     if not isinstance(findings_raw, list):
         raise ProductionWiringError("sections.runtime.findings doit être une liste")
@@ -255,6 +264,15 @@ def runtime_resolution_from_plan(document: Mapping[str, Any]) -> runtime_resolve
         summary=_string(section.get("summary"), "sections.runtime.summary"),
         findings=findings,
         rejected=tuple(rejected),
+        allow_container=_strict_bool(
+            politique["allow_container"], "runtime.policy.allow_container"
+        ),
+        allow_local_build=_strict_bool(
+            politique["allow_local_build"], "runtime.policy.allow_local_build"
+        ),
+        allow_cpu_fallback=_strict_bool(
+            politique["allow_cpu_fallback"], "runtime.policy.allow_cpu_fallback"
+        ),
     )
     if resolution.to_data() != data:
         raise ProductionWiringError(

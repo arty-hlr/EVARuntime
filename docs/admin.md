@@ -1668,6 +1668,9 @@ cd /opt/llm-gateway
 | `--pin-commit` | Commit git correspondant à `--pin-version` | aucun |
 | `--min-build` | Premier build patché connu — plancher de sécurité | `0` |
 | `--runtime-variants` | Matrice d'artefacts `llama-server` épinglée par l'opérateur (YAML) — **remplace** la matrice livrée | matrice livrée |
+| `--allow-container` | Accepter une image conteneur épinglée par digest (étape 2 de §6) | refusé |
+| `--allow-local-build` / `--no-local-build` | Accepter le build local reproductible (étape 4 de §6) | accepté |
+| `--allow-cpu-fallback` | **Assumer** la dégradation GPU → CPU si aucune variante GPU sûre n'existe | refusé |
 | `--llmfit-bin` | Binaire LLMfit à consulter | recherché dans le `PATH` |
 | `--llmfit-version` | Version LLMfit attendue — va de pair avec `--llmfit-sha256` | aucune |
 | `--llmfit-sha256` | Empreinte attendue du binaire LLMfit (64 hex minuscules) | aucune |
@@ -1852,6 +1855,50 @@ Enfin, ce que fournir une matrice **ne fait pas** : cela n'autorise aucun repli
 CPU tacite (§6 reste appliqué à l'identique), et cela ne prouve pas que l'archive
 désignée contient un `llama-server` compilé pour le backend annoncé —
 `--version` ne le dit pas. Le plan porte ce constat.
+
+### Ouvrir une branche de §6 — les trois drapeaux de politique
+
+L'ordre de résolution de §6 comporte des branches que l'opérateur doit accepter
+explicitement. Elles étaient jusqu'ici inatteignables autrement que depuis du code
+Python : on pouvait épingler une image conteneur par digest et la voir
+**systématiquement** écartée — « mode conteneur non accepté par la politique ».
+
+| Option | Ce qu'elle ouvre ou ferme | Défaut |
+|---|---|---|
+| `--allow-container` | L'étape 2 de §6 : les images officielles épinglées **par digest** entrent dans l'ordre de résolution | refusé |
+| `--no-local-build` | Ferme l'étape 4. Sur la matrice livrée, qui ne porte aucune empreinte, il ne reste alors **aucune** variante éligible et la résolution échoue | l'étape est ouverte |
+| `--allow-cpu-fallback` | Assume la dégradation GPU → CPU quand aucune variante GPU sûre n'existe | refusé |
+
+Les trois exigent `--pin-version` et `--pin-commit`, pour la même raison que
+`--runtime-variants` : autoriser une branche sans épingler de version ne résout
+rien, et laisser passer l'option ferait croire qu'elle a été prise en compte.
+
+`--allow-container` a une limite qui n'est pas dans la politique mais dans le
+code : `server_manager` ne sait lancer que des sous-processus natifs. Le plan est
+descriptible, son application ne l'est pas encore — le plan porte ce constat.
+
+#### `--allow-cpu-fallback` n'est pas un détail d'invocation
+
+Le défaut qui compte est que ce drapeau soit **faux**. Une installation CPU
+démarre, répond et passe le smoke test : elle a toutes les apparences d'une
+installation réussie, et son TTFT ne se verra qu'en production, des semaines plus
+tard. §6 exige donc que cette dégradation soit demandée, jamais subie.
+
+La politique retenue est inscrite dans le plan, sous `sections.runtime.data.policy`,
+et pas seulement dans la ligne de commande : un plan relu six mois après doit dire
+sous quelles règles il a été calculé, sans quoi on le compare à un autre sans
+savoir que les règles différaient. Deux constats accompagnent le drapeau :
+
+- `cpu_fallback_authorized` (`info`) dès que l'autorisation est debout, **même si
+  le repli n'est pas emprunté** ;
+- `cpu_fallback_degraded` (`warn`) quand il l'est — avec ce que l'opérateur perd :
+  GPU inutilisé, TTFT et débit d'un ordre de grandeur inférieurs, `vram_gb` de
+  `models.yaml` privé de sens.
+
+Le rendu humain, lui, porte l'annonce en toutes lettres dans les notes de la
+section : `Repli CPU EMPRUNTÉ` et `CE PLAN EST DÉGRADÉ`. `data` n'est pas imprimé,
+`notes` l'est — et un repli CPU qui ne se lirait que dans le JSON serait un repli
+silencieux. Avec `--strict`, l'avertissement devient bloquant.
 
 ### Exemple de sortie humaine
 

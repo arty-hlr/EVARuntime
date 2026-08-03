@@ -17,11 +17,20 @@ aveugles.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
+import io
+import json
+import tarfile
 from pathlib import Path
 
 import pytest
 import yaml
 
+from bootstrap import applier as ap
+from bootstrap import execution as ex
+from bootstrap import install_report as ir
+from bootstrap import runtime_installer as ri
 from bootstrap import runtime_resolver as rr
 from bootstrap import schema
 from llama_version import LlamaVersion
@@ -909,18 +918,70 @@ def test_variant_rejects_an_unknown_evidence_level():
 
 # ── Étapes du plan ────────────────────────────────────────────────────────────
 
-def test_steps_verify_before_installing():
+def test_une_archive_epinglee_ne_produit_que_l_etape_qui_verifie_vraiment():
+    """
+    COR-030 — l'étape `verify_artifact` du domaine runtime n'est plus émise.
+
+    Elle précédait `install_runtime` alors que l'archive n'est pas encore
+    téléchargée à ce numéro d'étape : elle ne pouvait rien vérifier,
+    `applier._verify_dispatcher` la sautait, et `install_report` en tirait — à
+    juste titre — que la condition n°1 de M2 n'était pas prouvée.
+
+    L'empreinte attendue ne disparaît pas du plan pour autant : elle est
+    désormais portée par l'étape qui la confronte réellement.
+    """
     resolution = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_OFFICIAL_RELEASE),)))
     steps = rr.to_plan_steps(resolution)
-    assert [s.action for s in steps] == [schema.ACTION_VERIFY_ARTIFACT, schema.ACTION_INSTALL_RUNTIME]
-    assert SHA_A in steps[0].detail
+
+    assert [s.action for s in steps] == [schema.ACTION_INSTALL_RUNTIME]
+    assert SHA_A in steps[0].detail, "l'empreinte épinglée a disparu du plan"
     assert steps[-1].requires_root is True
+
+
+def test_l_etape_de_verification_reste_disponible_mais_sur_demande():
+    """
+    `include_verify` survit comme opt-in, pour un appelant qui poserait l'archive
+    en amont. Aucun ne le fait aujourd'hui — et c'est bien pour cela que le défaut
+    ne se voyait qu'à l'exécution du parcours complet.
+    """
+    resolution = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_OFFICIAL_RELEASE),)))
+    steps = rr.to_plan_steps(resolution, include_verify=True)
+
+    # Quand elle est demandée, la vérification précède toujours l'installation.
+    assert [s.action for s in steps] == [
+        schema.ACTION_VERIFY_ARTIFACT, schema.ACTION_INSTALL_RUNTIME,
+    ]
+
+
+def test_aucun_appelant_du_depot_ne_demande_l_etape_de_verification():
+    """
+    Contrôle de non-retour : réactiver le défaut demanderait un appel explicite.
+
+    Le paramètre était mort avec un défaut à `True` ; il est mort avec un défaut
+    à `False`. La différence est qu'il ne produit plus une étape que l'exécuteur
+    saute et que le rapport compte comme une preuve manquante.
+    """
+
+    assert inspect.signature(rr.to_plan_steps).parameters["include_verify"].default is False
+
+    paquet = Path(rr.__file__).parent
+    for fichier in paquet.glob("*.py"):
+        source = fichier.read_text(encoding="utf-8")
+        assert "include_verify=True" not in source, fichier.name
+    # Contrôle positif : la recherche voit bien les appels à `to_plan_steps`.
+    assert any(
+        "to_plan_steps(" in f.read_text(encoding="utf-8")
+        for f in paquet.glob("*.py")
+        if f.name != "runtime_resolver.py"
+    )
 
 
 def test_steps_are_renumbered_from_start_order():
     resolution = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_OFFICIAL_RELEASE),)))
-    steps = rr.to_plan_steps(resolution, start_order=7)
-    assert [s.order for s in steps] == [7, 8]
+    assert [s.order for s in rr.to_plan_steps(resolution, start_order=7)] == [7]
+    assert [
+        s.order for s in rr.to_plan_steps(resolution, start_order=7, include_verify=True)
+    ] == [7, 8]
 
 
 def test_local_build_has_nothing_to_verify_yet():
@@ -956,8 +1017,132 @@ def test_plan_section_data_leaks_no_secret():
 def test_resolver_imports_nothing_that_could_reach_the_network_or_build():
     imports = rr.module_toplevel_imports()
     assert imports & rr.FORBIDDEN_IMPORTS == frozenset()
-    # Contrôle positif : l'analyse voit réellement les imports du module.
-    assert {"yaml", "llama_version", "re", "ast"} <= imports
+    assert imports & rr.FORBIDDEN_SIBLING_IMPORTS == frozenset()
+    # Contrôle positif : l'analyse voit réellement les imports du module, y
+    # compris le seul frère qu'il s'autorise — un contrat, pas un pair.
+    assert {"yaml", "llama_version", "re", "ast", f"{rr.PACKAGE}.schema"} <= imports
+
+
+# ── TST-007 — le garde-fou lui-même est-il capable d'échouer ? ────────────────
+#
+# L'analyse statique filtrait les imports sur `node.level == 0` : `from . import
+# public_https` lui était invisible. Le garde-fou aurait donc laissé passer
+# exactement l'ajout qu'il existe pour empêcher. Les tests qui suivent le
+# prouvent par mutation : on injecte l'import interdit dans une copie du module
+# et on exige que l'analyse le voie.
+
+def _mutant(tmp_path: Path, ligne: str) -> Path:
+    """Copie du résolveur avec une ligne d'import ajoutée juste après la sienne."""
+    source = Path(rr.__file__).read_text(encoding="utf-8")
+    ancre = "from . import schema"
+    assert ancre in source, "point d'injection introuvable : le module a changé d'import"
+    chemin = tmp_path / "resolveur_mute.py"
+    chemin.write_text(source.replace(ancre, f"{ancre}\n{ligne}", 1), encoding="utf-8")
+    return chemin
+
+
+@pytest.mark.parametrize("ligne", [
+    "from . import public_https",
+    "from .public_https import fetch_json",
+    "from bootstrap import public_https",
+    "import bootstrap.public_https",
+])
+def test_le_garde_fou_voit_un_frere_reseau_quelle_que_soit_la_syntaxe(tmp_path, ligne):
+    """
+    Les quatre écritures d'un même import doivent toutes rendre le garde-fou rouge.
+
+    Trois d'entre elles lui échappaient : les deux relatives par le filtre
+    `node.level == 0`, et `from bootstrap import public_https` parce qu'elle ne
+    rendait que « bootstrap », interdit nulle part.
+    """
+    vus = rr.module_toplevel_imports(_mutant(tmp_path, ligne))
+
+    assert f"{rr.PACKAGE}.public_https" in vus, vus
+    assert vus & rr.FORBIDDEN_SIBLING_IMPORTS, "le garde-fou reste aveugle à ce frère"
+
+
+def test_le_garde_fou_voit_un_import_reseau_direct_meme_differe(tmp_path):
+    """
+    Contrôle symétrique : un `import socket` caché dans un corps de fonction est vu.
+
+    `ast.walk` descend dans tout l'arbre ; s'il ne parcourait que le premier
+    niveau, déplacer l'import de trois lignes suffirait à contourner le garde-fou.
+    """
+    source = Path(rr.__file__).read_text(encoding="utf-8")
+    chemin = tmp_path / "resolveur_differe.py"
+    chemin.write_text(
+        source.replace(
+            "async def sha256_binary(path: Path) -> str | None:",
+            "async def sha256_binary(path: Path) -> str | None:\n    import socket  # noqa",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    assert "socket" in rr.module_toplevel_imports(chemin)
+
+
+def test_l_analyse_ne_confond_pas_un_frere_avec_un_module_du_meme_nom(tmp_path):
+    """
+    `import schema` (absolu) et `from . import schema` (frère) ne sont pas le même
+    module. Les canoniser tous les deux en « schema » rendrait n'importe quelle
+    liste d'autorisation ambiguë.
+    """
+    chemin = tmp_path / "deux_schemas.py"
+    chemin.write_text("import schema\nfrom . import schema as s2\n", encoding="utf-8")
+
+    vus = rr.module_toplevel_imports(chemin)
+    assert vus == {"schema", f"{rr.PACKAGE}.schema"}
+
+
+def _atteint_un_interdit() -> frozenset[str]:
+    """
+    Fermeture transitive « module du paquet qui peut atteindre un FORBIDDEN_IMPORTS ».
+
+    Recalculée depuis les sources plutôt que recopiée : c'est ce qui empêche
+    `FORBIDDEN_SIBLING_IMPORTS` de vieillir en silence le jour où un module gagne
+    un accès réseau.
+    """
+    paquet = Path(rr.__file__).parent
+    directs: dict[str, frozenset[str]] = {}
+    for fichier in paquet.glob("*.py"):
+        if fichier.name == "__init__.py":
+            continue
+        directs[f"{rr.PACKAGE}.{fichier.stem}"] = rr.module_toplevel_imports(fichier)
+
+    atteints = {
+        nom for nom, vus in directs.items() if vus & rr.FORBIDDEN_IMPORTS
+    }
+    change = True
+    while change:  # propagation jusqu'au point fixe
+        change = False
+        for nom, vus in directs.items():
+            if nom not in atteints and vus & atteints:
+                atteints.add(nom)
+                change = True
+    return frozenset(atteints)
+
+
+def test_la_liste_des_freres_interdits_est_complete_et_sans_exces():
+    """
+    `FORBIDDEN_SIBLING_IMPORTS` doit valoir exactement la fermeture transitive.
+
+    Trop courte, le garde-fou laisse passer ; trop longue, il interdit un module
+    inoffensif et l'opérateur finira par contourner la règle plutôt que la lire.
+    """
+    attendu = _atteint_un_interdit() - {f"{rr.PACKAGE}.{Path(rr.__file__).stem}"}
+
+    # Contrôle positif : le calcul voit bien quelque chose, et voit bien le frère
+    # qui a motivé TST-007.
+    assert f"{rr.PACKAGE}.public_https" in attendu
+    assert len(attendu) >= 5, attendu
+
+    assert attendu == rr.FORBIDDEN_SIBLING_IMPORTS
+
+
+def test_le_resolveur_lui_meme_n_atteint_aucun_interdit():
+    """Le corollaire : le résolveur ne figure pas dans sa propre fermeture."""
+    assert f"{rr.PACKAGE}.runtime_resolver" not in _atteint_un_interdit()
 
 
 def test_version_probe_is_delegated_to_llama_version_not_reimplemented():
@@ -967,3 +1152,315 @@ def test_version_probe_is_delegated_to_llama_version_not_reimplemented():
     assert rr.probe_llama_version is llama_version.probe_llama_version
     source = Path(rr.__file__).read_text(encoding="utf-8")
     assert "create_subprocess" not in source
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COR-030 — les quatre parcours bout en bout
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Le correctif retire une étape du plan. Une suppression d'étape est toujours
+# suspecte : elle peut supprimer un défaut, ou seulement supprimer le témoin qui
+# le signalait. Les quatre parcours ci-dessous tranchent la question en exécutant
+# réellement la chaîne — plan → applicateur → journal → rapport d'installation —
+# sur les deux axes indépendants :
+#
+#   axe 1 : l'étape `verify_artifact` est-elle émise ?
+#   axe 2 : l'archive servie correspond-elle à l'empreinte épinglée ?
+#
+# C'est le COUPLE des deux parcours « sans verify » qui fait la démonstration :
+# retirer l'étape verdit le parcours réussi SANS verdir le parcours non vérifié.
+# Sans lui, le correctif serait indistinguable d'une complaisance.
+#
+# Aucun réseau, aucun sous-processus : le transport et la sonde `--version` sont
+# injectés, comme dans la suite de `runtime_installer`.
+
+_URL_ARCHIVE ="https://releases.example.com/llama-server-b6800-cpu.tar.gz"
+
+
+def _archive_bytes(contenu: bytes = b"#!/bin/false\nfaux llama-server\n") -> bytes:
+    """Archive plausible : le binaire, un objet partagé, une licence."""
+    tampon = io.BytesIO()
+    with tarfile.open(fileobj=tampon, mode="w:gz") as tar:
+        for nom, data, mode in (
+            ("llama-server", contenu, 0o755),
+            ("libggml.so.0", b"faux objet partage", 0o644),
+            ("LICENSE", b"MIT License\n", 0o644),
+        ):
+            info = tarfile.TarInfo(nom)
+            info.size = len(data)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(data))
+    return tampon.getvalue()
+
+
+class _TransportInjecte:
+    """Sert des octets préparés. Ne joint rien, ne résout rien."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    async def fetch(self, url: str, destination: Path, *, max_bytes: int) -> int:
+        destination.write_bytes(self.payload)
+        return len(self.payload)
+
+
+def _parcours(tmp_path: Path, *, include_verify: bool, archive_conforme: bool):
+    """
+    Exécute un parcours complet et rend `(rapport_exec, rapport_install)`.
+
+    `archive_conforme=False` fait servir au transport une archive DIFFÉRENTE de
+    celle qu'épingle le manifeste : c'est le vrai contrôle d'intégrité de
+    `runtime_installer` qui échoue alors, pas une assertion de ce test.
+    """
+    servi = _archive_bytes() if archive_conforme else _archive_bytes(b"charge utile substituee")
+    epingle = hashlib.sha256(_archive_bytes()).hexdigest()
+
+    resolution = resolve(
+        cpu_profile(),
+        make_policy(
+            (variant(rr.SOURCE_OFFICIAL_RELEASE, "cpu", artifact_sha256=epingle),),
+            release=rr.ReleasePolicy(
+                pinned_version="b6800", pinned_commit=COMMIT, security_floor_build=6700,
+            ),
+        ),
+    )
+    assert resolution.resolved and resolution.variant is not None
+
+    steps = rr.to_plan_steps(resolution, include_verify=include_verify)
+    plan = schema.BootstrapPlan(
+        generated_at=NOW,
+        mode="apply",
+        sections=(rr.to_plan_section(resolution),),
+        steps=steps,
+        decisions=(rr.to_decision(resolution),),
+    )
+    document = plan.to_dict()
+    assert schema.validate_plan_dict(document) == ()
+    assert document["applicable"] is True
+
+    installateur = ri.RuntimeInstaller(
+        ri.RuntimeInstallRequest(
+            resolution=resolution,
+            archive_url=_URL_ARCHIVE,
+            install_root=tmp_path / "runtime",
+            limits=ri.ArchiveLimits(),
+        ),
+        transport=_TransportInjecte(servi),  # type: ignore[arg-type]
+        probe=probing(6800, raw="version: 6800 (abc1234)", commit="abc1234"),
+    )
+
+    registre = ex.ExecutorRegistry()
+    registre.register(schema.ACTION_INSTALL_RUNTIME, installateur)
+    registre.register(
+        schema.ACTION_VERIFY_ARTIFACT,
+        ap._verify_dispatcher(ap.ApplierConfig(runtime=installateur), None),
+    )
+
+    ticks = iter(range(0, 100_000))
+    contexte = ex.ExecutionContext(
+        mode=ex.ExecutionMode.APPLY,
+        allowed_roots=(tmp_path,),
+        monotonic=lambda: float(next(ticks)) / 1000.0,
+        now=lambda: NOW,
+    )
+    rapport_exec = asyncio.run(ex.execute_plan(
+        ex.load_plan_document(json.dumps(document)), registre, contexte,
+    ))
+    rapport_install = ir.build_install_report(
+        plan_document=document, execution_report=rapport_exec, now=lambda: NOW,
+    )
+    return rapport_exec, rapport_install
+
+
+def _condition_runtime(rapport: ir.InstallReport) -> ir.ConditionOutcome:
+    return next(c for c in rapport.conditions() if c.code == "runtime_installed")
+
+
+def test_parcours_avec_verify_et_runtime_conforme_reste_insatisfait(tmp_path):
+    """
+    Le défaut, reproduit tel qu'il se produisait : l'installation RÉUSSIT et la
+    condition n°1 du jalon M2 sort quand même insatisfaite.
+
+    L'étape `verify_artifact` ne peut rien vérifier à ce numéro — l'archive n'est
+    pas encore téléchargée — donc l'applicateur la saute, et une étape sautée ne
+    prouve rien. Ce test reste vert avec le correctif : il passe `include_verify`
+    explicitement, et documente ce que le défaut coûtait.
+    """
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=True, archive_conforme=True)
+
+    statuts = [(r.action, r.status) for r in rapport_exec.results]
+    assert statuts == [
+        (schema.ACTION_VERIFY_ARTIFACT, ex.STEP_SKIPPED),
+        (schema.ACTION_INSTALL_RUNTIME, ex.STEP_DONE),
+    ]
+    condition = _condition_runtime(rapport)
+    assert condition.status == ir.CONDITION_UNSATISFIED
+    assert "sautée" in condition.proof
+    # Le rayon d'action dépassait le rapport M2 : l'EXÉCUTION elle-même sortait
+    # en code 3, et tout script testant le code 0 lisait un demi-échec — alors
+    # que la seule étape qui agit avait réussi.
+    assert rapport_exec.verdict() == ex.VERDICT_PARTIAL
+    assert rapport_exec.exit_code() == ex.EXIT_PARTIAL == 3
+
+
+def test_parcours_avec_verify_et_runtime_non_verifie_reste_insatisfait(tmp_path):
+    """Contrôle : avec l'étape vide, un échec réel reste un échec."""
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=True, archive_conforme=False)
+
+    assert rapport_exec.results[-1].status == ex.STEP_FAILED
+    assert _condition_runtime(rapport).status == ir.CONDITION_UNSATISFIED
+
+
+def test_parcours_sans_verify_et_runtime_conforme_est_satisfait(tmp_path):
+    """
+    COR-030 — le parcours nominal se prononce enfin.
+
+    Une seule étape, celle qui vérifie et installe réellement. La condition n°1
+    est satisfaite, l'exécution est `ok`, et `bootstrap-apply` sort en code 0.
+    """
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=False, archive_conforme=True)
+
+    assert [(r.action, r.status) for r in rapport_exec.results] == [
+        (schema.ACTION_INSTALL_RUNTIME, ex.STEP_DONE),
+    ]
+    assert _condition_runtime(rapport).status == ir.CONDITION_SATISFIED
+    assert rapport_exec.verdict() == ex.VERDICT_OK
+    assert rapport_exec.exit_code() == ex.EXIT_OK == 0
+
+    # Le rapport d'installation reste `partial`, et c'est correct : ce plan-ci ne
+    # pose QUE le runtime, les six autres conditions de M2 n'ont aucune étape pour
+    # les prouver. Ce qui est corrigé, c'est la condition n°1 — la seule que ce
+    # plan puisse trancher — et le code de sortie de `bootstrap-apply`.
+    assert {c.status for c in rapport.conditions() if c.code != "runtime_installed"} <= {
+        ir.CONDITION_UNPROVEN, ir.CONDITION_SATISFIED,
+    }
+
+
+def test_parcours_sans_verify_et_runtime_non_verifie_reste_insatisfait(tmp_path):
+    """
+    Le pendant décisif du précédent, et la preuve que le correctif n'est pas une
+    complaisance : retirer l'étape vide NE verdit PAS un runtime non vérifié.
+
+    La détection est portée entièrement par `install_runtime`, qui confronte
+    l'empreinte de l'archive avant d'extraire. L'étape `verify_artifact` n'y
+    contribuait rien — elle ne faisait que soustraire.
+    """
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=False, archive_conforme=False)
+
+    assert [(r.action, r.status) for r in rapport_exec.results] == [
+        (schema.ACTION_INSTALL_RUNTIME, ex.STEP_FAILED),
+    ]
+    assert _condition_runtime(rapport).status == ir.CONDITION_UNSATISFIED
+    assert rapport_exec.exit_code() != ex.EXIT_OK
+    assert rapport.exit_code() != ir.EXIT_OK
+    assert rapport.verdict() == ir.VERDICT_FAILED
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEC-017 — relire le manifeste posé à côté du binaire
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# SEC-009 (volet b) a livré le recoupement manifeste ↔ binaire, mais AUCUN
+# appelant ne fournissait jamais `existing_manifest` : le chemin corrigé n'était
+# exercé que par les tests. Le trou était réel et dormant.
+# `read_existing_attestation` est la lecture qui manquait ; ses quatre issues
+# sont couvertes ici, et `test_bootstrap_planner.py` prouve qu'elle est empruntée.
+
+def _ecrire_manifeste(binaire: Path, document) -> Path:
+    chemin = rr.provenance_path(binaire)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    chemin.write_text(
+        document if isinstance(document, str)
+        else yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return chemin
+
+
+def _document_pose(**overrides) -> dict:
+    """Document tel que `runtime_installer` le pose : bloc §6 + bloc `install:`."""
+    document = posed_manifest().to_document()
+    document["install"] = {"installer": "eva-bootstrap", "binary_sha256": SHA_BINARY}
+    for cle, valeur in overrides.items():
+        document["runtime"][cle] = valeur
+    return document
+
+
+def test_le_nom_du_manifeste_ne_peut_pas_diverger_de_celui_de_l_installateur():
+    """
+    Le résolveur DÉFINIT le manifeste, l'installateur le POSE. Le nom vit donc
+    chez le décideur : le sens de dépendance de `bootstrap/__init__.py` interdit
+    l'inverse, et le garde-fou d'isolation (TST-007) le refuserait.
+
+    Deux constantes, une seule vérité : ce test est le lien qui les tient.
+    """
+    assert rr.MANIFEST_FILENAME == ri.MANIFEST_FILENAME == "provenance.yaml"
+    assert rr.provenance_path(Path("/opt/eva/bin/llama-server")) == Path(
+        "/opt/eva/bin/provenance.yaml"
+    )
+
+
+def test_un_manifeste_absent_est_un_constat_nomme_et_non_une_attestation(tmp_path):
+    """Fail-closed : l'absence de manifeste ne vaut jamais attestation."""
+    lu = rr.read_existing_attestation(tmp_path / "llama-server")
+
+    assert lu.manifest is None
+    assert lu.binary_sha256 is None
+    assert lu.finding is not None
+    assert lu.finding.code == "runtime_manifest_absent"
+    assert lu.finding.level == "info"
+    # Le constat dit OÙ le manifeste était attendu : sans ce chemin, l'opérateur
+    # ne sait pas où poser celui qui manque.
+    assert str(tmp_path / "provenance.yaml") in lu.finding.message
+
+
+def test_un_manifeste_illisible_est_un_constat_nomme(tmp_path):
+    binaire = tmp_path / "llama-server"
+    _ecrire_manifeste(binaire, "runtime: [ceci n'est pas\n  un: yaml valide\n")
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.manifest is None
+    assert lu.finding is not None and lu.finding.code == "runtime_manifest_unreadable"
+    assert lu.finding.level == "warn"
+
+
+def test_un_manifeste_incoherent_est_un_constat_nomme(tmp_path):
+    """Un manifeste approximatif vaut moins que pas de manifeste : on lui fait confiance."""
+    binaire = tmp_path / "llama-server"
+    _ecrire_manifeste(binaire, _document_pose(version="six-mille-huit-cents"))
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.manifest is None
+    assert lu.finding is not None and lu.finding.code == "runtime_manifest_invalid"
+    assert "version" in lu.finding.message
+
+
+def test_un_manifeste_sain_rend_le_manifeste_et_l_empreinte_du_binaire(tmp_path):
+    """Contrôle positif de la famille : le cas nominal produit bien une attestation."""
+    binaire = tmp_path / "llama-server"
+    _ecrire_manifeste(binaire, _document_pose())
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.finding is None
+    assert lu.manifest == posed_manifest()
+    assert lu.binary_sha256 == SHA_BINARY
+
+
+def test_un_manifeste_sans_empreinte_de_binaire_n_atteste_pas(tmp_path):
+    """
+    Le bloc `install.binary_sha256` rattache le manifeste à CE binaire-ci. Sans
+    lui, la lecture réussit mais n'atteste rien, et le recoupement aval refuse la
+    réutilisation.
+    """
+    binaire = tmp_path / "llama-server"
+    document = _document_pose()
+    del document["install"]["binary_sha256"]
+    _ecrire_manifeste(binaire, document)
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.manifest is not None  # le bloc §6 est cohérent
+    assert lu.binary_sha256 is None  # mais rien ne le rattache au binaire
