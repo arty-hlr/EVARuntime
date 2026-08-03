@@ -634,12 +634,23 @@ def _string_literals(tree: ast.Module) -> set[str]:
 
 
 def _imported_modules(tree: ast.Module) -> set[str]:
+    """
+    Modules importés, imports relatifs compris.
+
+    TST-007 : la version d'origine ne gardait que `node.module`, or `from . import
+    public_https` porte `module=None` et son nom vit dans les alias. Le test
+    d'absence adossé à cette fonction était donc aveugle à la seule façon
+    réaliste, dans ce paquet, de faire entrer le réseau par la bande.
+    """
     modules: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            modules.add(node.module.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                modules.add(node.module.split(".")[0])
+            else:  # `from . import x` : c'est l'alias qui nomme le module
+                modules.update(alias.name.split(".")[0] for alias in node.names)
     return modules
 
 

@@ -956,8 +956,132 @@ def test_plan_section_data_leaks_no_secret():
 def test_resolver_imports_nothing_that_could_reach_the_network_or_build():
     imports = rr.module_toplevel_imports()
     assert imports & rr.FORBIDDEN_IMPORTS == frozenset()
-    # Contrôle positif : l'analyse voit réellement les imports du module.
-    assert {"yaml", "llama_version", "re", "ast"} <= imports
+    assert imports & rr.FORBIDDEN_SIBLING_IMPORTS == frozenset()
+    # Contrôle positif : l'analyse voit réellement les imports du module, y
+    # compris le seul frère qu'il s'autorise — un contrat, pas un pair.
+    assert {"yaml", "llama_version", "re", "ast", f"{rr.PACKAGE}.schema"} <= imports
+
+
+# ── TST-007 — le garde-fou lui-même est-il capable d'échouer ? ────────────────
+#
+# L'analyse statique filtrait les imports sur `node.level == 0` : `from . import
+# public_https` lui était invisible. Le garde-fou aurait donc laissé passer
+# exactement l'ajout qu'il existe pour empêcher. Les tests qui suivent le
+# prouvent par mutation : on injecte l'import interdit dans une copie du module
+# et on exige que l'analyse le voie.
+
+def _mutant(tmp_path: Path, ligne: str) -> Path:
+    """Copie du résolveur avec une ligne d'import ajoutée juste après la sienne."""
+    source = Path(rr.__file__).read_text(encoding="utf-8")
+    ancre = "from . import schema"
+    assert ancre in source, "point d'injection introuvable : le module a changé d'import"
+    chemin = tmp_path / "resolveur_mute.py"
+    chemin.write_text(source.replace(ancre, f"{ancre}\n{ligne}", 1), encoding="utf-8")
+    return chemin
+
+
+@pytest.mark.parametrize("ligne", [
+    "from . import public_https",
+    "from .public_https import fetch_json",
+    "from bootstrap import public_https",
+    "import bootstrap.public_https",
+])
+def test_le_garde_fou_voit_un_frere_reseau_quelle_que_soit_la_syntaxe(tmp_path, ligne):
+    """
+    Les quatre écritures d'un même import doivent toutes rendre le garde-fou rouge.
+
+    Trois d'entre elles lui échappaient : les deux relatives par le filtre
+    `node.level == 0`, et `from bootstrap import public_https` parce qu'elle ne
+    rendait que « bootstrap », interdit nulle part.
+    """
+    vus = rr.module_toplevel_imports(_mutant(tmp_path, ligne))
+
+    assert f"{rr.PACKAGE}.public_https" in vus, vus
+    assert vus & rr.FORBIDDEN_SIBLING_IMPORTS, "le garde-fou reste aveugle à ce frère"
+
+
+def test_le_garde_fou_voit_un_import_reseau_direct_meme_differe(tmp_path):
+    """
+    Contrôle symétrique : un `import socket` caché dans un corps de fonction est vu.
+
+    `ast.walk` descend dans tout l'arbre ; s'il ne parcourait que le premier
+    niveau, déplacer l'import de trois lignes suffirait à contourner le garde-fou.
+    """
+    source = Path(rr.__file__).read_text(encoding="utf-8")
+    chemin = tmp_path / "resolveur_differe.py"
+    chemin.write_text(
+        source.replace(
+            "async def sha256_binary(path: Path) -> str | None:",
+            "async def sha256_binary(path: Path) -> str | None:\n    import socket  # noqa",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    assert "socket" in rr.module_toplevel_imports(chemin)
+
+
+def test_l_analyse_ne_confond_pas_un_frere_avec_un_module_du_meme_nom(tmp_path):
+    """
+    `import schema` (absolu) et `from . import schema` (frère) ne sont pas le même
+    module. Les canoniser tous les deux en « schema » rendrait n'importe quelle
+    liste d'autorisation ambiguë.
+    """
+    chemin = tmp_path / "deux_schemas.py"
+    chemin.write_text("import schema\nfrom . import schema as s2\n", encoding="utf-8")
+
+    vus = rr.module_toplevel_imports(chemin)
+    assert vus == {"schema", f"{rr.PACKAGE}.schema"}
+
+
+def _atteint_un_interdit() -> frozenset[str]:
+    """
+    Fermeture transitive « module du paquet qui peut atteindre un FORBIDDEN_IMPORTS ».
+
+    Recalculée depuis les sources plutôt que recopiée : c'est ce qui empêche
+    `FORBIDDEN_SIBLING_IMPORTS` de vieillir en silence le jour où un module gagne
+    un accès réseau.
+    """
+    paquet = Path(rr.__file__).parent
+    directs: dict[str, frozenset[str]] = {}
+    for fichier in paquet.glob("*.py"):
+        if fichier.name == "__init__.py":
+            continue
+        directs[f"{rr.PACKAGE}.{fichier.stem}"] = rr.module_toplevel_imports(fichier)
+
+    atteints = {
+        nom for nom, vus in directs.items() if vus & rr.FORBIDDEN_IMPORTS
+    }
+    change = True
+    while change:  # propagation jusqu'au point fixe
+        change = False
+        for nom, vus in directs.items():
+            if nom not in atteints and vus & atteints:
+                atteints.add(nom)
+                change = True
+    return frozenset(atteints)
+
+
+def test_la_liste_des_freres_interdits_est_complete_et_sans_exces():
+    """
+    `FORBIDDEN_SIBLING_IMPORTS` doit valoir exactement la fermeture transitive.
+
+    Trop courte, le garde-fou laisse passer ; trop longue, il interdit un module
+    inoffensif et l'opérateur finira par contourner la règle plutôt que la lire.
+    """
+    attendu = _atteint_un_interdit() - {f"{rr.PACKAGE}.{Path(rr.__file__).stem}"}
+
+    # Contrôle positif : le calcul voit bien quelque chose, et voit bien le frère
+    # qui a motivé TST-007.
+    assert f"{rr.PACKAGE}.public_https" in attendu
+    assert len(attendu) >= 5, attendu
+
+    assert attendu == rr.FORBIDDEN_SIBLING_IMPORTS
+
+
+def test_le_resolveur_lui_meme_n_atteint_aucun_interdit():
+    """Le corollaire : le résolveur ne figure pas dans sa propre fermeture."""
+    assert f"{rr.PACKAGE}.runtime_resolver" not in _atteint_un_interdit()
 
 
 def test_version_probe_is_delegated_to_llama_version_not_reimplemented():

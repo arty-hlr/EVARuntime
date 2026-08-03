@@ -177,12 +177,40 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9]+-[a-z0-9_]+$")
 
+# Nom du paquet, tel que la gateway l'importe (`from bootstrap import …`). Sert à
+# ramener les trois écritures d'un import de module frère — `from . import x`,
+# `from .x import y`, `from bootstrap import x` — à une seule forme canonique.
+PACKAGE = "bootstrap"
+
 # Modules dont l'import prouverait que le résolveur sort de son bac à sable :
 # réseau ou sous-processus arbitraire. Le seul sous-processus admissible est
 # `llama-server --version`, et il n'est pas lancé ici : il est délégué à
 # `llama_version.probe_llama_version`, injectable pour les tests.
 FORBIDDEN_IMPORTS: frozenset[str] = frozenset({
     "subprocess", "socket", "ssl", "urllib", "http", "httpx", "requests", "ftplib",
+})
+
+# TST-007 — la même interdiction, par la bande.
+#
+# Interdire `socket` sans interdire `from . import public_https` ne protège de
+# rien : le module frère apporte exactement la capacité qu'on refuse, et il
+# l'apporte sous un nom qui n'est dans aucune liste stdlib. C'est la porte par
+# laquelle AUT-018 a failli entrer.
+#
+# Cet ensemble est la fermeture transitive « modules du paquet qui atteignent un
+# `FORBIDDEN_IMPORTS` », et il n'a pas à être tenu à jour à la main : un test de
+# complétude le recalcule depuis les sources et échoue si un frère nouvellement
+# doté de réseau ou de sous-processus n'y figure pas.
+FORBIDDEN_SIBLING_IMPORTS: frozenset[str] = frozenset({
+    f"{PACKAGE}.applier",
+    f"{PACKAGE}.downloader",
+    f"{PACKAGE}.inventory",
+    f"{PACKAGE}.llmfit",
+    f"{PACKAGE}.planner",
+    f"{PACKAGE}.production",
+    f"{PACKAGE}.public_https",
+    f"{PACKAGE}.runtime_installer",
+    f"{PACKAGE}.runtime_variants",
 })
 
 
@@ -1779,19 +1807,69 @@ def _format_options(options: Mapping[str, Any]) -> str:
 
 def module_toplevel_imports(source_path: Path | None = None) -> frozenset[str]:
     """
-    Modules importés au premier niveau par ce fichier, par analyse statique.
+    Modules qu'un fichier peut tirer, par analyse statique de ses imports.
 
     Sert au test qui prouve que le résolveur ne peut ni parler au réseau ni lancer
-    un build : il n'importe aucun de `FORBIDDEN_IMPORTS`. Une assertion d'absence
-    doit pouvoir échouer — d'où cette fonction, qui rend l'ensemble observable au
-    lieu de laisser le test croire sur parole.
+    un build : il n'importe aucun de `FORBIDDEN_IMPORTS`, ni aucun module frère de
+    `FORBIDDEN_SIBLING_IMPORTS`. Une assertion d'absence doit pouvoir échouer —
+    d'où cette fonction, qui rend l'ensemble observable au lieu de laisser le test
+    croire sur parole.
+
+    TST-007 — ce que cette fonction ne voyait pas
+    ---------------------------------------------
+    Elle filtrait sur `node.level == 0`, donc `from . import public_https` lui
+    était **invisible**. Le garde-fou ne pouvait pas attraper l'ajout qu'il existe
+    précisément pour empêcher : importer un frère qui, lui, parle au réseau.
+    `from bootstrap import public_https` — la forme employée par `planner` et
+    `applier` — passait tout aussi bien, puisqu'elle ne rendait que « bootstrap ».
+
+    Les trois écritures sont désormais ramenées à une forme canonique unique,
+    `bootstrap.<frère>`, quelle que soit la syntaxe employée :
+
+    - `from . import public_https`        → `bootstrap.public_https`
+    - `from .public_https import fetch`   → `bootstrap.public_https`
+    - `from bootstrap import public_https`→ `bootstrap.public_https`
+    - `import bootstrap.public_https`     → `bootstrap.public_https`
+
+    Un import relatif remontant au-delà du paquet (`from .. import x`) est rendu
+    verbatim, avec ses points : il sort du périmètre canonique, et le laisser
+    visible sous une forme qui ne ressemble à aucun nom autorisé vaut mieux que le
+    normaliser à tort.
+
+    Le parcours est un `ast.walk` : un import différé dans le corps d'une fonction
+    est vu lui aussi. Le garde-fou perdrait tout son sens si déplacer `import
+    socket` de trois lignes suffisait à le contourner.
     """
     path = source_path or Path(__file__)
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module.split(".")[0])
+            for alias in node.names:
+                parts = alias.name.split(".")
+                names.add(parts[0])
+                if parts[0] == PACKAGE and len(parts) > 1:
+                    names.add(f"{PACKAGE}.{parts[1]}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 1:
+                # `from .x import y` désigne le frère x ; `from . import x` aussi,
+                # mais c'est alors l'alias qui porte son nom.
+                if node.module:
+                    names.add(f"{PACKAGE}.{node.module.split('.')[0]}")
+                else:
+                    names.update(f"{PACKAGE}.{alias.name}" for alias in node.names)
+            elif node.level > 1:
+                prefix = "." * node.level
+                if node.module:
+                    names.add(f"{prefix}{node.module.split('.')[0]}")
+                else:
+                    names.update(f"{prefix}{alias.name}" for alias in node.names)
+            elif node.module:
+                base = node.module.split(".")[0]
+                names.add(base)
+                # `from bootstrap import public_https` nomme le frère dans l'alias,
+                # pas dans le module : sans cette branche, il ne resterait que
+                # « bootstrap », qui n'est interdit nulle part.
+                if base == PACKAGE:
+                    names.update(f"{PACKAGE}.{alias.name}" for alias in node.names)
     return frozenset(names)

@@ -611,20 +611,25 @@ def test_le_resolveur_n_herite_pas_du_reseau_par_le_chargeur():
     Le placer dans `runtime_resolver` y ferait entrer ces modules par la bande et
     viderait le garde-fou d'isolation de sa substance.
 
-    L'assertion porte sur le TEXTE du résolveur, pas sur `module_toplevel_imports()` :
-    celle-ci ignore les imports relatifs (`node.level == 0`), et `from . import
-    public_https` lui serait donc invisible. Un test d'absence adossé au garde-fou
-    aurait été vert sans rien prouver.
+    AUT-018 avait dû contourner : `module_toplevel_imports()` filtrait sur
+    `node.level == 0` et ne voyait donc pas `from . import public_https`. Le
+    contournement — chercher la chaîne « import public_https » dans le texte du
+    module — s'est révélé faux dans les deux sens : aveugle à
+    `from bootstrap import public_https`, et rouge dès qu'un simple COMMENTAIRE
+    nomme l'import. TST-007 a rendu le garde-fou capable de voir ces imports ;
+    l'assertion revient donc sur lui, qui juge l'AST et non la prose.
     """
     importes = rr.module_toplevel_imports()
-    assert not (importes & rr.FORBIDDEN_IMPORTS)
-    assert "yaml" in importes  # contrôle positif : l'analyse statique voit bien quelque chose
 
-    source = Path(rr.__file__).read_text(encoding="utf-8")
-    for module in ("public_https", "runtime_variants"):
-        assert f"import {module}" not in source, f"{module} importé par le résolveur"
-    # Contrôle positif de CETTE recherche : elle voit bien un import qui existe.
-    assert "from . import schema" in source
+    assert not (importes & rr.FORBIDDEN_IMPORTS)
+    assert not (importes & rr.FORBIDDEN_SIBLING_IMPORTS)
+    assert f"{rr.PACKAGE}.public_https" not in importes
+    assert f"{rr.PACKAGE}.runtime_variants" not in importes
+
+    # Contrôles positifs : l'analyse statique voit bien un import absolu ET un
+    # import de module frère. Sans le second, ce test serait redevenu inerte.
+    assert "yaml" in importes
+    assert f"{rr.PACKAGE}.schema" in importes
 
 
 def test_le_chargeur_ne_reecrit_pas_une_seconde_politique_d_url():
