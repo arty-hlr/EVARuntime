@@ -580,10 +580,11 @@ def test_la_redaction_est_documentee():
 def test_nginx_valide_la_configuration_livree(tmp_path, conf_text):
     """
     La seule vérification qui prouve que la syntaxe est acceptée (regex de `map`
-    comprises). `skip` propre quand nginx est absent — c'est le cas des runners
-    CI et de la machine de développement macOS de ce dépôt : les tests ci-dessus
-    sont donc la garantie qui tient en permanence, celui-ci un bonus quand
-    l'outil est là.
+    comprises). `skip` propre quand nginx est absent — c'est le cas de la machine
+    de développement macOS de ce dépôt, mais **pas** des runners CI GitHub, qui
+    livrent nginx et exécutent donc réellement ce test. Les tests structurels
+    ci-dessus restent la garantie permanente ; celui-ci est la seule preuve que
+    nginx accepte ce que nous écrivons.
     """
     binaire = shutil.which("nginx")
     if binaire is None:
@@ -617,11 +618,23 @@ def test_nginx_valide_la_configuration_livree(tmp_path, conf_text):
         .replace("listen [::]:80;", "listen [::]:8080;")
     )
     (racine / "conf" / "site.conf").write_text(site, encoding="utf-8")
+    # `pid` et les répertoires temporaires doivent être déportés sous la racine
+    # jetable : `nginx -t` ouvre RÉELLEMENT le fichier de pid, et un utilisateur
+    # non privilégié — le runner CI, par exemple — n'a pas accès à
+    # `/run/nginx.pid`. Sans ces directives, le test échoue sur les droits de
+    # l'hôte alors que nginx a déjà répondu « syntax is ok », c'est-à-dire sur
+    # tout autre chose que ce qu'il prétend vérifier.
     (racine / "conf" / "nginx.conf").write_text(
+        f"pid {racine / 'nginx.pid'};\n"
         "events { worker_connections 64; }\n"
         "http {\n"
         "    include mime.types;\n"
         f"    error_log {racine / 'logs' / 'error.log'} warn;\n"
+        f"    client_body_temp_path {racine / 'tmp' / 'client'};\n"
+        f"    proxy_temp_path {racine / 'tmp' / 'proxy'};\n"
+        f"    fastcgi_temp_path {racine / 'tmp' / 'fastcgi'};\n"
+        f"    uwsgi_temp_path {racine / 'tmp' / 'uwsgi'};\n"
+        f"    scgi_temp_path {racine / 'tmp' / 'scgi'};\n"
         "    include site.conf;\n"
         "}\n",
         encoding="utf-8",
