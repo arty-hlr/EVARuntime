@@ -310,6 +310,17 @@ Trois inversions seraient des défauts, pas des goûts :
 - **préchauffer avant la recette** conserverait en mémoire un modèle dont aucun
   token n'a encore été prouvé.
 
+`verify_artifact` est une action à **deux domaines**, et un seul l'emploie. Pour
+les GGUF du catalogue, elle suit `download_model` et relit réellement les octets.
+Pour l'archive de `llama-server`, elle **n'existe pas** : le plan ne l'émet pas
+(COR-030). La raison est qu'à ce numéro d'étape l'archive n'est pas encore
+téléchargée — c'est `install_runtime` qui la récupère puis confronte son empreinte
+avant d'extraire quoi que ce soit. Une étape qui ne peut rien vérifier était
+sautée par l'applicateur, et une étape sautée ne prouve rien : la condition n°1 du
+jalon M2 retombait `unsatisfied` sur une installation pourtant réussie, et
+`bootstrap-apply` sortait en code 3. L'empreinte attendue est donc inscrite dans le
+détail de l'étape `install_runtime`, qui est celle qui la contrôle.
+
 `smoke_test` est exécutée **pour chaque modèle**, immédiatement après son
 activation provisoire. Elle traverse le chemin public réel (nginx → gateway →
 `llama-server`) et ferme la transition DEC-010 : succès, la preuve complète

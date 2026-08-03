@@ -1722,7 +1722,7 @@ def to_plan_steps(
     resolution: RuntimeResolution,
     *,
     start_order: int = 1,
-    include_verify: bool = True,
+    include_verify: bool = False,
 ) -> tuple[schema.PlanStep, ...]:
     """
     Étapes que l'application du plan exécuterait pour poser ce runtime.
@@ -1733,6 +1733,43 @@ def to_plan_steps(
 
     La vérification précède l'installation, jamais l'inverse : contrôler
     l'empreinte après avoir posé le binaire ne protège de rien.
+
+    COR-030 — pourquoi `verify_artifact` n'est plus émise par défaut
+    ---------------------------------------------------------------
+    Ce module émettait, avant `install_runtime`, une étape `verify_artifact`
+    décrivant le contrôle d'empreinte de l'archive. Elle ne pouvait rien
+    vérifier : **à ce numéro d'étape l'archive n'est pas encore téléchargée**.
+    C'est `install_runtime` qui la récupère ET confronte son empreinte avant
+    d'extraire quoi que ce soit (AUT-016). `applier._verify_dispatcher` le
+    constatait déjà et rendait `STEP_SKIPPED` avec cette raison exacte — refuser
+    d'affirmer un contrôle qui n'a pas eu lieu était le bon geste.
+
+    Le coût de cette étape vide n'était pas cosmétique. `install_report`
+    considère — à juste titre — qu'une étape sautée ne prouve rien, donc la
+    **condition n°1 du jalon M2** (« runtime installé et vérifié ») ressortait
+    `unsatisfied` alors que l'installation avait réellement réussi : archive
+    récupérée, empreinte confrontée, build relu sur le binaire posé, manifeste §6
+    écrit. Le jalon ne pouvait pas être prononcé, et — conséquence plus large que
+    le seul rapport — `bootstrap-apply` sortait en `partial`, **code 3**, sur
+    chaque succès. Tout script d'exploitation testant le code 0 lisait un
+    demi-échec.
+
+    Deux voies existaient. Requalifier le résultat en `already_satisfied` a été
+    écarté : `execution` définit `STEP_SKIPPED` comme « décision délibérée de ne
+    pas exécuter », ce qui est exactement le cas, et l'autre domaine de la même
+    action — `downloader._execute_verify_artifact` — ne rend
+    `already_satisfied` qu'**après avoir relu les octets**. Verdir le statut
+    aurait déplacé la complaisance au lieu de supprimer le défaut. C'est donc
+    l'émetteur qui est corrigé : une étape qui ne peut rien vérifier n'est pas
+    émise.
+
+    Rien n'est perdu côté lisibilité : l'empreinte ou le digest attendus sont
+    désormais inscrits dans le détail de l'étape `install_runtime`, qui est celle
+    qui les confronte réellement.
+
+    `include_verify` reste et devient **opt-in**. Il n'est correct que pour un
+    appelant qui poserait l'archive AVANT ce numéro d'étape — ce qu'aucun ne fait
+    aujourd'hui. Le passer à vrai réintroduit le défaut.
     """
     if not resolution.resolved or resolution.reuse_existing or resolution.variant is None:
         return ()
@@ -1776,13 +1813,20 @@ def to_plan_steps(
         )
     elif variant.requires_container:
         detail = (
-            f"Déployer l'image {variant.reference or variant.label()} épinglée par digest et "
-            "écrire le manifeste de provenance. Nécessite un backend conteneur côté server_manager."
+            f"Déployer l'image {variant.reference or variant.label()} épinglée par digest "
+            f"{manifest.container_digest if manifest else '?'} et refuser tout autre contenu, "
+            "puis écrire le manifeste de provenance. Nécessite un backend conteneur côté "
+            "server_manager."
         )
     else:
+        # COR-030 : l'empreinte attendue est inscrite ICI, sur l'étape qui la
+        # confronte réellement, et non sur une `verify_artifact` qui la précédait
+        # sans pouvoir rien lire.
         detail = (
-            f"Installer l'artefact {variant.source} vérifié pour {variant.backend} et écrire le "
-            "manifeste de provenance à côté du binaire."
+            f"Récupérer l'artefact {variant.reference or variant.label()}, contrôler son "
+            f"empreinte contre sha256:{manifest.artifact_sha256 if manifest else '?'} AVANT "
+            f"toute extraction, installer le binaire {variant.backend} et écrire le manifeste "
+            "de provenance à côté de lui. L'installation est annulée si l'empreinte diverge."
         )
     if resolution.degraded:
         detail += " ATTENTION : runtime CPU sur un hôte GPU — dégradation assumée."

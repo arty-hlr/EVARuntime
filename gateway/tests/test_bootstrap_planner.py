@@ -273,6 +273,57 @@ def test_la_sequence_suit_l_ordre_impose(tmp_path):
     ]
 
 
+def _politique_epinglee() -> runtime_mod.ResolverPolicy:
+    """
+    Matrice d'artefacts ÉPINGLÉE, telle que `--runtime-variants` en fournit une.
+
+    La matrice livrée avec EVARuntime ne porte aucune empreinte : seule une
+    variante `local-build` y est éligible, et un build local n'a rien à vérifier
+    avant construction. C'est pourquoi COR-030 ne se voyait pas sur le plan par
+    défaut — il n'est devenu atteignable qu'avec AUT-018.
+    """
+    return runtime_mod.ResolverPolicy(
+        release=_release(),
+        variants=(runtime_mod.ArtifactVariant(
+            source=runtime_mod.SOURCE_OFFICIAL_RELEASE,
+            backend="cuda12",
+            platform="linux-x86_64",
+            evidence=runtime_mod.EVIDENCE_OPERATOR,
+            evidence_note="Empreinte relevée par l'opérateur pour ce test.",
+            artifact_sha256="c" * 64,
+        ),),
+    )
+
+
+def test_un_runtime_epingle_n_ajoute_pas_d_etape_de_verification_vide(tmp_path):
+    """
+    COR-030 — le plan de l'opérateur ne porte qu'UNE `verify_artifact` : celle des
+    GGUF, qui relit réellement les octets.
+
+    L'étape jumelle du domaine runtime précédait `install_runtime` sans pouvoir
+    rien lire — l'archive n'est pas encore téléchargée à ce numéro. L'applicateur
+    la sautait, et une étape sautée fait retomber la condition n°1 du jalon M2 :
+    une installation réussie sortait en `partial`, code 3.
+    """
+    plan = _plan(_options(tmp_path, resolver_policy=_politique_epinglee()))
+    actions = _actions(plan)
+
+    # Contrôle positif : la variante épinglée est bien celle qui a été retenue,
+    # sans quoi ce test observerait le `local-build` par défaut et ne prouverait rien.
+    section = next(s for s in plan.sections if s.name == sc.SECTION_RUNTIME)
+    assert section.data["variant"]["source"] == runtime_mod.SOURCE_OFFICIAL_RELEASE
+    assert section.data["variant"]["artifact_sha256"] == "c" * 64
+
+    assert actions.count(sc.ACTION_VERIFY_ARTIFACT) == 1
+    verification = _etape(plan, sc.ACTION_VERIFY_ARTIFACT)
+    assert "llama-server" not in verification.target
+
+    # L'empreinte épinglée n'a pas disparu du plan : elle est portée par l'étape
+    # qui la confronte vraiment.
+    installation = _etape(plan, sc.ACTION_INSTALL_RUNTIME)
+    assert "c" * 64 in installation.detail
+
+
 def test_la_verification_suit_immediatement_le_telechargement(tmp_path):
     """Contrôler l'empreinte après avoir mis le modèle en service ne protège de rien."""
     actions = _actions(_plan(_options(tmp_path)))

@@ -17,11 +17,20 @@ aveugles.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
+import io
+import json
+import tarfile
 from pathlib import Path
 
 import pytest
 import yaml
 
+from bootstrap import applier as ap
+from bootstrap import execution as ex
+from bootstrap import install_report as ir
+from bootstrap import runtime_installer as ri
 from bootstrap import runtime_resolver as rr
 from bootstrap import schema
 from llama_version import LlamaVersion
@@ -909,18 +918,70 @@ def test_variant_rejects_an_unknown_evidence_level():
 
 # ── Étapes du plan ────────────────────────────────────────────────────────────
 
-def test_steps_verify_before_installing():
+def test_une_archive_epinglee_ne_produit_que_l_etape_qui_verifie_vraiment():
+    """
+    COR-030 — l'étape `verify_artifact` du domaine runtime n'est plus émise.
+
+    Elle précédait `install_runtime` alors que l'archive n'est pas encore
+    téléchargée à ce numéro d'étape : elle ne pouvait rien vérifier,
+    `applier._verify_dispatcher` la sautait, et `install_report` en tirait — à
+    juste titre — que la condition n°1 de M2 n'était pas prouvée.
+
+    L'empreinte attendue ne disparaît pas du plan pour autant : elle est
+    désormais portée par l'étape qui la confronte réellement.
+    """
     resolution = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_OFFICIAL_RELEASE),)))
     steps = rr.to_plan_steps(resolution)
-    assert [s.action for s in steps] == [schema.ACTION_VERIFY_ARTIFACT, schema.ACTION_INSTALL_RUNTIME]
-    assert SHA_A in steps[0].detail
+
+    assert [s.action for s in steps] == [schema.ACTION_INSTALL_RUNTIME]
+    assert SHA_A in steps[0].detail, "l'empreinte épinglée a disparu du plan"
     assert steps[-1].requires_root is True
+
+
+def test_l_etape_de_verification_reste_disponible_mais_sur_demande():
+    """
+    `include_verify` survit comme opt-in, pour un appelant qui poserait l'archive
+    en amont. Aucun ne le fait aujourd'hui — et c'est bien pour cela que le défaut
+    ne se voyait qu'à l'exécution du parcours complet.
+    """
+    resolution = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_OFFICIAL_RELEASE),)))
+    steps = rr.to_plan_steps(resolution, include_verify=True)
+
+    # Quand elle est demandée, la vérification précède toujours l'installation.
+    assert [s.action for s in steps] == [
+        schema.ACTION_VERIFY_ARTIFACT, schema.ACTION_INSTALL_RUNTIME,
+    ]
+
+
+def test_aucun_appelant_du_depot_ne_demande_l_etape_de_verification():
+    """
+    Contrôle de non-retour : réactiver le défaut demanderait un appel explicite.
+
+    Le paramètre était mort avec un défaut à `True` ; il est mort avec un défaut
+    à `False`. La différence est qu'il ne produit plus une étape que l'exécuteur
+    saute et que le rapport compte comme une preuve manquante.
+    """
+
+    assert inspect.signature(rr.to_plan_steps).parameters["include_verify"].default is False
+
+    paquet = Path(rr.__file__).parent
+    for fichier in paquet.glob("*.py"):
+        source = fichier.read_text(encoding="utf-8")
+        assert "include_verify=True" not in source, fichier.name
+    # Contrôle positif : la recherche voit bien les appels à `to_plan_steps`.
+    assert any(
+        "to_plan_steps(" in f.read_text(encoding="utf-8")
+        for f in paquet.glob("*.py")
+        if f.name != "runtime_resolver.py"
+    )
 
 
 def test_steps_are_renumbered_from_start_order():
     resolution = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_OFFICIAL_RELEASE),)))
-    steps = rr.to_plan_steps(resolution, start_order=7)
-    assert [s.order for s in steps] == [7, 8]
+    assert [s.order for s in rr.to_plan_steps(resolution, start_order=7)] == [7]
+    assert [
+        s.order for s in rr.to_plan_steps(resolution, start_order=7, include_verify=True)
+    ] == [7, 8]
 
 
 def test_local_build_has_nothing_to_verify_yet():
@@ -1091,3 +1152,205 @@ def test_version_probe_is_delegated_to_llama_version_not_reimplemented():
     assert rr.probe_llama_version is llama_version.probe_llama_version
     source = Path(rr.__file__).read_text(encoding="utf-8")
     assert "create_subprocess" not in source
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COR-030 — les quatre parcours bout en bout
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Le correctif retire une étape du plan. Une suppression d'étape est toujours
+# suspecte : elle peut supprimer un défaut, ou seulement supprimer le témoin qui
+# le signalait. Les quatre parcours ci-dessous tranchent la question en exécutant
+# réellement la chaîne — plan → applicateur → journal → rapport d'installation —
+# sur les deux axes indépendants :
+#
+#   axe 1 : l'étape `verify_artifact` est-elle émise ?
+#   axe 2 : l'archive servie correspond-elle à l'empreinte épinglée ?
+#
+# C'est le COUPLE des deux parcours « sans verify » qui fait la démonstration :
+# retirer l'étape verdit le parcours réussi SANS verdir le parcours non vérifié.
+# Sans lui, le correctif serait indistinguable d'une complaisance.
+#
+# Aucun réseau, aucun sous-processus : le transport et la sonde `--version` sont
+# injectés, comme dans la suite de `runtime_installer`.
+
+_URL_ARCHIVE ="https://releases.example.com/llama-server-b6800-cpu.tar.gz"
+
+
+def _archive_bytes(contenu: bytes = b"#!/bin/false\nfaux llama-server\n") -> bytes:
+    """Archive plausible : le binaire, un objet partagé, une licence."""
+    tampon = io.BytesIO()
+    with tarfile.open(fileobj=tampon, mode="w:gz") as tar:
+        for nom, data, mode in (
+            ("llama-server", contenu, 0o755),
+            ("libggml.so.0", b"faux objet partage", 0o644),
+            ("LICENSE", b"MIT License\n", 0o644),
+        ):
+            info = tarfile.TarInfo(nom)
+            info.size = len(data)
+            info.mode = mode
+            tar.addfile(info, io.BytesIO(data))
+    return tampon.getvalue()
+
+
+class _TransportInjecte:
+    """Sert des octets préparés. Ne joint rien, ne résout rien."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    async def fetch(self, url: str, destination: Path, *, max_bytes: int) -> int:
+        destination.write_bytes(self.payload)
+        return len(self.payload)
+
+
+def _parcours(tmp_path: Path, *, include_verify: bool, archive_conforme: bool):
+    """
+    Exécute un parcours complet et rend `(rapport_exec, rapport_install)`.
+
+    `archive_conforme=False` fait servir au transport une archive DIFFÉRENTE de
+    celle qu'épingle le manifeste : c'est le vrai contrôle d'intégrité de
+    `runtime_installer` qui échoue alors, pas une assertion de ce test.
+    """
+    servi = _archive_bytes() if archive_conforme else _archive_bytes(b"charge utile substituee")
+    epingle = hashlib.sha256(_archive_bytes()).hexdigest()
+
+    resolution = resolve(
+        cpu_profile(),
+        make_policy(
+            (variant(rr.SOURCE_OFFICIAL_RELEASE, "cpu", artifact_sha256=epingle),),
+            release=rr.ReleasePolicy(
+                pinned_version="b6800", pinned_commit=COMMIT, security_floor_build=6700,
+            ),
+        ),
+    )
+    assert resolution.resolved and resolution.variant is not None
+
+    steps = rr.to_plan_steps(resolution, include_verify=include_verify)
+    plan = schema.BootstrapPlan(
+        generated_at=NOW,
+        mode="apply",
+        sections=(rr.to_plan_section(resolution),),
+        steps=steps,
+        decisions=(rr.to_decision(resolution),),
+    )
+    document = plan.to_dict()
+    assert schema.validate_plan_dict(document) == ()
+    assert document["applicable"] is True
+
+    installateur = ri.RuntimeInstaller(
+        ri.RuntimeInstallRequest(
+            resolution=resolution,
+            archive_url=_URL_ARCHIVE,
+            install_root=tmp_path / "runtime",
+            limits=ri.ArchiveLimits(),
+        ),
+        transport=_TransportInjecte(servi),  # type: ignore[arg-type]
+        probe=probing(6800, raw="version: 6800 (abc1234)", commit="abc1234"),
+    )
+
+    registre = ex.ExecutorRegistry()
+    registre.register(schema.ACTION_INSTALL_RUNTIME, installateur)
+    registre.register(
+        schema.ACTION_VERIFY_ARTIFACT,
+        ap._verify_dispatcher(ap.ApplierConfig(runtime=installateur), None),
+    )
+
+    ticks = iter(range(0, 100_000))
+    contexte = ex.ExecutionContext(
+        mode=ex.ExecutionMode.APPLY,
+        allowed_roots=(tmp_path,),
+        monotonic=lambda: float(next(ticks)) / 1000.0,
+        now=lambda: NOW,
+    )
+    rapport_exec = asyncio.run(ex.execute_plan(
+        ex.load_plan_document(json.dumps(document)), registre, contexte,
+    ))
+    rapport_install = ir.build_install_report(
+        plan_document=document, execution_report=rapport_exec, now=lambda: NOW,
+    )
+    return rapport_exec, rapport_install
+
+
+def _condition_runtime(rapport: ir.InstallReport) -> ir.ConditionOutcome:
+    return next(c for c in rapport.conditions() if c.code == "runtime_installed")
+
+
+def test_parcours_avec_verify_et_runtime_conforme_reste_insatisfait(tmp_path):
+    """
+    Le défaut, reproduit tel qu'il se produisait : l'installation RÉUSSIT et la
+    condition n°1 du jalon M2 sort quand même insatisfaite.
+
+    L'étape `verify_artifact` ne peut rien vérifier à ce numéro — l'archive n'est
+    pas encore téléchargée — donc l'applicateur la saute, et une étape sautée ne
+    prouve rien. Ce test reste vert avec le correctif : il passe `include_verify`
+    explicitement, et documente ce que le défaut coûtait.
+    """
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=True, archive_conforme=True)
+
+    statuts = [(r.action, r.status) for r in rapport_exec.results]
+    assert statuts == [
+        (schema.ACTION_VERIFY_ARTIFACT, ex.STEP_SKIPPED),
+        (schema.ACTION_INSTALL_RUNTIME, ex.STEP_DONE),
+    ]
+    condition = _condition_runtime(rapport)
+    assert condition.status == ir.CONDITION_UNSATISFIED
+    assert "sautée" in condition.proof
+    # Le rayon d'action dépassait le rapport M2 : l'EXÉCUTION elle-même sortait
+    # en code 3, et tout script testant le code 0 lisait un demi-échec — alors
+    # que la seule étape qui agit avait réussi.
+    assert rapport_exec.verdict() == ex.VERDICT_PARTIAL
+    assert rapport_exec.exit_code() == ex.EXIT_PARTIAL == 3
+
+
+def test_parcours_avec_verify_et_runtime_non_verifie_reste_insatisfait(tmp_path):
+    """Contrôle : avec l'étape vide, un échec réel reste un échec."""
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=True, archive_conforme=False)
+
+    assert rapport_exec.results[-1].status == ex.STEP_FAILED
+    assert _condition_runtime(rapport).status == ir.CONDITION_UNSATISFIED
+
+
+def test_parcours_sans_verify_et_runtime_conforme_est_satisfait(tmp_path):
+    """
+    COR-030 — le parcours nominal se prononce enfin.
+
+    Une seule étape, celle qui vérifie et installe réellement. La condition n°1
+    est satisfaite, l'exécution est `ok`, et `bootstrap-apply` sort en code 0.
+    """
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=False, archive_conforme=True)
+
+    assert [(r.action, r.status) for r in rapport_exec.results] == [
+        (schema.ACTION_INSTALL_RUNTIME, ex.STEP_DONE),
+    ]
+    assert _condition_runtime(rapport).status == ir.CONDITION_SATISFIED
+    assert rapport_exec.verdict() == ex.VERDICT_OK
+    assert rapport_exec.exit_code() == ex.EXIT_OK == 0
+
+    # Le rapport d'installation reste `partial`, et c'est correct : ce plan-ci ne
+    # pose QUE le runtime, les six autres conditions de M2 n'ont aucune étape pour
+    # les prouver. Ce qui est corrigé, c'est la condition n°1 — la seule que ce
+    # plan puisse trancher — et le code de sortie de `bootstrap-apply`.
+    assert {c.status for c in rapport.conditions() if c.code != "runtime_installed"} <= {
+        ir.CONDITION_UNPROVEN, ir.CONDITION_SATISFIED,
+    }
+
+
+def test_parcours_sans_verify_et_runtime_non_verifie_reste_insatisfait(tmp_path):
+    """
+    Le pendant décisif du précédent, et la preuve que le correctif n'est pas une
+    complaisance : retirer l'étape vide NE verdit PAS un runtime non vérifié.
+
+    La détection est portée entièrement par `install_runtime`, qui confronte
+    l'empreinte de l'archive avant d'extraire. L'étape `verify_artifact` n'y
+    contribuait rien — elle ne faisait que soustraire.
+    """
+    rapport_exec, rapport = _parcours(tmp_path, include_verify=False, archive_conforme=False)
+
+    assert [(r.action, r.status) for r in rapport_exec.results] == [
+        (schema.ACTION_INSTALL_RUNTIME, ex.STEP_FAILED),
+    ]
+    assert _condition_runtime(rapport).status == ir.CONDITION_UNSATISFIED
+    assert rapport_exec.exit_code() != ex.EXIT_OK
+    assert rapport.exit_code() != ir.EXIT_OK
+    assert rapport.verdict() == ir.VERDICT_FAILED
