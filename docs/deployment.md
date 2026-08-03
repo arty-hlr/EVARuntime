@@ -99,6 +99,14 @@ Sans `--pin-version`/`--pin-commit`, le plan sort **bloqué** et ne propose aucu
 des options et des exit codes :
 [guide administrateur, section 9](admin.md#9-planificateur-damorçage--bootstrap-plan).
 
+Si `--models-dir` contient déjà les GGUF du catalogue et qu'un manifeste de
+provenance les atteste, le plan **ne propose pas de les retélécharger** : l'étape
+`download_model` disparaît, le volume annoncé est décompté, et seule la
+vérification d'empreinte subsiste. Un fichier présent dont la **taille** diffère
+de celle épinglée bloque le plan au lieu d'être écrasé. Le détail des trois cas —
+et pourquoi le plan n'a jamais à hacher les fichiers pour conclure — est dans le
+[guide administrateur, section 9](admin.md#artefacts-déjà-présents-sur-lhôte).
+
 Les sections 2 et 3 qui suivent décrivent la procédure manuelle éprouvée
 (compilation de llama.cpp, téléchargement des GGUF). Le plan de bootstrap ne la
 remplace pas : il la documente pour un hôte donné.
