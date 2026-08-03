@@ -26,13 +26,13 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 
 | | |
 |---|---|
-| **Où en est-on** | Jalons **M0 et M1 atteints**, M1 ayant été **exercé sur deux VMs réelles** (§0.13). La vague 6 a livré les sept modules d'exécution de M2 et son applicateur (§0.14). La **vague 7 a fermé les 18 items qui empêchaient encore ce parcours d'aboutir** (§0.15) : il ne reste **aucun blocage de code connu** sur la route du jalon |
+| **Où en est-on** | Jalons **M0 et M1 atteints**, M1 ayant été **exercé sur deux VMs réelles** (§0.13). La vague 6 a livré les sept modules d'exécution de M2 et son applicateur (§0.14). La **vague 7 a fermé les 18 items qui empêchaient encore ce parcours d'aboutir**, puis la revue de la PR #13 a fermé quatre défauts d'intégration entre ces chantiers (§0.15) : il ne reste **aucun blocage de code connu** sur la route du jalon |
 | **Ce qui bloque** | **Uniquement la preuve terrain.** Les trois blocages de code que la vague 6 laissait ouverts sont fermés : l'opérateur peut désormais **épingler son runtime** (AUT-018, la matrice livrée ne portait ni empreinte ni URL d'archive — l'installateur ne pouvait rien installer), `install.sh` accepte un hôte **sans GPU** par option explicite (OPS-012, qui avait fait contourner le script aux deux déploiements réels), et la condition n°1 du jalon **peut enfin être prouvée** (COR-030) |
 | **Ce qui vient ensuite** | Relever les **empreintes amont réelles** de `llama-server` dans un fichier `--runtime-variants`, puis exécuter `bootstrap-apply --apply` sur l'hôte cible mono-worker avec GPU et nginx de production. Archiver le rapport et traiter tout écart terrain, au lieu de prononcer M2 sur les seuls tests |
-| **Santé des tests** | **2427 tests verts en CI** (2364 gateway + 63 node_agent), `ruff` et `bash -n` propres sur les deux composants. **+337 tests** pendant la seule vague 7. En local, un `skip` de plus : la machine de développement macOS n'a pas nginx, les runners CI si |
+| **Santé des tests** | **2441 tests collectés localement** (2378 gateway + 63 node_agent), dont 2440 réussis et 1 `skip` nginx local ; `ruff` et `bash -n` propres sur les deux composants. **+351 tests** pendant la vague 7 et sa revue. La CI de la PR doit encore rejouer ce nouvel état sur Python 3.11 |
 | **Reste à faire** | 31 items sur 93 (§0.3). Le Lot B — bootstrap automatisé — est **intégralement livré**. Aucun P0 ouvert hors des lots performance et sécurité amont |
 | **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
-| **Ce que la vague 7 a appris** | Trois défauts de **sécurité et d'honnêteté** que 2089 tests verts n'avaient pas vus : SEC-008 était **intégralement contournée en production** par le journal d'accès d'uvicorn ; `_VERSION_RE` produisait une **attestation mensongère** de build plutôt qu'un refus ; et le rapport qui **prononce** le jalon prouvait sa condition n°1 par la vérification d'un GGUF de modèle. Aucun n'était visible en test — voir §0.15 |
+| **Ce que la vague 7 a appris** | Trois défauts de **sécurité et d'honnêteté** que 2089 tests verts n'avaient pas vus, puis quatre défauts de **raccord réel** que 2427 tests n'avaient toujours pas vus : le paquet `bootstrap/` n'était pas déployé, une installation CPU-only n'était pas actualisable, un constat opérateur redevenait hypothèse dans le rapport et une édition YAML scalaire pouvait être écrasée. Voir §0.15 |
 
 **Comment lire la suite** : §0.1 à §0.4 donnent l'état chiffré, §0.5 les
 décisions tranchées **et celle qui reste à prendre**, §0.7 le journal des
@@ -65,10 +65,10 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir. **§0.15.1 remplace
 | Champ | Valeur |
 |---|---|
 | Dernière mise à jour | 2026-08-03 |
-| Phase | **Vague 7 livrée — clôture du code du jalon M2, jalon toujours non prononcé.** Les trois blocages de code que la vague 6 laissait ouverts sont fermés (runtime épinglable, préflight GPU franchissable, condition n°1 prouvable). Il ne reste **aucun blocage de code connu** sur la route de M2 : la sortie n'attend plus qu'une exécution physique avec GPU, nginx et une archive amont réelle |
+| Phase | **Vague 7 et revue de PR livrées — clôture du code du jalon M2, jalon toujours non prononcé.** Les trois blocages de la vague 6 et les quatre défauts d'intégration trouvés en revue sont fermés. Il ne reste **aucun blocage de code connu** sur la route de M2 : la sortie n'attend plus qu'une exécution physique avec GPU, nginx et une archive amont réelle |
 | Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
 | Jalon visé | **M2 — installation jusqu'au premier token** (§13) — conditions détaillées en **§0.15.1**, qui remplace §0.14.1 |
-| Branche de travail | `codex/vague7-cloture-m2` @ `55b36fb` (33 commits sans fusion au-dessus de `a6bcb2c`, sept branches de chantier fusionnées) |
+| Branche de travail | `codex/vague7-cloture-m2`, PR #13 ; correctifs de revue dans `a5970cb` |
 | Base de référence | `a6bcb2c` — 2089 tests verts, `ruff` propre |
 | Périmètre livré à ce jour | AUT-001 → AUT-019, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, COR-020 → COR-030, OPS-006, OPS-008, OPS-009, OPS-011, OPS-012, SEC-002, SEC-008 → SEC-014, SEC-016, SEC-017, TST-001, TST-006, TST-007 |
 | Périmètre de la vague 7 | **18 items** : AUT-014, AUT-018, AUT-019, COR-020, COR-021, COR-026 → COR-030, OPS-011, OPS-012, SEC-002, SEC-009, SEC-010, SEC-016, SEC-017, TST-007 (§0.15) |
@@ -78,14 +78,14 @@ n'avait vus —, §0.9 ce que l'exploitation doit savoir. **§0.15.1 remplace
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **2364** 🔬 (2363 + 1 `skip` en local) |
+| `gateway` | `cd gateway && .venv/bin/python -m pytest tests -q` | 309 | **2378** 🔬 (2377 + 1 `skip` en local) |
 | `node_agent` | `cd node_agent && .venv/bin/python -m pytest tests -q` | 45 | **63** 🔬 |
-| **Total** | — | **354** | **2427** 🔬 |
+| **Total** | — | **354** | **2441** 🔬 |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
 **+324 tests** ajoutés par le jalon M0, **+80 par la vague 4**, **+499 par la
-vague 5**, **+832 par la vague 6 et sa revue**, puis **+337 par la vague 7**,
+vague 5**, **+832 par la vague 6 et sa revue**, puis **+351 par la vague 7 et sa revue**,
 tous des régressions rouges avant correctif et vertes après. Les scripts de
 déploiement passent `bash -n`.
 
@@ -325,6 +325,7 @@ ainsi qu'un rollback tardif et les courses local/cluster, sont testés.
 | 2026-08-03 | COR-026, COR-028, COR-029 | `71f3d72`, `1eb314b`, `694c017` | `pytest tests -q` (gateway) + 13 rouges par retrait | **2327** après fusion (+17) ; conditions M2 prouvées par appariement de **cible**, localisateur d'entrée unifié, refus d'écriture en 422 sur les trois verbes 🔬 |
 | 2026-08-03 | COR-030, TST-007, SEC-017, AUT-019, COR-027 | `b4140ca`, `f3bbc11`, `8d59ff3`, `ab6f9c3`, `661ddac` | `pytest tests -q` (2 composants) + 21 rouges par retrait | **2363** après fusion (+36) ; **dernier blocage de code de M2 levé**, garde-fou d'imports rendu voyant (2 tests d'absence étaient inertes), recoupement du manifeste raccordé au parcours 🔬 |
 | 2026-08-03 | **Vague 7** | `55b36fb` | Les 2 suites + `ruff` + `bash -n` sur les deux composants | **2426 réussis** (2363 + 1 `skip` / 63) ; 18 items livrés, **Lot B clos**, aucun blocage de code connu restant sur la route de M2. Jalon **toujours non prononcé** : preuve terrain seule manquante (§0.15.1) 🔬 |
+| 2026-08-03 | **Revue PR #13** | `a5970cb` | Faux layout `/opt`, snapshot/rollback réel, branches GPU bash, rapport bout en bout, concurrence scalaire ; suites complètes + `ruff` + `bash -n` | **2440 réussis** (2377 + 1 `skip` / 63), +14 tests. Quatre raccords inter-chantiers fermés : `bootstrap/` réellement déployé, CPU-only actualisable, `constat-opérateur` conservé, édition YAML concurrente refusée 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 
@@ -1084,7 +1085,8 @@ installation réelle n'a pas encore été faite.**
 La vague 6 avait livré les exécuteurs. La vague 7 devait fermer ce qui restait
 entre eux et une installation réelle. Elle a livré **18 items** — 8 qui
 attendaient au backlog, 10 nés pendant la vague — et fait passer la suite de
-2089 à **2426 tests**.
+2089 à **2426 tests**. La revue de la PR #13 a ensuite ajouté **14 régressions**
+sur les raccords entre chantiers, soit **2440 réussites et un skip local**.
 
 Le résultat qui compte n'est pas ce chiffre : c'est que **le Lot B est clos** et
 qu'il ne reste **aucun blocage de code connu** sur la route de M2. Trois
@@ -1208,6 +1210,26 @@ leur contrat et leurs tests, et le **raccord** au parcours opérateur est une
 — un test qui exige que chaque paramètre public d'une politique soit atteignable
 depuis la CLI serait le candidat évident, et il aurait attrapé les quatre.
 
+#### Revue de la PR #13 — quatre raccords supplémentaires fermés
+
+La revue a appliqué la contre-mesure au parcours **installé**, pas seulement au
+checkout. Quatre défauts traversaient chacun la frontière entre deux chantiers :
+
+| Défaut de raccord | Impact réel | Fermeture dans `a5970cb` |
+|---|---|---|
+| `install.sh` et `update.sh` ne copiaient pas `bootstrap/` sous `/opt/llm-gateway` | Les commandes documentées depuis `/opt` levaient `ModuleNotFoundError` ; toute mutation admin de `models.yaml` refusait aussi d'importer `bootstrap.registry_writer` | Layout partagé et sourçable, package + catalogue copiés, snapshot et rollback inclus ; test qui importe **depuis une fausse cible `/opt`**, sans voir le checkout |
+| `update.sh` ajoutait toujours `nvidia-smi` en mode local | Un banc CPU accepté et tracé par `install.sh --allow-no-gpu` devenait impossible à mettre à jour | Même décision bash que l'installation, relecture de `ALLOW_NO_GPU`, grammaire truthy alignée sur `doctor`, refus historique conservé sans dérogation |
+| AUT-018 introduisait `constat-opérateur`, mais AUT-011 ne le reconnaissait pas | Le rapport final reclassait la preuve externe en hypothèse non vérifiée | Niveaux de preuve centralisés dans `schema`, test matrice opérateur → rapport sans hypothèse |
+| COR-020 ne comparait le disque qu'à la cible mémoire | Une édition manuelle scalaire pouvait être remise à l'ancienne valeur par une mutation admin sans rapport | Verrou optimiste sur le snapshot précédant la mutation ; toute divergence sémantique refuse, les commentaires seuls restent modifiables |
+
+Le test de layout est volontairement différent des tests d'import existants : il
+copie exactement les artefacts de production dans un répertoire vide, change le
+répertoire courant vers cette cible, puis importe la politique du registre. Le
+checkout ne peut donc plus masquer un package oublié. Pour les mises à jour qui
+modifient `update.sh` lui-même, la procédure demande désormais un
+`git pull --ff-only` **avant** l'invocation : un shell déjà lancé conserve
+l'ancien inode du script et ne peut pas se mettre lui-même à jour de façon sûre.
+
 #### Ce que la vague 7 ne prétend pas avoir démontré
 
 - **Aucune installation réelle, toujours.** Transports HTTPS, sondes
@@ -1237,8 +1259,11 @@ depuis la CLI serait le candidat évident, et il aurait attrapé les quatre.
   `--version` ne dit pas avec quel backend le binaire a été compilé. Une archive
   CPU étiquetée `cuda12` s'installerait en silence — le péché cardinal de §6,
   ici seulement *signalé*, pas empêché.
-- **COR-020 n'a aucune couverture de concurrence** : le reparse comparatif
-  garantit la correction d'**une** écriture, il ne sérialise pas deux écrivains.
+- **COR-020 détecte désormais une édition concurrente antérieure à la mutation**
+  par comparaison optimiste du snapshot complet, scalaires compris. Il ne pose
+  toujours pas de verrou inter-processus : deux gateways qui lisent puis écrivent
+  exactement en même temps peuvent encore produire une course. Le déploiement
+  officiel reste mono-worker et ne partage pas le registre entre services.
 - **Deux worktrees d'agent sur huit ont été livrés sur un HEAD antérieur à la
   vague 6.** Les chantiers concernés l'ont détecté et reconstruit leur base ; les
   chiffres de non-régression de ce document sont ceux mesurés **après fusion sur
@@ -1257,7 +1282,7 @@ Conditions de §13 et leur état réel au 2026-08-03. **Cette table remplace
 | Calibration effectuée | `[~]` | Inchangé — sondes concrètes, aucune mesure GPU terrain archivée |
 | Modèle préchauffé | `[~]` | Inchangé — raccord livré, jamais exécuté sur le modèle cible |
 | Appel E2E réussi | `[~]` | `nginx.conf` a changé (SEC-016) et est désormais **validée par `nginx -t` en CI**, runners GitHub livrant le binaire. Reste inchangé : le vrai chemin public n'a jamais été traversé par la recette, et la sémantique d'exécution de la configuration n'est pas démontrée |
-| Rapport final produit | `[x]` | COR-026 et COR-030 le rendent **juste** : chaque condition est prouvée par les étapes qui la concernent, cible comprise, et une installation réussie n'est plus classée `partial` |
+| Rapport final produit | `[x]` | COR-026 et COR-030 le rendent **juste** : chaque condition est prouvée par les étapes qui la concernent, cible comprise, et une installation réussie n'est plus classée `partial`. La revue PR #13 conserve aussi `constat-opérateur` comme preuve établie au lieu de le reclasser en hypothèse |
 
 **Décision de sortie : toujours refusée, et pour une seule raison.** Ce n'est
 plus « la preuve terrain manque *et* le code bloque » : le code ne bloque plus.
