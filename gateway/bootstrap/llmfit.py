@@ -746,7 +746,11 @@ def run_llmfit(
 
 def _from_manual_profile(config: LLMfitConfig) -> LLMfitResult:
     path = config.manual_profile_path
-    assert path is not None  # garanti par l'appelant
+    if path is None:  # garanti par l'appelant — mais `python -O` retirerait un assert
+        raise LLMfitError(
+            "profil manuel demandé sans `manual_profile_path` : rien à lire, et rien "
+            "à recommander"
+        )
     try:
         recommendation = load_manual_profile(path)
     except (LLMfitError, OSError) as exc:
@@ -849,7 +853,11 @@ def _degraded(
     duration_ms: int | None,
 ) -> LLMfitResult:
     """Échec d'exécution ou de validation : dégradé, jamais bloquant."""
-    assert config.pin is not None
+    if config.pin is None:  # garanti par l'appelant — mais `python -O` retirerait un assert
+        raise LLMfitError(
+            "dégradation LLMfit sans épinglage : `pin` est absent alors que le binaire "
+            "a été exécuté — l'état est incohérent, il n'est pas rapporté comme normal"
+        )
     return LLMfitResult(
         status="warn",
         summary="conseil consultatif — LLMfit inexploitable, plan poursuivi sans recommandation",

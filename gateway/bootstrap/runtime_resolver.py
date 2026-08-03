@@ -242,7 +242,11 @@ class ProvenanceManifest:
     def build_number(self) -> int:
         """Numéro de build entier, comparable à ce que rend `--version`."""
         match = _VERSION_RE.match(self.version)
-        assert match is not None  # garanti par __post_init__
+        if match is None:  # garanti par __post_init__ — mais `python -O` retirerait un assert
+            raise ProvenanceError(
+                f"manifeste de provenance incohérent : version {self.version!r} n'est pas un tag "
+                "de build llama.cpp « bNNNNN » et son numéro de build est donc indéterminable"
+            )
         return int(match.group(1))
 
     @property
@@ -1635,7 +1639,11 @@ def to_decision(resolution: RuntimeResolution) -> schema.Decision:
         )
 
     variant = resolution.variant
-    assert variant is not None  # garanti par resolved and not reuse_existing
+    if variant is None:  # garanti par resolved and not reuse_existing — sauf sous `python -O`
+        raise ProvenanceError(
+            "résolution incohérente : résolue et sans réutilisation, mais sans variante "
+            "retenue — aucune décision de runtime ne peut être motivée"
+        )
     rationale = (
         f"première variante sûre dans l'ordre de §6 pour {resolution.profile.platform} "
         f"({variant.evidence} : {variant.evidence_note})"

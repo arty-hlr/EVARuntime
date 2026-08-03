@@ -771,6 +771,21 @@ Mo ne prouverait rien.
 Quand `--version` ne rend pas de commit, ce recoupement-là est simplement omis :
 on ne peut pas le faire, on ne l'invente pas. Les autres restent.
 
+#### Aucun invariant de production porté par un `assert` (COR-021)
+
+`python -O` retire toutes les instructions `assert` du bytecode, et rien
+n'interdit `-O` dans une unité systemd (`ExecStart=… python -O …`, ou
+`PYTHONOPTIMIZE=1` dans l'`EnvironmentFile`). Un garde-fou écrit
+`assert x is not None` disparaît alors en silence, et le refus explicite se
+transforme en `AttributeError` opaque quelques lignes plus loin.
+
+Le code de production des deux composants n'en contient donc aucun : un invariant
+dont la violation doit produire une erreur lève une exception nommée
+(`ProvenanceError`, `LLMfitError`) ou retourne un refus explicite. Un test balaie
+l'AST de tous les modules de `gateway/` et `node_agent/` — tests exclus — et
+échoue à la première occurrence. Il porte deux contrôles positifs : le scanner
+sait voir un `assert` imbriqué, et son périmètre couvre bien les deux composants.
+
 ### Isolation réseau
 
 ```

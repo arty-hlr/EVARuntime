@@ -898,7 +898,15 @@ class RuntimeInstaller:
 
         manifest = self.request.resolution.manifest
         variant = self.request.resolution.variant
-        assert manifest is not None and variant is not None  # garanti par refusal_reasons
+        if manifest is None or variant is None:
+            # Garanti par `refusal_reasons`, mais un `assert` disparaîtrait sous
+            # `python -O` — que rien n'interdit dans une unité systemd — et le
+            # refus deviendrait un `AttributeError` opaque (COR-021).
+            return self._echec(
+                step, context, debut, CODE_REFUSED,
+                "installation refusée : la résolution ne porte ni manifeste ni variante "
+                "exploitables — rien à installer, et rien à attester.",
+            )
 
         satisfait = await self._deja_satisfait(manifest)
         if satisfait.ok:

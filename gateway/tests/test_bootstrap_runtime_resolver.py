@@ -714,6 +714,35 @@ def test_sha256_binary_reads_a_real_file(tmp_path):
     assert asyncio.run(rr.sha256_binary(tmp_path / "absent")) is None
 
 
+# ── COR-021 : les invariants ne sont plus portés par des `assert` ─────────────
+
+def test_build_number_of_an_incoherent_version_raises_a_named_error():
+    """
+    Un `assert` disparaîtrait sous `python -O` et `int(None.group(1))` lèverait un
+    `AttributeError` opaque. On force l'état incohérent en contournant le gel du
+    dataclass, comme le ferait une désérialisation exotique.
+    """
+    manifest = posed_manifest()
+    object.__setattr__(manifest, "version", "pas-un-tag")
+    with pytest.raises(rr.ProvenanceError, match="bNNNNN"):
+        _ = manifest.build_number
+    # Contrôle positif : la propriété sait aussi rendre un numéro.
+    assert posed_manifest().build_number == 6750
+
+
+def test_decision_without_a_variant_raises_a_named_error():
+    resolution = rr.RuntimeResolution(
+        profile=nvidia_profile(), min_build=6700, resolved=True, reuse_existing=False,
+        degraded=False, targeted_backend="cuda12", variant=None, manifest=None,
+        observed_build=None, summary="", findings=(), rejected=(),
+    )
+    with pytest.raises(rr.ProvenanceError, match="sans variante"):
+        rr.to_decision(resolution)
+    # Contrôle positif : la même fonction produit bien une décision quand elle peut.
+    saine = resolve(nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)))
+    assert rr.to_decision(saine).choice
+
+
 def test_manifest_announcing_a_foreign_backend_forces_a_replacement():
     manifest = rr.ProvenanceManifest(
         version="b6750", commit=COMMIT, source=rr.SOURCE_LOCAL_BUILD, backend="cpu",
