@@ -967,6 +967,67 @@ chargement (au besoin `POST /admin/models/{id}/unload` puis `/load`).
 > de chaque **node** qui doit le supporter. Le bloc `speculative` est visible dans
 > `GET /admin/status` une fois le modèle chargé.
 
+### Ce qu'une mutation admin fait à `models.yaml` (COR-020)
+
+`POST /admin/models`, `PATCH /admin/models/{id}` et `DELETE /admin/models/{id}`
+persistent dans `models.yaml`. Depuis COR-020, la persistance **retouche le
+texte** du fichier au lieu de le resérialiser : les commentaires d'exploitation
+— l'en-tête du fichier livré, les notes de fin de ligne, les procédures de
+réactivation — sont de la documentation, pas du bruit.
+
+**Ce qui est préservé**
+
+| Cas | Ce que fait la gateway |
+|-----|------------------------|
+| Ajout (`POST`) | L'entrée est **ajoutée en fin de document**. Aucun octet de l'existant n'est réécrit. |
+| Mise à jour (`PATCH`) | Seules les **lignes de champ qui changent** sont retouchées, y compris à l'intérieur de `llama_params`. Le commentaire de fin de ligne survit (son alignement est normalisé à deux espaces). |
+| Suppression (`DELETE`) | Seul le **bloc de l'entrée** est retiré : en-tête du fichier et entrées voisines intacts. |
+| Mutation sans effet | Rien n'est écrit, aucune sauvegarde n'est produite. |
+
+**Ce qui n'est pas préservé**
+
+- Les commentaires **internes au bloc supprimé** par un `DELETE` : ils décrivent
+  l'entrée qui disparaît. La sauvegarde horodatée en garde une copie.
+- Un commentaire placé **après le dernier champ** d'une entrée supprimée est
+  conservé dans le fichier et devient orphelin — un commentaire orphelin se
+  relit, un commentaire effacé ne se retrouve pas.
+- Une entrée qui n'a pas de bloc `llama_params` et dont on modifie un paramètre
+  reçoit un bloc **complet** (paramètres effectifs), pas un bloc partiel.
+
+**Ce qui est refusé** — HTTP 422, message explicite, *rien n'est écrit et l'état
+mémoire de la gateway est restauré* :
+
+- `models.yaml` n'est plus lisible, ou n'est plus un registre (clé `models`
+  absente, valeur qui n'est pas une liste) ;
+- une entrée n'est pas identifiable avec certitude dans le texte : registre en
+  style « flow » (`models: [{...}]`), identifiant présent plusieurs fois ;
+- le texte candidat, reparsé, ne rend **pas** le document attendu — par exemple
+  une clé dupliquée dans une entrée, où YAML retient la dernière ;
+- un champ **non scalaire** diverge entre le disque et la mémoire
+  (`capabilities`, `speculative`, `path`) : aucune mutation admin ne les change,
+  donc la divergence vient d'une édition manuelle et l'écraser serait une perte
+  de données.
+
+Dans tous ces cas, corrigez le fichier à la main puis redémarrez la gateway (le
+registre relit `models.yaml` au démarrage). La gateway ne se rabat **jamais** sur
+une réécriture globale.
+
+**Sauvegardes et durabilité**
+
+- Avant chaque écriture, une copie `models.yaml.pre-admin.<horodatage>.bak` est
+  produite dans le même répertoire, avec le mode du fichier d'origine.
+- Ces sauvegardes sont **bornées à 5** (les plus anciennes sont purgées).
+  Contrairement aux `*.pre-migration.*.bak` des migrations SQLite, elles ne
+  s'accumulent pas. Le motif est distinct de celui du bootstrap
+  (`*.pre-bootstrap.*.bak`) : les deux jeux ne se purgent pas l'un l'autre.
+- L'écriture est atomique : fichier temporaire dans le même répertoire, `fsync`,
+  validation par le chargeur du registre lui-même, `os.replace`, puis `fsync`
+  du **répertoire parent** — sans lequel le renommage n'est pas durable.
+- Le **mode** du fichier est réappliqué (un `models.yaml` en 0640 le reste), et
+  le **propriétaire et le groupe** sont rétablis après le renommage. Si le
+  service n'a pas le droit de le faire, un avertissement est journalisé : vérifiez
+  alors `ls -l` sur le fichier.
+
 ### Enregistrer un nouveau modèle (sans redémarrage)
 
 ```bash
