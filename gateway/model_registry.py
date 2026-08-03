@@ -23,14 +23,16 @@ Structure du fichier YAML :
 """
 from __future__ import annotations
 
+import copy
 import hashlib
+import os
 import re
-import tempfile
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 
 import yaml
 
@@ -45,9 +47,49 @@ _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 # Taille de bloc pour le hachage incrémental des GGUF (1 Mo).
 _HASH_CHUNK_SIZE = 1024 * 1024
 
+# ── Persistance : sauvegardes des mutations admin (COR-020) ──────────────────
+#
+# Convention de nommage de `database._backup_path()` : « <nom>.<raison>.<horodatage>.bak ».
+# Le motif est DISTINCT de celui de `bootstrap.registry_writer` (« .pre-bootstrap. ») :
+# un exploitant doit pouvoir dire qui a écrit, et la purge de l'un ne doit pas
+# manger les copies de l'autre.
+_ADMIN_BACKUP_INFIX = ".pre-admin."
+_ADMIN_BACKUP_SUFFIX = ".bak"
+
+# Nombre de sauvegardes admin conservées. BORNÉ, contrairement aux
+# `*.pre-migration.*.bak` des migrations SQLite qu'OPS-002 constate non purgées :
+# le dashboard peut déclencher une écriture à chaque clic.
+ADMIN_BACKUP_RETENTION = 5
+
+# En-tête du fichier créé de toutes pièces, quand `models.yaml` n'existe pas
+# encore. Se termine par la clé `models:` pour que l'ajout textuel s'y accroche.
+_NEW_REGISTRY_HEADER = (
+    "# Registre des modèles — EVA Inference Gateway.\n"
+    "#\n"
+    "# Fichier créé par l'API admin. Les commentaires ajoutés à la main sont\n"
+    "# préservés : les mutations retouchent le texte au lieu de le réécrire.\n"
+    "\n"
+    "models:\n"
+)
+
+# Ligne de la clé racine `models:`, avec sa forme vide et un commentaire de fin
+# éventuel. Non indentée : c'est une clé de premier niveau.
+_MODELS_KEY_RE = re.compile(r"^models:[ \t]*(\[[ \t]*\])?[ \t]*(?P<comment>#.*)?$")
+
 
 class IntegrityError(Exception):
     """Levée quand la vérification d'intégrité (SHA-256) d'un GGUF échoue."""
+
+
+class RegistryWriteRefused(ValueError):
+    """
+    L'écriture de `models.yaml` est refusée : rien n'a été écrit (COR-020).
+
+    Hérite de `ValueError` **à dessein** : `admin.py` traduit déjà les `ValueError`
+    des mutations de registre en HTTP 422 avec le message. Un refus est
+    exploitable par un opérateur — « la mise en page de votre fichier empêche une
+    modification sûre » — et doit lui parvenir, pas se perdre dans une 500 muette.
+    """
 
 # Types valides pour la quantisation du KV cache
 _CACHE_TYPES = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
@@ -567,8 +609,9 @@ class ModelRegistry:
         model = self._parse_entry(entry)
         if model.id in self._models:
             raise ValueError(f"Un modèle avec l'ID '{model.id}' existe déjà dans le registre.")
+        precedent = dict(self._models)
         self._models[model.id] = model
-        self._save()
+        self._save(precedent)
         log.info("Modèle enregistré : '%s' (vram=%.1f GB, enabled=%s)", model.id, model.vram_gb, model.enabled)
         return model
 
@@ -591,8 +634,9 @@ class ModelRegistry:
             speculative=model.speculative,
             sha256=model.sha256,
         )
+        precedent = dict(self._models)
         self._models[model_id] = updated
-        self._save()
+        self._save(precedent)
         log.info("Modèle '%s' : enabled → %s", model_id, enabled)
         return updated
 
@@ -636,8 +680,9 @@ class ModelRegistry:
         if updated.vram_gb <= 0:
             raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")
 
+        precedent = dict(self._models)
         self._models[model_id] = updated
-        self._save()
+        self._save(precedent)
         return updated
 
     def remove(self, model_id: str) -> None:
@@ -647,38 +692,614 @@ class ModelRegistry:
         """
         if model_id not in self._models:
             raise KeyError(f"Modèle inconnu : '{model_id}'")
+        precedent = dict(self._models)
         del self._models[model_id]
-        self._save()
+        self._save(precedent)
         log.info("Modèle '%s' supprimé du registre.", model_id)
 
     def reload(self) -> None:
         """Recharge le registre depuis le fichier YAML (utile après édition manuelle)."""
         self._load()
 
-    # ── Persistance atomique ──────────────────────────────────────────────────
+    # ── Persistance : retouche textuelle, jamais réécriture globale (COR-020) ──
 
-    def _save(self) -> None:
+    def _save(self, precedent: dict[str, ModelDefinition]) -> None:
         """
-        Écrit le registre dans le fichier YAML de manière atomique :
-        écriture dans un fichier temporaire → rename.
-        Évite la corruption en cas de crash pendant l'écriture.
-        """
-        data = {"models": [m.to_dict() for m in self._models.values()]}
-        parent = self._path.parent
+        Persiste la mutation en PRÉSERVANT le fichier de l'exploitant (COR-020).
 
-        # Écriture atomique via fichier temporaire dans le même répertoire
+        Avant ce correctif, `_save()` sérialisait la mémoire par `yaml.dump` et
+        écrasait le fichier : les 55 lignes d'en-tête opérationnel du `models.yaml`
+        livré — budget VRAM, table RAM hôte, procédure de réactivation de
+        `minimax-m2.7` — et tous les commentaires d'entrée disparaissaient au
+        premier clic du dashboard. Sans sauvegarde, sans `fsync`, et avec un
+        basculement silencieux des permissions en 0600.
+
+        Ce qui est fait à la place, dans l'ordre :
+
+        1. le fichier est relu, texte ET structure. Illisible ou non conforme
+           (« models » absent, liste attendue) ⇒ **refus**, rien n'est écrit ;
+        2. l'écart entre le disque et la mémoire est réduit à des opérations
+           TEXTUELLES minimales : suppression du bloc d'une entrée retirée,
+           retouche des seules lignes de champ qui changent, ajout en fin de
+           document pour une entrée nouvelle ;
+        3. le texte candidat est reparsé et comparé au document attendu. S'il ne
+           signifie pas exactement ce qui était prévu ⇒ **refus**. Jamais de repli
+           sur une réécriture globale : c'est elle, le défaut ;
+        4. sauvegarde horodatée et **bornée** (`ADMIN_BACKUP_RETENTION`) ;
+        5. écriture atomique — temporaire dans le même répertoire, `fsync` du
+           fichier, validation par `ModelRegistry` lui-même, `os.replace`, puis
+           `fsync` du **répertoire parent** sans lequel le renommage n'est pas
+           durable —, mode d'origine réappliqué, propriétaire et groupe rétablis.
+
+        `precedent` est l'état mémoire d'avant la mutation : un refus le restaure,
+        pour qu'une écriture refusée ne laisse jamais la mémoire en avance sur le
+        disque.
+        """
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=parent,
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                yaml.dump(data, tmp, allow_unicode=True, default_flow_style=False, sort_keys=False)
-                tmp_path = Path(tmp.name)
-
-            tmp_path.replace(self._path)
+            self._write_preserving_layout()
         except Exception as exc:
-            log.error("Échec de la sauvegarde du registre : %s", exc)
+            self._models = precedent
+            log.error("Échec de la sauvegarde du registre %s : %s", self._path, exc)
             raise
+
+    def _write_preserving_layout(self) -> None:
+        """Corps de `_save()`, sans la restauration mémoire (cf. sa docstring)."""
+        rw = _text_write_policy()
+        horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+        try:
+            document = rw._read_document(self._path)
+        except Exception as exc:
+            raise RegistryWriteRefused(
+                f"{self._path} n'a pas pu être relu avant écriture ({exc}). Rien n'a été "
+                "écrit : la gateway ne remplace pas un registre qu'elle ne comprend pas."
+            ) from exc
+
+        texte, attendu = self._plan_registry_text(rw, document, horodatage)
+
+        if document.exists and texte == document.text:
+            # Mutation sans effet sur le disque (valeur réécrite à l'identique) :
+            # ni sauvegarde, ni churn de fichier. Idempotence.
+            return
+
+        try:
+            rw._assert_candidate_matches(texte, attendu, f"écriture de {self._path.name}")
+        except Exception as exc:
+            raise RegistryWriteRefused(str(exc)) from exc
+
+        avant = os.stat(self._path) if self._path.exists() else None
+        if avant is not None:
+            _backup_registry(self._path, horodatage, ADMIN_BACKUP_RETENTION)
+
+        rw._atomic_write(self._path, texte, self._allowed_dirs, horodatage)
+
+        if avant is not None:
+            _restore_ownership(self._path, avant)
+
+    # ── Planification de l'écriture ───────────────────────────────────────────
+
+    def _plan_registry_text(self, rw, document, horodatage: str) -> tuple[str, dict]:
+        """
+        Rend `(texte candidat, document attendu)` pour l'état mémoire courant.
+
+        Le « document attendu » n'est PAS `{"models": [m.to_dict() …]}` : ce serait
+        redire la sortie de `yaml.dump` qu'on cherche justement à ne plus produire.
+        C'est le document **brut du disque** auquel on applique le même écart que
+        celui appliqué au texte. Les deux se recoupent ensuite, structure comprise.
+        """
+        brutes = [copy.deepcopy(entree) for entree in document.models]
+        positions: dict[str, int] = {}
+        for position, entree in enumerate(brutes):
+            if not isinstance(entree, dict) or not entree.get("id"):
+                raise RegistryWriteRefused(
+                    f"{self._path} : une entrée sans clé « id » exploitable empêche toute "
+                    "retouche sûre. Rien n'a été écrit."
+                )
+            identifiant = str(entree["id"])
+            if identifiant in positions:
+                raise RegistryWriteRefused(
+                    f"{self._path} : « {identifiant} » figure plusieurs fois. Le fichier est "
+                    "déjà incohérent, la gateway n'y touchera pas."
+                )
+            positions[identifiant] = position
+
+        retires = [identifiant for identifiant in positions if identifiant not in self._models]
+        ajoutes = [identifiant for identifiant in self._models if identifiant not in positions]
+        communs = [identifiant for identifiant in positions if identifiant in self._models]
+
+        if document.exists and document.text.strip():
+            texte = document.text if document.text.endswith("\n") else document.text + "\n"
+        else:
+            texte = _NEW_REGISTRY_HEADER
+
+        # 1. Suppressions. Elles décalent les lignes : chaque opération repart du
+        #    texte courant plutôt que d'un index calculé une fois pour toutes.
+        for identifiant in retires:
+            texte = _delete_entry_block(rw, texte, identifiant)
+
+        # 2. Mises à jour, champ par champ.
+        for identifiant in communs:
+            brute = brutes[positions[identifiant]]
+            ecart = self._entry_delta(brute, self._models[identifiant])
+            if ecart is None:
+                continue
+            scalaires, llama, llama_absent = ecart
+            for champ, valeur in scalaires.items():
+                texte = _set_entry_scalar(rw, texte, identifiant, champ, valeur)
+                brute[champ] = valeur
+            if llama:
+                if llama_absent:
+                    complet = self._models[identifiant].to_dict()["llama_params"]
+                    texte = _insert_entry_mapping(rw, texte, identifiant, "llama_params", complet)
+                    brute["llama_params"] = dict(complet)
+                else:
+                    for champ, valeur in llama.items():
+                        texte = _set_entry_nested_scalar(
+                            rw, texte, identifiant, "llama_params", champ, valeur
+                        )
+                    sous = dict(brute.get("llama_params") or {})
+                    sous.update(llama)
+                    brute["llama_params"] = sous
+
+        restantes = [brutes[positions[i]] for i in positions if i not in retires]
+
+        # 3. Ajouts, en fin de document. `models:` doit porter la bonne forme :
+        #    « models: [] » quand la liste est vide, « models: » sinon.
+        texte = _set_models_key(texte, vide=not (restantes or ajoutes))
+        for identifiant in ajoutes:
+            entree = self._models[identifiant].to_dict()
+            texte = _append_entry_block(rw, texte, entree, horodatage)
+            restantes.append(entree)
+
+        attendu = copy.deepcopy(document.data) if document.exists else {}
+        attendu["models"] = restantes
+        return texte, attendu
+
+    def _entry_delta(
+        self, brute: dict, model: ModelDefinition
+    ) -> tuple[dict[str, Any], dict[str, Any], bool] | None:
+        """
+        Écart entre l'entrée du disque et le modèle en mémoire, ou `None` si nul.
+
+        La comparaison est **normalisée** : l'entrée du disque est reparsée puis
+        resérialisée, si bien qu'un champ omis qui vaut son défaut ne compte pas
+        pour une divergence. Sans cette normalisation, toute mutation aurait
+        « touché » chaque entrée du fichier livré.
+
+        Rend `(scalaires, llama_params, llama_params_absent_du_disque)`.
+
+        **Refus** si un champ non scalaire diverge — `capabilities`, `speculative`,
+        `path`, `id` : aucune mutation admin ne les change, donc une divergence
+        vient d'une édition manuelle concurrente ou d'un fichier déjà désynchronisé.
+        La retoucher à l'aveugle écraserait le réglage de l'exploitant.
+        """
+        cible = model.to_dict()
+        try:
+            actuel = self._parse_entry(brute).to_dict()
+        except (ValueError, TypeError) as exc:
+            raise RegistryWriteRefused(
+                f"{self._path} : l'entrée « {brute.get('id')} » présente sur le disque n'est "
+                f"plus lisible ({exc}). Rien n'a été écrit."
+            ) from exc
+
+        if actuel == cible:
+            return None
+
+        disparus = sorted(champ for champ in actuel if champ not in cible)
+        if disparus:
+            raise RegistryWriteRefused(
+                f"« {model.id} » : les champs {disparus} devraient disparaître du registre. "
+                "La gateway ne supprime pas de champ par retouche textuelle — modifiez "
+                "l'entrée à la main. Rien n'a été écrit."
+            )
+
+        scalaires: dict[str, Any] = {}
+        for champ, valeur in cible.items():
+            if champ == "llama_params":
+                continue
+            if champ in actuel and actuel[champ] == valeur:
+                continue
+            if valeur is None or isinstance(valeur, (str, int, float, bool)):
+                scalaires[champ] = valeur
+            else:
+                raise RegistryWriteRefused(
+                    f"« {model.id} » : le champ « {champ} » diverge du disque et n'est pas un "
+                    "scalaire. Aucune mutation admin ne le modifie ; la gateway refuse de "
+                    "réécrire le bloc. Rien n'a été écrit."
+                )
+
+        llama_cible = cible["llama_params"]
+        llama_actuel = actuel["llama_params"]
+        llama: dict[str, Any] = {
+            champ: valeur
+            for champ, valeur in llama_cible.items()
+            if champ not in llama_actuel or llama_actuel[champ] != valeur
+        }
+        for champ in llama_actuel:
+            if champ not in llama_cible:
+                # `to_dict()` omet `cpu_moe` quand il est faux. L'écrire
+                # explicitement à `false` est plus sûr que d'effacer la ligne :
+                # même sens, et le commentaire de fin de ligne survit.
+                llama[champ] = getattr(model.llama_params, champ, False)
+
+        sous_disque = brute.get("llama_params")
+        absent = not isinstance(sous_disque, dict) or not sous_disque
+        return scalaires, llama, absent
+
+
+# ── Politique d'écriture partagée ────────────────────────────────────────────
+
+def _text_write_policy():
+    """
+    Rend le module qui porte la politique d'écriture textuelle de `models.yaml`.
+
+    Il n'existe volontairement **qu'une** politique dans le dépôt, celle
+    d'AUT-007 : ajout textuel, retouche de ligne, reparse comparatif, écriture
+    atomique validée par le registre lui-même. La dupliquer ici aurait produit
+    deux politiques divergentes sur le même fichier — exactement la classe de
+    défaut que COR-020 corrige.
+
+    Import tardif, comme `cli.py` le fait déjà pour ce paquet : `registry_writer`
+    importe `model_registry` au chargement, un import au niveau module serait
+    circulaire.
+
+    Indisponible ⇒ **refus d'écrire**. Pas de repli sur un `yaml.dump` global :
+    ce repli est le défaut.
+    """
+    try:
+        from bootstrap import registry_writer
+    except ImportError as exc:  # pragma: no cover - le paquet est livré avec la gateway
+        raise RegistryWriteRefused(
+            "la politique d'écriture de models.yaml (bootstrap.registry_writer) est "
+            f"introuvable : {exc}. Le registre n'a pas été modifié — une réécriture "
+            "globale détruirait les commentaires d'exploitation du fichier."
+        ) from exc
+    return registry_writer
+
+
+# ── Retouches textuelles ─────────────────────────────────────────────────────
+
+def _lines(texte: str) -> list[str]:
+    return texte.splitlines()
+
+
+def _join(lignes: list[str]) -> str:
+    return ("\n".join(lignes) + "\n") if lignes else ""
+
+
+def _entry_bounds(lignes: list[str], model_id: str) -> tuple[int, int, int]:
+    """
+    Bornes textuelles de l'entrée `model_id` : (début, fin exclue, indentation des champs).
+
+    Pourquoi ne pas réutiliser `registry_writer._entry_block_bounds` : celui-ci
+    ancre sa recherche sur une ligne « - id: <model_id> », donc sur des entrées
+    dont `id` est la PREMIÈRE clé. C'est vrai du `models.yaml` livré et de ce que
+    le bootstrap écrit, mais pas d'un fichier produit par `yaml.safe_dump`, qui
+    trie les clés par ordre alphabétique et place `capabilities` en tête. Le
+    chemin admin doit adresser le fichier de l'exploitant tel qu'il est.
+
+    On délimite donc les éléments de la séquence, puis on cherche la ligne `id:`
+    à l'indentation des champs À L'INTÉRIEUR de chaque élément. Zéro ou plusieurs
+    correspondances ⇒ **refus** : la gateway ne retouche pas un fichier dont elle
+    n'identifie pas l'entrée avec certitude.
+    """
+    debuts: list[tuple[int, int]] = []  # (ligne, indentation des champs)
+    indent_liste: int | None = None
+    for index, ligne in enumerate(lignes):
+        match = re.match(r"^(\s*)-(\s+)(?=\S)", ligne)
+        if not match:
+            continue
+        tiret_indent = len(match.group(1))
+        if indent_liste is None:
+            indent_liste = tiret_indent
+        if tiret_indent != indent_liste:
+            continue
+        debuts.append((index, tiret_indent + 1 + len(match.group(2))))
+
+    trouves: list[tuple[int, int, int]] = []
+    for rang, (debut, champ_indent) in enumerate(debuts):
+        fin = debuts[rang + 1][0] if rang + 1 < len(debuts) else len(lignes)
+        # Une ligne moins indentée et signifiante ferme la séquence avant
+        # l'élément suivant (une autre clé racine, par exemple).
+        for curseur in range(debut + 1, fin):
+            depouillee = lignes[curseur].strip()
+            if not depouillee or depouillee.startswith("#"):
+                continue
+            if len(lignes[curseur]) - len(lignes[curseur].lstrip()) < champ_indent:
+                fin = curseur
+                break
+        motif = re.compile(
+            r"^(\s*)id:\s*[\"']?" + re.escape(model_id) + r"[\"']?\s*(#.*)?$"
+        )
+        for curseur in range(debut, fin):
+            candidate = lignes[curseur]
+            if curseur == debut:
+                candidate = " " * champ_indent + candidate[champ_indent:]
+            match_id = motif.match(candidate)
+            if match_id and len(match_id.group(1)) == champ_indent:
+                trouves.append((debut, fin, champ_indent))
+                break
+
+    if len(trouves) != 1:
+        raise RegistryWriteRefused(
+            f"« {model_id} » : {len(trouves)} entrée(s) identifiée(s) dans le texte du "
+            "registre, une seule est attendue. La gateway ne retouche pas un fichier dont "
+            "elle n'identifie pas l'entrée avec certitude ; rien n'a été écrit."
+        )
+    return trouves[0]
+
+
+def _set_models_key(texte: str, *, vide: bool) -> str:
+    """
+    Met la clé racine `models:` à la forme qu'exige la liste résultante.
+
+    Supprimer la dernière entrée laisserait `models:` seul, que YAML lit comme
+    `None` et que `read_snapshot()` refuse : le fichier deviendrait illisible par
+    la gateway qui vient de l'écrire. Symétriquement, ajouter sous un
+    `models: []` produirait un document invalide. Le commentaire de fin de ligne
+    éventuel est conservé.
+    """
+    lignes = _lines(texte)
+    for index, ligne in enumerate(lignes):
+        match = _MODELS_KEY_RE.match(ligne)
+        if not match:
+            continue
+        commentaire = match.group("comment")
+        suffixe = f"  {commentaire.strip()}" if commentaire else ""
+        lignes[index] = ("models: []" if vide else "models:") + suffixe
+        return _join(lignes)
+    raise RegistryWriteRefused(
+        "la clé racine « models: » est introuvable en début de ligne dans le registre. "
+        "La gateway ne retouche pas un fichier dont elle n'identifie pas la structure ; "
+        "rien n'a été écrit."
+    )
+
+
+def _delete_entry_block(rw, texte: str, model_id: str) -> str:
+    """
+    Retire les lignes de l'entrée `model_id`, et elles seules.
+
+    Deux ajustements sur les bornes de `registry_writer._entry_block_bounds`,
+    qui sont taillées pour la RETOUCHE et non pour la suppression :
+
+    - vers le haut, les commentaires collés juste au-dessus du tiret documentent
+      cette entrée : les laisser en place les orphelinerait sur la suivante ;
+    - vers le bas, la borne haute court jusqu'à l'élément suivant et englobe donc
+      la ligne vide de séparation et les commentaires de l'entrée SUIVANTE. On la
+      ramène sur la dernière ligne de champ.
+
+    Ce qui est **perdu** : les commentaires internes au bloc supprimé. Ils
+    décrivent l'entrée qui disparaît, et la sauvegarde horodatée les conserve.
+    Ce qui est **gardé** : un commentaire placé après le dernier champ reste dans
+    le fichier plutôt que d'être supprimé — un commentaire orphelin se relit, un
+    commentaire effacé ne se retrouve pas.
+    """
+    lignes = _lines(texte)
+    debut, fin, _ = _entry_bounds(lignes, model_id)
+
+    tiret_indent = len(lignes[debut]) - len(lignes[debut].lstrip())
+    while debut > 0:
+        precedente = lignes[debut - 1]
+        depouillee = precedente.strip()
+        if not depouillee.startswith("#"):
+            break
+        if len(precedente) - len(precedente.lstrip()) != tiret_indent:
+            break
+        debut -= 1
+
+    while fin > debut:
+        derniere = lignes[fin - 1].strip()
+        if derniere and not derniere.startswith("#"):
+            break
+        fin -= 1
+
+    del lignes[debut:fin]
+    return _join(lignes)
+
+
+def _set_entry_scalar(rw, texte: str, model_id: str, champ: str, valeur: Any) -> str:
+    """Remplace (ou insère) un champ scalaire de premier niveau dans l'entrée."""
+    lignes = _lines(texte)
+    debut, fin, champ_indent = _entry_bounds(lignes, model_id)
+    lignes = rw._set_scalar_field(
+        lignes, debut, fin, champ_indent, champ, rw._render_scalar(valeur)
+    )
+    return _join(lignes)
+
+
+def _sub_block_bounds(
+    lignes: list[str], debut: int, fin: int, champ_indent: int, champ: str
+) -> tuple[int, int, int] | None:
+    """Bornes du sous-bloc `champ:` d'une entrée, ou `None` s'il est absent/vide."""
+    motif = re.compile(r"^(\s*)" + re.escape(champ) + r":\s*(#.*)?$")
+    for index in range(debut, fin):
+        match = motif.match(lignes[index])
+        if not match or len(match.group(1)) != champ_indent:
+            continue
+        sous_debut = index + 1
+        sous_indent: int | None = None
+        curseur = sous_debut
+        while curseur < fin:
+            ligne = lignes[curseur]
+            if not ligne.strip():
+                curseur += 1
+                continue
+            indent = len(ligne) - len(ligne.lstrip())
+            if indent <= champ_indent:
+                break
+            if sous_indent is None:
+                sous_indent = indent
+            curseur += 1
+        if sous_indent is None:
+            return None
+        return sous_debut, curseur, sous_indent
+    return None
+
+
+def _set_entry_nested_scalar(
+    rw, texte: str, model_id: str, bloc: str, champ: str, valeur: Any
+) -> str:
+    """Remplace (ou insère) un scalaire DANS le sous-bloc `bloc:` de l'entrée."""
+    lignes = _lines(texte)
+    debut, fin, champ_indent = _entry_bounds(lignes, model_id)
+    bornes = _sub_block_bounds(lignes, debut, fin, champ_indent, bloc)
+    if bornes is None:
+        raise RegistryWriteRefused(
+            f"« {model_id} » : le bloc « {bloc} » est introuvable dans le texte du registre "
+            f"alors que le champ « {champ} » doit y changer. Rien n'a été écrit."
+        )
+    sous_debut, sous_fin, sous_indent = bornes
+    lignes = rw._set_scalar_field(
+        lignes, sous_debut, sous_fin, sous_indent, champ, rw._render_scalar(valeur)
+    )
+    return _join(lignes)
+
+
+def _insert_entry_mapping(
+    rw, texte: str, model_id: str, champ: str, mapping: Mapping[str, Any]
+) -> str:
+    """
+    Insère un sous-bloc `champ:` complet dans une entrée qui n'en a pas.
+
+    Cas réel : une entrée écrite à la main qui s'appuie sur les défauts de
+    `LlamaParams`, dont l'exploitant change `ctx_size` via le dashboard. Il n'y a
+    alors aucune ligne à retoucher — il faut créer le bloc, avec ses paramètres
+    EFFECTIFS. Les autres lignes de l'entrée ne sont pas touchées.
+    """
+    lignes = _lines(texte)
+    debut, fin, champ_indent = _entry_bounds(lignes, model_id)
+
+    rendu = yaml.safe_dump(
+        dict(mapping), allow_unicode=True, default_flow_style=False, sort_keys=False, width=100
+    )
+    bloc = [f"{' ' * champ_indent}{champ}:"]
+    bloc += [
+        f"{' ' * (champ_indent + 2)}{ligne}" if ligne else ""
+        for ligne in rendu.rstrip("\n").split("\n")
+    ]
+
+    # Une ligne `champ:` vide peut exister sans sous-bloc : on écrit sous elle.
+    motif = re.compile(r"^(\s*)" + re.escape(champ) + r":\s*(#.*)?$")
+    for index in range(debut, fin):
+        match = motif.match(lignes[index])
+        if match and len(match.group(1)) == champ_indent:
+            lignes[index + 1:index + 1] = bloc[1:]
+            return _join(lignes)
+
+    lignes[fin:fin] = bloc
+    return _join(lignes)
+
+
+def _append_entry_block(rw, texte: str, entree: Mapping[str, Any], horodatage: str) -> str:
+    """
+    Ajoute une entrée en fin de document, sans toucher un octet de l'existant.
+
+    L'indentation reprend celle de la liste du fichier, quelle qu'elle soit : un
+    registre écrit à 0 colonne par `yaml.safe_dump` et le fichier livré, indenté
+    de 2, restent tous deux cohérents.
+    """
+    indent = rw._list_indent(texte)
+    prefixe = " " * indent
+    rendu = yaml.safe_dump(
+        [dict(entree)], allow_unicode=True, default_flow_style=False, sort_keys=False, width=100
+    )
+    bloc = [f"{prefixe}# Entrée ajoutée par l'API admin le {horodatage}."]
+    bloc += [prefixe + ligne if ligne else "" for ligne in rendu.rstrip("\n").split("\n")]
+
+    separateur = "" if texte.endswith("\n\n") or not texte.strip() else "\n"
+    return texte + separateur + "\n".join(bloc) + "\n"
+
+
+# ── Sauvegarde bornée et propriété du fichier ────────────────────────────────
+
+def _admin_backup_path(cible: Path, horodatage: str) -> Path:
+    return cible.with_name(f"{cible.name}{_ADMIN_BACKUP_INFIX}{horodatage}{_ADMIN_BACKUP_SUFFIX}")
+
+
+def _backup_registry(cible: Path, horodatage: str, retention: int) -> Path:
+    """
+    Copie horodatée du registre AVANT toute écriture, puis purge bornée.
+
+    `O_EXCL` : une sauvegarde existante n'est jamais recouverte — deux mutations
+    dans la même seconde prennent des suffixes distincts. Le mode d'origine est
+    repris : une sauvegarde ne doit pas être plus largement lisible que l'original.
+    """
+    contenu = cible.read_bytes()
+    mode = os.stat(cible).st_mode & 0o777
+
+    chemin = _admin_backup_path(cible, horodatage)
+    for essai in range(1, 100):
+        try:
+            descripteur = os.open(chemin, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            break
+        except FileExistsError:
+            chemin = _admin_backup_path(cible, f"{horodatage}-{essai}")
+    else:
+        raise RegistryWriteRefused(
+            f"impossible de créer une sauvegarde libre pour {cible} — 100 tentatives. "
+            "Rien n'a été écrit."
+        )
+    with os.fdopen(descripteur, "wb") as fichier:
+        fichier.write(contenu)
+        fichier.flush()
+        os.fsync(fichier.fileno())
+    os.chmod(chemin, mode)
+
+    _purge_admin_backups(cible, retention)
+    return chemin
+
+
+def _purge_admin_backups(cible: Path, retention: int) -> tuple[str, ...]:
+    """
+    Ne conserve que les `retention` sauvegardes admin les plus récentes.
+
+    Motif strict, et propre à `.pre-admin.` : les `*.pre-bootstrap.*.bak`
+    d'AUT-007 ne sont pas touchées, et les `*.pre-migration.*.bak` que le dépôt
+    laisse s'accumuler (OPS-002) non plus. Le dashboard peut déclencher une
+    écriture à chaque clic : ne pas borner ici recréerait ce défaut en pire.
+    """
+    motif = re.compile(
+        r"^" + re.escape(cible.name + _ADMIN_BACKUP_INFIX)
+        + r"\d{8}T\d{6}Z(-\d+)?" + re.escape(_ADMIN_BACKUP_SUFFIX) + r"$"
+    )
+    existantes = sorted(
+        (p for p in cible.parent.iterdir() if p.is_file() and motif.match(p.name)),
+        key=lambda p: p.name,
+    )
+    supprimees: list[str] = []
+    for vieille in existantes[:-retention] if retention < len(existantes) else []:
+        try:
+            vieille.unlink()
+            supprimees.append(vieille.name)
+        except OSError:
+            # Une sauvegarde non supprimable occupe de la place, elle ne casse rien.
+            continue
+    return tuple(supprimees)
+
+
+def _restore_ownership(chemin: Path, avant: os.stat_result) -> None:
+    """
+    Rétablit propriétaire et groupe après `os.replace`.
+
+    Le fichier publié est l'inode du temporaire : il porte l'uid du processus et
+    le gid du répertoire (ou du processus). Sur un hôte où `models.yaml` est
+    `root:eva-gateway` en 0640, une écriture par le service dédié le ferait
+    basculer en `eva-gateway:eva-gateway` — le mode 0640, réappliqué par
+    l'écriture atomique, ne protégerait alors plus rien.
+
+    Best-effort : un service non privilégié ne peut pas toujours redonner un uid.
+    L'échec est journalisé, jamais silencieux, et n'annule pas une écriture déjà
+    publiée et valide.
+    """
+    apres = os.stat(chemin)
+    uid = avant.st_uid if apres.st_uid != avant.st_uid else -1
+    gid = avant.st_gid if apres.st_gid != avant.st_gid else -1
+    if uid == -1 and gid == -1:
+        return
+    try:
+        os.chown(chemin, uid, gid)
+    except OSError as exc:
+        log.warning(
+            "Registre %s : propriété d'origine non rétablie (%s). Vérifiez uid/gid "
+            "et les permissions du fichier.", chemin, exc,
+        )
