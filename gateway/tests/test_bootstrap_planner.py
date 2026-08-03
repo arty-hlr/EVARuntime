@@ -15,12 +15,15 @@ sa propre suite. Trois familles d'invariants :
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import struct
 
 import pytest
 
 from bootstrap import catalog as catalog_mod
+from bootstrap import downloader, execution, gguf_meta
 from bootstrap import llmfit as llmfit_mod
 from bootstrap import planner
 from bootstrap import runtime_resolver as runtime_mod
@@ -503,6 +506,334 @@ def test_la_section_modeles_rappelle_que_les_ressources_sont_estimees(tmp_path):
     texte = sc.render_human(_plan(_options(tmp_path)))
     assert "ESTIMATIONS" in texte
     assert "calibrate_model" in texte
+
+
+# ── 4. AUT-014 — artefacts déjà présents ──────────────────────────────────────
+#
+# Sur le second déploiement réel (§0.13), les deux GGUF du catalogue étaient déjà
+# sur l'hôte et le plan annonçait quand même 837,1 Mio de téléchargement. Ce qui
+# est testé ici est le RAISONNEMENT, pas la collecte : le planificateur lisait
+# déjà les en-têtes, il n'en tirait rien.
+#
+# Le catalogue de production épingle des fichiers de plusieurs centaines de Mio :
+# les tests fabriquent donc leur propre catalogue, avec de vrais GGUF minimaux
+# de quelques dizaines d'octets et de vraies empreintes.
+
+ARTEFACT_REVISION = "0123456789abcdef0123456789abcdef01234567"
+ARTEFACT_ID = "modele-aut-014"
+POIDS = "modele-aut-014-q4_k_m.gguf"
+MMPROJ = "mmproj-modele-aut-014.gguf"
+
+
+def _gguf(taille: int, *, arch: str = "qwen2") -> bytes:
+    """
+    Un GGUF minimal mais RÉELLEMENT lisible, complété jusqu'à la taille voulue.
+
+    Un fichier illisible ferait apparaître un constat `gguf_illisible` dans la
+    section « modèles » et brouillerait ce qu'on cherche à observer ici.
+    """
+    valeur = arch.encode("utf-8")
+    cle = b"general.architecture"
+    kv = (
+        struct.pack("<Q", len(cle)) + cle
+        + struct.pack("<I", gguf_meta._T_STRING)
+        + struct.pack("<Q", len(valeur)) + valeur
+    )
+    tete = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", 1) + kv
+    assert taille >= len(tete)
+    return tete + b"\0" * (taille - len(tete))
+
+
+POIDS_OCTETS = _gguf(4096)
+MMPROJ_OCTETS = _gguf(2048)
+
+
+def _catalogue_artefact(tmp_path) -> catalog_mod.Catalog:
+    """Catalogue synthétique relu par le VRAI chargeur — contraintes du catalogue incluses."""
+    import yaml
+
+    def fichier(nom: str, role: str, data: bytes) -> dict:
+        return {
+            "name": nom,
+            "role": role,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+        }
+
+    document = {
+        "catalog_version": 1,
+        "downloader": {"name": "eva-bootstrap downloader", "license_id": "agpl-3.0"},
+        "models": [{
+            "id": ARTEFACT_ID,
+            "family": "test",
+            "display_name": "Modèle synthétique AUT-014",
+            "description": "Entrée fabriquée pour les régressions d'AUT-014.",
+            "use_cases": ["smoke_test"],
+            "source": {
+                "provider": "huggingface",
+                "repo_id": "organisation/depot-aut-014",
+                "repo_url": "https://huggingface.co/organisation/depot-aut-014",
+                "revision": ARTEFACT_REVISION,
+                "revision_recorded_on": "2026-08-01",
+                "files": [
+                    fichier(POIDS, "weights", POIDS_OCTETS),
+                    fichier(MMPROJ, "mmproj", MMPROJ_OCTETS),
+                ],
+            },
+            "license": {
+                "base_model": {"id": "apache-2.0"},
+                "fine_tune": {"id": "apache-2.0"},
+                "usage_terms": None,
+                "gated": False,
+                "redistribution_allowed": True,
+                "operator_acceptance_required": False,
+                "notes": None,
+            },
+            "runtime": {
+                "min_llama_build": 0,
+                "capabilities": ["text_generation"],
+                "requires_mmproj": True,
+                "defaults": {
+                    "ctx_size": 4096, "parallel": 1,
+                    "cache_type_k": "f16", "cache_type_v": "f16",
+                },
+            },
+            "resources": {
+                "disk_gb": 1.0, "initial_vram_gb": 1.0, "initial_ram_gb": 1.0,
+                "estimation_basis": "gguf_header",
+            },
+        }],
+    }
+    cible = tmp_path / "catalogue-aut-014.yaml"
+    cible.write_text(yaml.safe_dump(document, allow_unicode=True), encoding="utf-8")
+    return catalog_mod.load_catalog(cible)
+
+
+def _options_artefact(tmp_path, **overrides) -> planner.PlannerOptions:
+    _catalogue_artefact(tmp_path)
+    return _options(
+        tmp_path, catalog_path=tmp_path / "catalogue-aut-014.yaml", **overrides
+    )
+
+
+def _poser(options, *, poids: bytes | None = POIDS_OCTETS, mmproj: bytes | None = MMPROJ_OCTETS):
+    """Pose sur le disque ce qu'un déploiement antérieur y aurait laissé."""
+    if poids is not None:
+        (options.models_dir / POIDS).write_bytes(poids)
+    if mmproj is not None:
+        (options.models_dir / MMPROJ).write_bytes(mmproj)
+
+
+def _attester(options) -> None:
+    """
+    Écrit le manifeste de provenance par la VRAIE fabrique du téléchargeur.
+
+    Le recopier à la main dans le test ferait exactement ce que le module refuse
+    de faire dans le code : une seconde définition du manifeste, qui dériverait.
+    """
+    catalogue = catalog_mod.load_catalog(options.catalog_path)
+    entree = catalogue.get(ARTEFACT_ID)
+    downloader.provenance_path(options.models_dir, ARTEFACT_ID).write_text(
+        json.dumps(downloader.build_manifest(
+            entree, options.models_dir,
+            downloaded_at="2026-08-01T12:00:00Z", token_used=False,
+            acceptance=None, catalog=catalogue,
+        )),
+        encoding="utf-8",
+    )
+
+
+def _etape(plan, action):
+    return next((s for s in plan.steps if s.action == action), None)
+
+
+def test_un_artefact_absent_est_bien_planifie_au_telechargement(tmp_path):
+    """
+    Contrôle positif de toute la section : sans fichier sur l'hôte, le plan
+    propose le téléchargement et en annonce le volume. Sans lui, les tests
+    d'absence qui suivent seraient verts pour la mauvaise raison.
+    """
+    plan = _plan(_options_artefact(tmp_path))
+    telechargement = _etape(plan, sc.ACTION_DOWNLOAD_MODEL)
+
+    assert telechargement is not None
+    assert telechargement.estimated_bytes == len(POIDS_OCTETS) + len(MMPROJ_OCTETS)
+    assert plan.total_download_bytes() == telechargement.estimated_bytes
+    assert _actions(plan).index(sc.ACTION_VERIFY_ARTIFACT) == _actions(plan).index(
+        sc.ACTION_DOWNLOAD_MODEL
+    ) + 1
+
+
+def test_un_artefact_present_et_atteste_n_est_plus_retelecharge(tmp_path):
+    """
+    Le cas d'EvR-A : les fichiers étaient là, vérifiés, et le plan proposait
+    quand même 837,1 Mio. L'étape de téléchargement disparaît, son volume est
+    décompté, et la `verify_artifact` restée seule porte le motif.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    plan = _plan(options)
+
+    assert sc.ACTION_DOWNLOAD_MODEL not in _actions(plan)
+    assert plan.total_download_bytes() == 0
+    assert plan.applicable is True
+    assert sc.validate_plan_dict(plan.to_dict()) == ()
+
+    verification = _etape(plan, sc.ACTION_VERIFY_ARTIFACT)
+    assert verification is not None
+    assert "Aucun téléchargement proposé" in verification.detail
+    assert "manifeste de provenance atteste" in verification.detail
+    # Le motif reste aussi lisible dans la section « modèles », pour l'opérateur
+    # qui lit le plan et non ses étapes.
+    retenu = plan.section(sc.SECTION_MODELS).data["retained"][0]
+    assert retenu["local_artifact"]["attested"] is True
+
+
+def test_le_plan_qui_ne_telecharge_plus_reste_execute_par_l_applicateur(tmp_path):
+    """
+    Une `verify_artifact` seule doit s'inscrire proprement dans le journal.
+
+    L'applicateur enregistre bien un exécuteur pour elle, et cet exécuteur rend
+    `already_satisfied` — jamais `done` : une vérification qui réussit n'a rien
+    changé sur l'hôte, et `ExecutionReport.changed()` ne doit pas devenir vrai à
+    cause d'une lecture.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    plan = _plan(options)
+
+    catalogue = catalog_mod.load_catalog(options.catalog_path)
+    config = downloader.DownloadConfig(
+        catalog=catalogue,
+        models_dir=options.models_dir,
+        transport=None,
+        token_provider=lambda: None,
+        disk_free=lambda path: 10 ** 12,
+        chunk_bytes=64,
+    )
+    executeurs = downloader.make_executors(config)
+    registre = execution.ExecutorRegistry()
+    for action, executeur in executeurs.items():
+        registre.register(action, executeur)
+
+    assert registre.missing_actions(
+        [s for s in plan.steps if s.action in executeurs]
+    ) == ()
+
+    contexte = execution.ExecutionContext(
+        execution.ExecutionMode.APPLY,
+        allowed_roots=(tmp_path,),
+        now=lambda: "2026-08-01T12:00:00Z",
+        log=lambda message: None,
+    )
+    resultat = asyncio.run(
+        executeurs[sc.ACTION_VERIFY_ARTIFACT](
+            _etape(plan, sc.ACTION_VERIFY_ARTIFACT), contexte
+        )
+    )
+    assert resultat.status == execution.STEP_ALREADY_SATISFIED
+
+
+def test_un_artefact_present_mais_divergent_bloque_le_plan(tmp_path):
+    """
+    Une taille différente de celle épinglée interdit au SHA-256 de correspondre.
+
+    C'est une preuve, pas une présomption : le plan bloque, et ne propose ni de
+    réutiliser le fichier ni de l'écraser.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options, poids=_gguf(4096 + 64))
+    _attester(options)
+    plan = _plan(options)
+
+    assert "artefact_local_divergent" in [f.code for f in plan.blockers]
+    assert plan.applicable is False
+    assert plan.effective_steps() == ()
+    message = next(f.message for f in plan.blockers if f.code == "artefact_local_divergent")
+    assert POIDS in message
+    assert "supprimez-le vous-même" in message
+
+
+def test_un_ensemble_partiellement_present_reste_indivisible(tmp_path):
+    """
+    Un `mmproj` sans ses poids ne charge rien (§8), et l'inverse non plus.
+
+    Créditer la moitié présente annoncerait un volume que rien n'atteste : le
+    téléchargement reste proposé EN ENTIER, attestation ou pas.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options, mmproj=None)
+    _attester(options)
+    plan = _plan(options)
+
+    telechargement = _etape(plan, sc.ACTION_DOWNLOAD_MODEL)
+    assert telechargement is not None
+    assert telechargement.estimated_bytes == len(POIDS_OCTETS) + len(MMPROJ_OCTETS)
+    assert "ensemble incomplet" in telechargement.detail
+    assert "indivisible" in telechargement.detail
+
+
+def test_sans_attestation_le_telechargement_reste_propose(tmp_path):
+    """
+    Fichiers en place, tailles conformes, aucun manifeste : le plan ne présume
+    pas d'une empreinte qu'il n'a pas vérifiée. Le cas de l'opérateur qui a
+    recopié ses GGUF à la main.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    plan = _plan(options)
+
+    telechargement = _etape(plan, sc.ACTION_DOWNLOAD_MODEL)
+    assert telechargement is not None
+    assert "aucune attestation de vérification exploitable" in telechargement.detail
+    assert plan.applicable is True
+
+
+def test_une_attestation_perimee_ne_credite_pas_l_ensemble(tmp_path):
+    """Un manifeste qui parle d'une autre révision décrit des fichiers que le catalogue n'approuve plus."""
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    chemin = downloader.provenance_path(options.models_dir, ARTEFACT_ID)
+    document = json.loads(chemin.read_text(encoding="utf-8"))
+    document["source"]["revision"] = "f" * 40
+    chemin.write_text(json.dumps(document), encoding="utf-8")
+
+    plan = _plan(options)
+    assert _etape(plan, sc.ACTION_DOWNLOAD_MODEL) is not None
+    retenu = plan.section(sc.SECTION_MODELS).data["retained"][0]
+    assert retenu["local_artifact"]["attested"] is False
+    assert retenu["local_artifact"]["attestation_problems"]
+
+
+def test_le_plan_ne_hache_aucun_octet_pour_conclure(tmp_path, monkeypatch):
+    """
+    L'arbitrage du chantier, rendu exécutable : `bootstrap-plan` doit rester une
+    commande rapide et rejouable. Hacher 40 Gio à chaque planification
+    échangerait un défaut d'affichage contre un défaut de conception.
+    """
+    appels: list[str] = []
+    vrai_sha256 = hashlib.sha256
+
+    def espion(*args, **kwargs):
+        appels.append("sha256")
+        return vrai_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "sha256", espion)
+
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    appels.clear()
+    plan = _plan(options)
+
+    assert sc.ACTION_DOWNLOAD_MODEL not in _actions(plan)
+    assert appels == []
+    # Contrôle positif : l'espion voit bien passer un hachage quand il y en a un.
+    hashlib.sha256(b"controle")
+    assert appels == ["sha256"]
 
 
 # ── Intégration CLI (`python cli.py bootstrap-plan`) ──────────────────────────
