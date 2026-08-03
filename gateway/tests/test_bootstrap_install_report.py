@@ -51,6 +51,27 @@ ACTIONS_M2 = (
     sc.ACTION_SMOKE_TEST,
 )
 
+# Cibles d'étapes, à la grammaire RÉELLE du planificateur (COR-026). Une fixture
+# qui donnait à chaque action une cible distincte ne pouvait pas exercer la
+# discrimination par cible : `verify_artifact` sert deux domaines, et c'est la
+# cible — et elle seule — qui dit lequel.
+CIBLE_RUNTIME = "llama-server b6099 (cuda12)"
+CIBLE_MODELE = "qwen2.5-0.5b"
+
+CIBLES: dict[str, str] = {
+    sc.ACTION_INSTALL_RUNTIME: CIBLE_RUNTIME,
+    # Par défaut, la vérification du jeu de fixtures est celle du RUNTIME : elle
+    # accompagne l'unique `install_runtime` du plan.
+    sc.ACTION_VERIFY_ARTIFACT: CIBLE_RUNTIME,
+    sc.ACTION_DOWNLOAD_MODEL: "Qwen/Qwen2.5-0.5B-GGUF@" + "d" * 40,
+    sc.ACTION_ACCEPT_LICENSE: f"{CIBLE_MODELE} — apache-2.0",
+    sc.ACTION_WRITE_REGISTRY: f"models.yaml → {CIBLE_MODELE}",
+    sc.ACTION_CALIBRATE_MODEL: CIBLE_MODELE,
+    sc.ACTION_ENABLE_MODEL: CIBLE_MODELE,
+    sc.ACTION_WARMUP_MODEL: CIBLE_MODELE,
+    sc.ACTION_SMOKE_TEST: CIBLE_MODELE,
+}
+
 
 # ── Fabriques ─────────────────────────────────────────────────────────────────
 
@@ -105,16 +126,26 @@ def plan_document(
     sections=None,
     decisions=None,
     generated_at: str = PLAN_DATE,
+    targets=None,
 ) -> dict:
-    """Un document de plan valide, applicable, et sans secret."""
+    """
+    Un document de plan valide, applicable, et sans secret.
+
+    `actions` accepte une action nue — sa cible vient alors de `CIBLES` — ou un
+    couple `(action, cible)` quand le test doit choisir le domaine visé.
+    `targets` surcharge la table pour tout le plan.
+    """
+    table = dict(CIBLES)
+    table.update(targets or {})
+    paires = [a if isinstance(a, tuple) else (a, table[a]) for a in actions]
     steps = tuple(
         sc.PlanStep(
             order=index + 1,
             action=action,
-            target=f"cible-{action}",
-            detail=f"Détail de {action}.",
+            target=target,
+            detail=f"Détail de {action} sur {target}.",
         )
-        for index, action in enumerate(actions)
+        for index, (action, target) in enumerate(paires)
     )
     if sections is None:
         sections = (section_runtime(), section_catalogue())
@@ -296,13 +327,37 @@ def test_deja_satisfait_vaut_satisfait_mais_ne_compte_pas_comme_applique():
 
 def test_la_partition_des_actions_est_exhaustive_et_disjointe():
     """Une action nouvelle ne peut pas disparaître de l'évaluation en silence."""
-    mappees: list[str] = []
+    propres: list[str] = []
+    partagees: set[str] = set()
     for condition in ir.M2_CONDITIONS:
-        mappees.extend(condition.actions)
+        propres.extend(condition.actions)
+        partagees.update(condition.shared_actions)
 
-    assert len(mappees) == len(set(mappees)), "une action prouve deux conditions"
-    assert set(mappees) & ir.CONDITION_UNMAPPED_ACTIONS == set()
-    assert set(mappees) | ir.CONDITION_UNMAPPED_ACTIONS == set(sc.PLAN_ACTIONS)
+    assert len(propres) == len(set(propres)), "une action propre prouve deux conditions"
+    # Une action partagée sert PLUSIEURS domaines par définition : elle peut
+    # revenir dans plusieurs conditions, mais jamais en tant qu'action propre —
+    # sinon elle prouverait sans que sa cible soit contrôlée.
+    assert partagees & set(propres) == set()
+    mappees = set(propres) | partagees
+    assert mappees & ir.CONDITION_UNMAPPED_ACTIONS == set()
+    assert mappees | ir.CONDITION_UNMAPPED_ACTIONS == set(sc.PLAN_ACTIONS)
+
+
+def test_toute_action_partagee_est_bornee_par_des_ancres_connues():
+    """Une action à deux domaines sans ancre prouverait tout, partout."""
+    vues = 0
+    for condition in ir.M2_CONDITIONS:
+        if not condition.shared_actions:
+            assert condition.anchor_actions == (), condition.code
+            continue
+        vues += 1
+        assert condition.anchor_actions, condition.code
+        assert set(condition.anchor_actions) <= set(sc.PLAN_ACTIONS)
+        assert set(condition.shared_actions) <= set(sc.PLAN_ACTIONS)
+        # Une ancre ne doit pas être elle-même ambiguë, sinon la borne est vide
+        # de sens : elle rattacherait au domaine ce qu'on cherche à en exclure.
+        assert set(condition.anchor_actions) & set(condition.shared_actions) == set()
+    assert vues == 2, "le contrôle serait inerte si aucune condition n'était partagée"
 
 
 def test_les_actions_non_mappees_ne_fabriquent_aucune_condition():
@@ -317,6 +372,138 @@ def test_les_actions_non_mappees_ne_fabriquent_aucune_condition():
     assert statuts["report_produced"] == ir.CONDITION_SATISFIED  # contrôle positif
     assert rapport.counts()["conditions_unproven"] == 6
     assert rapport.verdict() == ir.VERDICT_PARTIAL
+
+
+# ── 1 bis. COR-026 — une preuve ne vaut que pour la condition qu'elle regarde ─
+#
+# `verify_artifact` sert deux domaines. Avant COR-026, la table des conditions
+# l'attribuait au runtime sans regarder la cible, et n'admettait pour le modèle
+# qu'un `download_model` — que le plan n'émet plus quand les GGUF sont déjà là et
+# attestés (AUT-014). Le rapport prononçait donc M2 sur une preuve d'un autre
+# domaine, et refusait de le prononcer sur une installation parfaite.
+
+# Un bootstrap réel : le runtime, puis le modèle, chacun avec SA vérification.
+ACTIONS_REELLES = (
+    (sc.ACTION_INSTALL_RUNTIME, CIBLE_RUNTIME),
+    (sc.ACTION_VERIFY_ARTIFACT, CIBLE_RUNTIME),
+    (sc.ACTION_ACCEPT_LICENSE, CIBLES[sc.ACTION_ACCEPT_LICENSE]),
+    (sc.ACTION_DOWNLOAD_MODEL, CIBLES[sc.ACTION_DOWNLOAD_MODEL]),
+    (sc.ACTION_VERIFY_ARTIFACT, CIBLE_MODELE),
+    (sc.ACTION_CALIBRATE_MODEL, CIBLE_MODELE),
+    (sc.ACTION_WARMUP_MODEL, CIBLE_MODELE),
+    (sc.ACTION_SMOKE_TEST, CIBLE_MODELE),
+)
+
+# Le même hôte, mais les GGUF étaient déjà présents et attestés : AUT-014
+# n'émet plus d'étape de téléchargement, la vérification reste seule.
+ACTIONS_DEJA_PRESENT = tuple(
+    e for e in ACTIONS_REELLES if e[0] != sc.ACTION_DOWNLOAD_MODEL
+)
+
+
+def conditions_de(actions, statuses=None) -> dict[str, ir.ConditionOutcome]:
+    plan = plan_document(actions=actions)
+    rapport = ir.build_install_report(
+        plan_document=plan,
+        execution_report=journal(plan, statuses or [ex.STEP_DONE] * len(actions)),
+        now=horloge(),
+    )
+    return {c.code: c for c in rapport.conditions()}
+
+
+def test_verifier_le_gguf_d_un_modele_ne_prouve_pas_le_runtime():
+    """Facette a : la condition n°1 de M2 ne s'affirme pas sur la preuve d'un autre."""
+    actions = tuple(e for e in ACTIONS_REELLES if e[0] != sc.ACTION_INSTALL_RUNTIME)
+    conditions = conditions_de(actions)
+
+    assert conditions["runtime_installed"].status == ir.CONDITION_UNPROVEN
+    # La phrase doit dire POURQUOI : une vérification existe, elle regarde ailleurs.
+    assert "attestent un autre domaine" in conditions["runtime_installed"].proof
+    # Contrôle positif : la même vérification prouve bien SA condition, donc le
+    # test saurait voir une condition satisfaite s'il y en avait une ici.
+    assert conditions["model_downloaded"].status == ir.CONDITION_SATISFIED
+
+
+def test_verifier_l_archive_du_runtime_ne_prouve_pas_le_modele():
+    """Symétrique : la borne joue dans les deux sens, sinon elle n'en est pas une."""
+    actions = tuple(
+        e for e in ACTIONS_REELLES
+        if e not in ((sc.ACTION_DOWNLOAD_MODEL, CIBLES[sc.ACTION_DOWNLOAD_MODEL]),
+                     (sc.ACTION_VERIFY_ARTIFACT, CIBLE_MODELE))
+    )
+    conditions = conditions_de(actions)
+
+    assert conditions["model_downloaded"].status == ir.CONDITION_UNPROVEN
+    assert "attestent un autre domaine" in conditions["model_downloaded"].proof
+    assert conditions["runtime_installed"].status == ir.CONDITION_SATISFIED
+
+
+def test_un_gguf_deja_present_et_atteste_tient_la_condition_sans_telechargement():
+    """Facette b : une installation réussie sans téléchargement clôture M2."""
+    conditions = conditions_de(ACTIONS_DEJA_PRESENT)
+
+    modele = conditions["model_downloaded"]
+    assert modele.status == ir.CONDITION_SATISFIED
+    assert "n'était au programme" in modele.proof
+    assert "verify_artifact" in modele.proof
+    assert set(c.status for c in conditions.values()) == {ir.CONDITION_SATISFIED}
+
+
+def test_rien_a_telecharger_atteste_et_rien_ne_l_atteste_ne_se_confondent_pas():
+    """Le rapport distingue le constat de l'absence de constat, phrase comprise."""
+    atteste = conditions_de(ACTIONS_DEJA_PRESENT)["model_downloaded"]
+    sans_preuve = conditions_de(tuple(
+        e for e in ACTIONS_DEJA_PRESENT
+        if e != (sc.ACTION_VERIFY_ARTIFACT, CIBLE_MODELE)
+    ))["model_downloaded"]
+
+    assert atteste.status == ir.CONDITION_SATISFIED
+    assert sans_preuve.status == ir.CONDITION_UNPROVEN
+    assert "rien n'atteste cette condition" in sans_preuve.proof
+    assert "rien n'atteste" not in atteste.proof
+    assert atteste.step_orders and not sans_preuve.step_orders
+
+
+def test_une_verification_de_gguf_en_echec_ne_satisfait_pas_la_condition():
+    """Élargir ce que le rapport sait voir ne le rend pas plus complaisant."""
+    statuses = [ex.STEP_DONE] * len(ACTIONS_DEJA_PRESENT)
+    index = ACTIONS_DEJA_PRESENT.index((sc.ACTION_VERIFY_ARTIFACT, CIBLE_MODELE))
+    statuses[index] = ex.STEP_FAILED
+    conditions = conditions_de(ACTIONS_DEJA_PRESENT, statuses)
+
+    assert conditions["model_downloaded"].status == ir.CONDITION_UNSATISFIED
+    # Et l'échec ne déborde pas sur le runtime, qui a sa propre vérification.
+    assert conditions["runtime_installed"].status == ir.CONDITION_SATISFIED
+
+
+def test_une_ancre_ne_prouve_rien_par_elle_meme():
+    """Nommer la cible d'un domaine n'est pas prouver la condition de ce domaine."""
+    actions = (
+        (sc.ACTION_CALIBRATE_MODEL, CIBLE_MODELE),
+        (sc.ACTION_ENABLE_MODEL, CIBLE_MODELE),
+    )
+    conditions = conditions_de(actions)
+
+    assert conditions["model_downloaded"].status == ir.CONDITION_UNPROVEN
+    # Contrôle positif : `calibrate_model` prouve bien SA condition à lui.
+    assert conditions["calibrated"].status == ir.CONDITION_SATISFIED
+
+
+def test_une_cible_non_textuelle_ne_rattache_rien():
+    """Fail-closed : une cible qu'on ne sait pas lire ne fabrique aucun domaine."""
+    resultats = [
+        {"order": 1, "action": sc.ACTION_INSTALL_RUNTIME, "target": None,
+         "status": ex.STEP_DONE},
+        {"order": 2, "action": sc.ACTION_VERIFY_ARTIFACT, "target": None,
+         "status": ex.STEP_DONE},
+    ]
+    outcomes = {c.code: c for c in ir._evaluate_conditions(resultats, applied=True)}
+
+    # L'installation compte (action propre) ; la vérification, non rattachable,
+    # n'ajoute rien — et surtout ne rattache pas le modèle.
+    assert outcomes["runtime_installed"].status == ir.CONDITION_SATISFIED
+    assert outcomes["runtime_installed"].step_orders == (1,)
+    assert outcomes["model_downloaded"].status == ir.CONDITION_UNPROVEN
 
 
 def test_un_statut_hors_contrat_ne_devient_jamais_un_succes():
@@ -344,6 +531,27 @@ def test_un_marqueur_de_preuve_reconnu_n_est_pas_une_hypothese():
     # Contrôle positif : l'affirmation est bien vue, elle n'est simplement pas
     # classée comme hypothèse.
     assert len(rapport.evidence_claims()) == 1
+    assert rapport.hypotheses() == ()
+
+
+def test_un_constat_operateur_n_est_pas_reclasse_en_hypothese():
+    """Le niveau produit par AUT-018 appartient au contrat partagé du plan."""
+    plan = plan_document(sections=(
+        section_runtime(
+            evidence=sc.EVIDENCE_OPERATOR,
+            note="Empreinte relevée par sha256sum le 2026-08-03.",
+        ),
+    ))
+    rapport = ir.build_install_report(
+        plan_document=plan,
+        execution_report=journal(plan, [ex.STEP_DONE] * len(ACTIONS_M2)),
+        now=horloge(),
+    )
+
+    claims = rapport.evidence_claims()
+    assert len(claims) == 1, "contrôle positif : le rapport voit le constat opérateur"
+    assert claims[0].marker == sc.EVIDENCE_OPERATOR
+    assert claims[0].verified is True
     assert rapport.hypotheses() == ()
 
 

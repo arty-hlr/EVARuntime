@@ -550,6 +550,28 @@ def bootstrap_plan(
         0, "--min-build",
         help="Premier build patché connu — plancher de sécurité d'où LLAMA_SERVER_MIN_BUILD est généré",
     ),
+    runtime_variants: Optional[str] = typer.Option(
+        None, "--runtime-variants",
+        help="Matrice d'artefacts llama-server épinglée par l'opérateur (YAML) — REMPLACE la "
+             "matrice livrée ; modèle dans deploy/runtime-variants.yaml.example",
+    ),
+    allow_container: bool = typer.Option(
+        False, "--allow-container",
+        help="Accepter une image conteneur épinglée par digest (étape 2 de §6). "
+             "`server_manager` ne sait pas encore lancer de conteneur : le plan est descriptible, "
+             "son application ne l'est pas",
+    ),
+    allow_local_build: bool = typer.Option(
+        True, "--allow-local-build/--no-local-build",
+        help="Accepter le build local reproductible (étape 4 de §6). Le refuser sur la matrice "
+             "livrée ne laisse AUCUNE variante éligible, puisqu'elle ne porte aucune empreinte",
+    ),
+    allow_cpu_fallback: bool = typer.Option(
+        False, "--allow-cpu-fallback",
+        help="ASSUMER la dégradation GPU → CPU si aucune variante GPU sûre n'existe. Refusé par "
+             "défaut : une installation CPU démarre, répond et passe le smoke test, avec un TTFT "
+             "inacceptable qui ne se verra qu'en production",
+    ),
     llmfit_bin: Optional[str] = typer.Option(
         None, "--llmfit-bin", help="Binaire LLMfit à consulter (défaut : recherché dans le PATH)"
     ),
@@ -587,6 +609,14 @@ def bootstrap_plan(
     plan sort bloqué : le planificateur refuse d'inventer un numéro de build, qui
     se propagerait dans les manifestes de provenance avec l'apparence d'un fait.
 
+    `--runtime-variants` fournit la matrice d'artefacts épinglée par l'opérateur.
+    La matrice livrée avec EVARuntime ne porte AUCUNE empreinte — aucune n'a été
+    vérifiée dans ce dépôt, et en inventer une serait pire que de ne pas en avoir
+    — de sorte que seules ses variantes `local-build` sont éligibles. Le fichier
+    fourni REMPLACE cette matrice ; modèle et mode d'emploi dans
+    `deploy/runtime-variants.yaml.example`. Un fichier malformé fait refuser la
+    commande, jamais retomber sur la matrice livrée.
+
     LLMfit est un conseiller OPTIONNEL : sans `--llmfit-version`/`--llmfit-sha256`,
     son binaire n'est pas exécuté et la section sort en `skip` — un binaire non
     épinglé n'est pas un binaire de confiance. `--llmfit-profile` fournit une
@@ -605,6 +635,7 @@ def bootstrap_plan(
     from bootstrap import llmfit as _llmfit
     from bootstrap import planner as planner_module
     from bootstrap import runtime_resolver as _runtime
+    from bootstrap import runtime_variants as _variants
     from bootstrap import schema as _schema
 
     if (llmfit_version is None) != (llmfit_sha256 is None):
@@ -627,6 +658,57 @@ def bootstrap_plan(
             )
         except _runtime.ProvenanceError as exc:
             console.print(f"[red]Politique de release refusée :[/red] {exc}")
+            raise typer.Exit(_schema.EXIT_USAGE)
+
+    # AUT-018 — la matrice d'artefacts fournie par l'opérateur. Sans cette option,
+    # `ResolverPolicy.variants` — l'échappatoire que le résolveur documente comme
+    # « l'opérateur ou la CI fournit les variantes épinglées » — n'était
+    # atteignable que depuis du code Python, et la matrice livrée ne porte aucune
+    # empreinte : en configuration par défaut, l'installateur n'installait rien.
+    # AUT-019 — les trois drapeaux de `ResolverPolicy` sont pilotables ici.
+    #
+    # Sans eux, un opérateur pouvait fournir une variante `official-container`
+    # correctement épinglée par digest (AUT-018) et la voir SYSTÉMATIQUEMENT
+    # écartée — « mode conteneur non accepté par la politique ». Il avait le moyen
+    # de l'épingler et aucun moyen de l'autoriser. Quatrième occurrence du motif
+    # « code juste, inatteignable depuis le parcours réel ».
+    politique_non_defaut = (
+        allow_container or not allow_local_build or allow_cpu_fallback
+    )
+
+    resolver = None
+    if runtime_variants is not None or politique_non_defaut:
+        if release is None:
+            # La matrice dit QUOI installer, l'épinglage dit QUELLE version. Sans
+            # `ReleasePolicy`, `ResolverPolicy` n'est pas constructible et le
+            # fichier serait lu pour rien : mieux vaut le dire que produire un
+            # plan bloqué dont la cause affichée serait ailleurs. Même raison pour
+            # les drapeaux : autoriser une branche de §6 sans épingler de version
+            # ne résout rien et laisserait croire que l'option a été prise en compte.
+            console.print(
+                "[red]--runtime-variants et les options de politique (--allow-container, "
+                "--no-local-build, --allow-cpu-fallback) exigent --pin-version et "
+                "--pin-commit :[/red] la matrice dit quel artefact installer, l'épinglage dit "
+                "quelle version il porte. Le manifeste de provenance a besoin des deux."
+            )
+            raise typer.Exit(_schema.EXIT_USAGE)
+        try:
+            variants = (
+                _variants.load_variants(_Path(runtime_variants))
+                if runtime_variants is not None
+                else _runtime.DEFAULT_VARIANTS
+            )
+            resolver = _runtime.ResolverPolicy(
+                release=release,
+                variants=variants,
+                allow_container=allow_container,
+                allow_local_build=allow_local_build,
+                allow_cpu_fallback=allow_cpu_fallback,
+            )
+        except _variants.RuntimeVariantsError as exc:
+            # Refus, jamais repli sur la matrice livrée : un opérateur qui fournit
+            # un fichier attend que ce fichier soit employé, pas qu'il soit ignoré.
+            console.print(f"[red]Matrice d'artefacts refusée :[/red] {exc}")
             raise typer.Exit(_schema.EXIT_USAGE)
 
     try:
@@ -654,6 +736,7 @@ def bootstrap_plan(
         max_models=max_models,
         existing_binary=_Path(llama_bin) if llama_bin else None,
         release_policy=release,
+        resolver_policy=resolver,
         llmfit_config=llmfit_config,
     )
 

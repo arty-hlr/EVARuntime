@@ -73,10 +73,42 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 
 Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité
 **persistante** pour tous les modèles disponibles sur la gateway. Il est lu au
-démarrage et peut être modifié en
-direct via l'API admin (écriture atomique : temp + rename). Il vit sous
+démarrage et peut être modifié en direct via l'API admin. Il vit sous
 `/var/lib`, writable par `llmservice`, tandis que secrets et topologie restent
 sous `/etc/llm-gateway`, non writable par le service.
+
+**Une mutation admin ne resérialise pas le fichier** (COR-020). Elle le
+**retouche textuellement** : ajout en fin de document, retouche des seules lignes
+de champ qui changent, retrait du seul bloc d'une entrée supprimée. Le texte
+candidat est reparsé et comparé au document attendu ; s'il ne signifie pas
+exactement ce qui était prévu, l'écriture est **refusée** plutôt que remplacée
+par une réécriture globale — celle-ci détruirait les commentaires
+d'exploitation du fichier, qui sont de la documentation. C'est la politique
+d'AUT-007 (`bootstrap/registry_writer.py`), réutilisée par `model_registry.py`
+pour qu'il n'existe qu'**une** politique d'écriture de `models.yaml`.
+
+La **localisation** d'une entrée dans ce texte suit la même règle depuis COR-028 :
+elle vit dans `model_registry._entry_bounds`, et `registry_writer` s'y adosse au
+lieu d'entretenir un second localisateur. Le premier ancrait sur une ligne
+`- id: <model_id>`, donc sur les seules entrées dont `id` est la première clé ;
+`yaml.safe_dump` trie les clés et met `capabilities` en tête, si bien que sur
+tout hôte dont le `models.yaml` était déjà passé par une mutation admin, l'étape
+`enable_model` de l'amorçage refusait un fichier pourtant valide. Le refus reste
+la bonne issue quand l'entrée est réellement introuvable ou ambiguë : le
+localisateur voit plus large, il ne refuse pas moins.
+
+S'y ajoutent une sauvegarde horodatée et bornée
+(`models.yaml.pre-admin.<stamp>.bak`, 5 conservées, motif distinct des
+`*.pre-bootstrap.*` du bootstrap), une écriture atomique validée par le chargeur
+du registre lui-même, le `fsync` du fichier **et** du répertoire parent — sans
+lequel le renommage n'est pas durable —, et la restauration du mode, du
+propriétaire et du groupe après `os.replace`. Un refus restaure l'état mémoire :
+la gateway ne reste jamais en avance sur son disque. Un verrou optimiste compare
+en outre le document relu au snapshot qui précédait la mutation : toute édition
+sémantique concurrente, scalaire comprise, provoque un refus explicite plutôt
+qu'un écrasement ; une retouche de commentaire seule reste permise et préservée.
+Ce garde ne remplace pas un verrou inter-processus entre deux gateways écrivant
+le même fichier. Détails opérationnels et liste des refus : `docs/admin.md`.
 
 La seule superposition à cette vérité est l'activation provisoire de
 `bootstrap-apply` : un snapshot validé peut être publié **en mémoire** dans le
@@ -292,6 +324,17 @@ Trois inversions seraient des défauts, pas des goûts :
 - **préchauffer avant la recette** conserverait en mémoire un modèle dont aucun
   token n'a encore été prouvé.
 
+`verify_artifact` est une action à **deux domaines**, et un seul l'emploie. Pour
+les GGUF du catalogue, elle suit `download_model` et relit réellement les octets.
+Pour l'archive de `llama-server`, elle **n'existe pas** : le plan ne l'émet pas
+(COR-030). La raison est qu'à ce numéro d'étape l'archive n'est pas encore
+téléchargée — c'est `install_runtime` qui la récupère puis confronte son empreinte
+avant d'extraire quoi que ce soit. Une étape qui ne peut rien vérifier était
+sautée par l'applicateur, et une étape sautée ne prouve rien : la condition n°1 du
+jalon M2 retombait `unsatisfied` sur une installation pourtant réussie, et
+`bootstrap-apply` sortait en code 3. L'empreinte attendue est donc inscrite dans le
+détail de l'étape `install_runtime`, qui est celle qui la contrôle.
+
 `smoke_test` est exécutée **pour chaque modèle**, immédiatement après son
 activation provisoire. Elle traverse le chemin public réel (nginx → gateway →
 `llama-server`) et ferme la transition DEC-010 : succès, la preuve complète
@@ -340,6 +383,14 @@ Aucune valeur estimée ne doit être recopiée telle quelle dans le `vram_gb` du
 registre. `calibrate_model` est l'étape qui remplace l'estimation par des pics
 observés et **propose** un `vram_gb` sans l'appliquer silencieusement ; tant
 qu'elle n'a pas eu lieu, l'entrée reste `enabled: false`.
+
+Les « paramètres » de cette chaîne sont ceux du modèle inspecté, et de lui seul :
+`ctx_size`, `parallel` et les types de cache KV viennent des `runtime.defaults` de
+**son** entrée de catalogue (COR-027). Le poste dominant de l'estimation est le
+cache KV, proportionnel au produit `ctx_size × parallel` : appliquer à un modèle
+les réglages d'un autre — ce que faisait le planificateur au-delà du premier
+modèle retenu — produit un chiffre faux de plusieurs ordres de grandeur, et faux
+dans le sens de la sous-estimation quand le premier modèle est le plus modeste.
 
 ### LLMfit : conseiller, jamais autorité
 
@@ -409,6 +460,35 @@ dans ce dépôt à ce jour, et inventer une empreinte serait pire que de ne pas 
 avoir. Avec la politique par défaut, seules les variantes `local-build` sont donc
 éligibles ; les autres apparaissent dans les motifs de rejet avec la mention
 « non épinglé », qui est l'information utile.
+
+Ses `reference` d'archive ne valent pas davantage : elles désignent la **page de
+releases** du projet, pas un artefact. Même munie d'une empreinte, la matrice
+livrée ne donnerait à `runtime_installer` aucune URL téléchargeable. L'opérateur
+fournit donc la sienne — `bootstrap-plan --runtime-variants`, chargée par
+`gateway/bootstrap/runtime_variants.py`, modèle dans
+`gateway/deploy/runtime-variants.yaml.example`. Trois propriétés structurent ce
+chargeur :
+
+- il **remplace** la matrice livrée au lieu de s'y ajouter. En union, une faute
+  de frappe dans `platform` rendrait l'entrée épinglée invisible et un
+  `local-build` livré l'emporterait en silence : l'opérateur lirait un plan
+  réussi qui ignore son épinglage ;
+- il est **fail-closed** : un fichier malformé refuse en bloc et ne se replie
+  jamais sur `DEFAULT_VARIANTS` ni sur ses seules entrées valides ;
+- il impose le niveau de preuve `constat-opérateur` — troisième valeur d'`evidence`.
+  Un fichier ne peut pas se réclamer de `constat-§6` : §6 ne connaît aucune
+  empreinte, et lui laisser l'autorité de la spécification annulerait la
+  distinction constat/hypothèse dont vit le rapport d'installation. Le plan porte
+  un constat `info` nommant l'origine des variantes employées.
+
+La politique d'URL vit dans ce chargeur et non dans le résolveur : elle réutilise
+`bootstrap/public_https.py`, donc `socket` et `http.client`, que le garde-fou
+d'isolation de `runtime_resolver` interdit précisément d'y faire entrer. Elle
+ajoute à la politique publique HTTPS trois contraintes — le chemin doit désigner
+une archive extractible, sans chaîne de requête ni fragment — et
+`production.runtime_installer_from_plan` l'applique désormais aussi, pour refuser
+une URL inexploitable **avant** le téléchargement plutôt qu'après, au contrôle
+d'empreinte.
 
 Usage opérationnel de la commande : [guide administrateur](admin.md#9-planificateur-damorçage--bootstrap-plan).
 Catalogue de modèles approuvés : [guide de déploiement](deployment.md#catalogue-de-modèles-approuvés-amorçage).
@@ -738,8 +818,72 @@ et overflows de parsing GGUF menant au RCE. Trois garde-fous :
 | Mesure | Mise en œuvre |
 |--------|---------------|
 | `--context-shift` désactivé | `build_llama_cmd` n'émet **jamais** ce flag — c'est le vecteur de la CVE `n_discard`. |
-| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; un build inférieur au minimum refuse le démarrage (0 = désactivé, non fatal si version illisible). |
+| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; **fail-closed** dès que le plancher est `> 0` — un build inférieur **ou une version illisible** refuse le démarrage (0 = désactivé, la sonde se contente alors d'un avertissement). Même verdict que `doctor`, quel que soit le chemin de démarrage (SEC-009). |
 | Intégrité GGUF | Champ `sha256` par modèle : le hash du fichier est recalculé et comparé avant chargement. |
+| Manifeste recoupé | Un manifeste de provenance §6 posé à côté du binaire ne vaut attestation qu'après confrontation **au binaire lui-même** : version et commit rendus par `--version`, puis empreinte SHA-256 du binaire face à celle consignée dans `install.binary_sha256`. Voir ci-dessous. |
+
+#### Un manifeste non recoupé n'est pas une attestation (SEC-009)
+
+Le manifeste de provenance est un fichier texte posé à côté d'un exécutable.
+Rien n'empêche de le recopier d'un autre hôte, ni de le laisser survivre au
+remplacement manuel du binaire qu'il décrit. `bootstrap/runtime_installer` le
+savait déjà : son contrôle d'idempotence recalcule l'empreinte du binaire posé à
+chaque passe. `bootstrap/runtime_resolver._judge_existing_binary` ne le faisait
+pas et accordait `reuse_existing` sur parole.
+
+Un binaire en place n'est désormais conservé qu'après quatre confrontations,
+toutes nécessaires, du moins cher au plus cher :
+
+| Constat | Ce qui est confronté | Verdict |
+|---|---|---|
+| `runtime_manifest_build_mismatch` | `version:` du manifeste ↔ build rendu par `--version` | remplacé |
+| `runtime_manifest_commit_mismatch` | `commit:` du manifeste ↔ SHA court rendu par `--version` (comparaison par préfixe, le binaire n'en rend que 7 caractères) | remplacé |
+| `runtime_backend_mismatch` | backend déclaré ↔ candidats de l'hôte | remplacé |
+| `runtime_binary_unattested` | aucun `install.binary_sha256` dans le manifeste | remplacé |
+| `runtime_binary_unreadable` | empreinte du binaire incalculable | remplacé |
+| `runtime_binary_tampered` | empreinte observée ↔ empreinte consignée | remplacé |
+
+Le refus est toujours **nommé** : la réinstallation depuis la variante épinglée
+est le remède, jamais un repli silencieux. Le binaire n'est lu — donc haché — que
+si un manifeste est fourni : sans attestation à confronter, lire des centaines de
+Mo ne prouverait rien.
+
+Quand `--version` ne rend pas de commit, ce recoupement-là est simplement omis :
+on ne peut pas le faire, on ne l'invente pas. Les autres restent.
+
+##### D'où vient le manifeste confronté (SEC-017)
+
+Ces six confrontations n'ont de valeur que si un manifeste leur est réellement
+fourni. Elles ne l'étaient pas : `planner._resolve_runtime` ne passait au
+résolveur que le chemin du binaire, jamais son manifeste, et le recoupement
+n'avait donc lieu que dans les tests. Le planificateur relit désormais le
+`provenance.yaml` que `runtime_installer` pose **à côté du binaire**, et en tire
+trois issues dégradées, chacune portant son constat dans le plan :
+
+| Constat | Cause | Conséquence |
+|---|---|---|
+| `runtime_manifest_absent` (`info`) | aucun fichier au chemin attendu — cas nominal d'un binaire compilé à la main | pas d'attestation ; le constat dit **où** le manifeste était attendu |
+| `runtime_manifest_unreadable` (`warn`) | droits insuffisants, fichier tronqué, YAML invalide | pas d'attestation |
+| `runtime_manifest_invalid` (`warn`) | relu, mais refusé par les règles de §6 | pas d'attestation |
+
+Fail-closed dans les trois cas : **l'absence de manifeste ne vaut jamais
+attestation**. Un manifeste approximatif vaut d'ailleurs moins que pas de
+manifeste, précisément parce qu'on lui fait confiance.
+
+#### Aucun invariant de production porté par un `assert` (COR-021)
+
+`python -O` retire toutes les instructions `assert` du bytecode, et rien
+n'interdit `-O` dans une unité systemd (`ExecStart=… python -O …`, ou
+`PYTHONOPTIMIZE=1` dans l'`EnvironmentFile`). Un garde-fou écrit
+`assert x is not None` disparaît alors en silence, et le refus explicite se
+transforme en `AttributeError` opaque quelques lignes plus loin.
+
+Le code de production des deux composants n'en contient donc aucun : un invariant
+dont la violation doit produire une erreur lève une exception nommée
+(`ProvenanceError`, `LLMfitError`) ou retourne un refus explicite. Un test balaie
+l'AST de tous les modules de `gateway/` et `node_agent/` — tests exclus — et
+échoue à la première occurrence. Il porte deux contrôles positifs : le scanner
+sait voir un `assert` imbriqué, et son périmètre couvre bien les deux composants.
 
 ### Isolation réseau
 

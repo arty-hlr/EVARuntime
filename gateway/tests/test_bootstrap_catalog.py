@@ -187,14 +187,22 @@ def test_le_telechargeur_declare_est_celui_reellement_employe() -> None:
     de licence fausse est pire qu'absente — elle a l'apparence d'une vérification.
     """
     source = (Path(__file__).resolve().parents[1] / "bootstrap" / "downloader.py").read_text()
+    arbre = ast.parse(source)
     imports = {
         node.module.split(".")[0]
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(arbre)
         if isinstance(node, ast.ImportFrom) and node.module
     } | {
         alias.name.split(".")[0]
-        for node in ast.walk(ast.parse(source))
+        for node in ast.walk(arbre)
         if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        # TST-007 : `from . import x` porte `module=None` ; sans cette branche,
+        # l'introspection ne voyait pas les imports de modules frères.
+        alias.name.split(".")[0]
+        for node in ast.walk(arbre)
+        if isinstance(node, ast.ImportFrom) and not node.module
         for alias in node.names
     }
 

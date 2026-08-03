@@ -44,6 +44,7 @@ from . import execution
 from . import first_token
 from . import runtime_installer
 from . import runtime_resolver
+from . import runtime_variants
 from . import schema
 from . import warmup
 
@@ -53,6 +54,13 @@ _RUNTIME_DATA_KEYS = frozenset({
     "backend_candidates", "targeted_backend", "selected_backend",
     "gpu_vendor", "gpu_count", "driver_version", "cuda_major",
     "min_build", "observed_build", "variant", "manifest", "rejected",
+    # AUT-019 — la politique du résolveur voyage dans le plan. La reconstruction
+    # doit la relire aussi strictement que le reste : c'est elle qui dit si un
+    # repli CPU était autorisé, et l'application ne doit pas pouvoir en changer.
+    "policy",
+})
+_POLICY_KEYS = frozenset({
+    "allow_container", "allow_local_build", "allow_cpu_fallback",
 })
 _VARIANT_KEYS = frozenset({
     "source", "backend", "platform", "evidence", "evidence_note",
@@ -222,6 +230,8 @@ def runtime_resolution_from_plan(document: Mapping[str, Any]) -> runtime_resolve
     rejected = data["rejected"]
     if not isinstance(rejected, list) or any(not isinstance(v, str) for v in rejected):
         raise ProductionWiringError("runtime.rejected doit être une liste de chaînes")
+    politique = _object(data["policy"], "sections.runtime.data.policy")
+    _closed(politique, _POLICY_KEYS, "sections.runtime.data.policy")
     findings_raw = section.get("findings")
     if not isinstance(findings_raw, list):
         raise ProductionWiringError("sections.runtime.findings doit être une liste")
@@ -254,6 +264,15 @@ def runtime_resolution_from_plan(document: Mapping[str, Any]) -> runtime_resolve
         summary=_string(section.get("summary"), "sections.runtime.summary"),
         findings=findings,
         rejected=tuple(rejected),
+        allow_container=_strict_bool(
+            politique["allow_container"], "runtime.policy.allow_container"
+        ),
+        allow_local_build=_strict_bool(
+            politique["allow_local_build"], "runtime.policy.allow_local_build"
+        ),
+        allow_cpu_fallback=_strict_bool(
+            politique["allow_cpu_fallback"], "runtime.policy.allow_cpu_fallback"
+        ),
     )
     if resolution.to_data() != data:
         raise ProductionWiringError(
@@ -271,13 +290,22 @@ def runtime_installer_from_plan(
     variant = resolution.variant
     if variant is None:
         raise ProductionWiringError("la décision runtime ne porte aucune variante")
-    archive_url = variant.reference
-    parts = urllib.parse.urlsplit(archive_url)
-    if parts.scheme != "https" or not parts.hostname:
-        raise ProductionWiringError(
-            "variant.reference n'est pas une URL HTTPS d'artefact exploitable ; "
-            "régénérez le plan avec la référence exacte de l'archive"
+    # `variant.reference` sert d'URL de téléchargement. Le contrôle initial se
+    # limitait au schéma et à l'autorité : la page de releases GitHub que porte
+    # toute variante `official-release` de la matrice livrée le passait sans être
+    # un artefact. L'installateur téléchargeait alors une page HTML pour la
+    # rejeter au contrôle d'empreinte — un diagnostic trompeur, après coup et
+    # après la bande passante. Le contrôle est désormais celui d'AUT-018 : URL
+    # publique HTTPS *désignant une archive*.
+    try:
+        archive_url = runtime_variants.validate_archive_url(
+            variant.reference, "variant.reference"
         )
+    except runtime_variants.RuntimeVariantsError as exc:
+        raise ProductionWiringError(
+            f"{exc} Régénérez le plan avec la référence exacte de l'archive "
+            "(--runtime-variants)."
+        ) from exc
     request = runtime_installer.RuntimeInstallRequest(
         resolution=resolution,
         archive_url=archive_url,

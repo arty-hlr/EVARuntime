@@ -590,6 +590,101 @@ def test_une_mise_en_page_qui_empeche_l_ajout_sur_est_refusee(atelier):
     assert atelier["registry"].read_bytes() == avant
 
 
+# ── COR-028 — l'ordre des clés d'une entrée ne décide pas de sa lisibilité ────
+#
+# `yaml.safe_dump` trie les clés et place `capabilities` avant `id`. C'est ce que
+# produisait `ModelRegistry._save()` avant COR-020, donc ce qu'on trouve sur tout
+# hôte dont le `models.yaml` est déjà passé par une mutation admin. Le
+# localisateur d'entrée ancrait sur « - id: <model_id> » : sur ces fichiers-là,
+# l'étape `enable_model` — maillon de la chaîne de preuve M2 — refusait en
+# fail-closed un fichier parfaitement valide.
+
+def _reserialiser_trie(registry: Path) -> None:
+    """Réécrit le registre comme `yaml.safe_dump` le ferait : clés triées."""
+    document = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    registry.write_text(
+        yaml.safe_dump(document, allow_unicode=True, sort_keys=True), encoding="utf-8"
+    )
+
+
+def test_une_entree_dont_id_n_est_pas_la_premiere_cle_reste_activable(atelier):
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    _reserialiser_trie(atelier["registry"])
+    texte = atelier["registry"].read_text(encoding="utf-8")
+    # Contrôle positif de la mise en scène : `id` n'est vraiment plus en tête.
+    assert f"- id: {MODEL_ID}" not in texte
+    assert "capabilities:" in texte
+
+    change = rw.enable_model_entry(config, MODEL_ID, _preuve(), mode=ex.ExecutionMode.APPLY)
+
+    assert change.status == ex.STEP_DONE, change.error
+    assert _entree(atelier["registry"], MODEL_ID)["enabled"] is True
+
+
+def test_l_activation_provisoire_lit_aussi_une_entree_a_cles_triees(atelier):
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    _reserialiser_trie(atelier["registry"])
+
+    change = rw.provisionally_enable_model_entry(
+        config, MODEL_ID,
+        rw.CalibrationProof.from_mapping(_calibration()),
+        mode=ex.ExecutionMode.APPLY,
+    )
+
+    assert change.status == ex.STEP_DONE, change.error
+    # L'activation provisoire ne touche pas le disque : c'est tout son intérêt.
+    assert _entree(atelier["registry"], MODEL_ID)["enabled"] is False
+    assert change.evidence["disk_enabled"] is False
+
+
+def test_le_rollback_lit_aussi_une_entree_a_cles_triees(atelier):
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    rw.enable_model_entry(config, MODEL_ID, _preuve(), mode=ex.ExecutionMode.APPLY)
+    _reserialiser_trie(atelier["registry"])
+
+    change = rw.rollback_provisional_model_entry(
+        config, MODEL_ID, reason="recette non confirmée", mode=ex.ExecutionMode.APPLY
+    )
+
+    assert change.status == ex.STEP_DONE, change.error
+    assert _entree(atelier["registry"], MODEL_ID)["enabled"] is False
+
+
+def test_une_entree_reellement_introuvable_est_toujours_refusee(atelier):
+    """Le localisateur voit plus large ; il ne refuse pas moins. Fail-closed intact."""
+    config = _config(atelier)
+    rw.write_model_entry(config, MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    lignes = atelier["registry"].read_text(encoding="utf-8").split("\n")
+
+    with pytest.raises(rw.RegistryWriterError, match="entrée"):
+        rw._entry_block_bounds(lignes, "modele-qui-n-existe-pas")
+    # Contrôle positif : le même appel sait bien trouver une entrée présente.
+    debut, fin, indent = rw._entry_block_bounds(lignes, MODEL_ID)
+    assert fin > debut and indent > 0
+
+
+def test_le_localisateur_est_celui_du_registre_pas_un_second(atelier):
+    """
+    COR-028 : une seule logique de localisation dans le dépôt, pas deux.
+
+    Deux implémentations de la même politique d'écriture sur le même fichier est
+    le défaut que COR-020 a fermé côté admin ; l'entretenir ici l'aurait rouvert.
+    """
+    lignes = (
+        "models:\n"
+        "  - capabilities: [text_generation]\n"
+        f"    id: {MODEL_ID}\n"
+        "    vram_gb: 1.4\n"
+    ).split("\n")
+
+    assert rw._entry_block_bounds(lignes, MODEL_ID) == model_registry._entry_bounds(
+        list(lignes), MODEL_ID
+    )
+
+
 # ══ 4. Sauvegarde et écriture atomique ════════════════════════════════════════
 
 def _sauvegardes(registry: Path) -> list[Path]:

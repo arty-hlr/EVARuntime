@@ -164,7 +164,10 @@ DEFAULT_BINARY_NAME = "llama-server"
 
 # Nom du manifeste §6, posé À CÔTÉ du binaire et non à la racine : c'est le
 # couple (binaire, manifeste) qui doit rester solidaire d'une release à l'autre.
-MANIFEST_FILENAME = "provenance.yaml"
+# La constante vit chez le DÉCIDEUR (SEC-017) : c'est le résolveur qui doit
+# savoir où relire le manifeste sans dépendre de l'exécuteur qui l'a écrit. On
+# la réemprunte ici plutôt que d'en tenir un second exemplaire à jour à la main.
+MANIFEST_FILENAME = runtime_resolver.MANIFEST_FILENAME
 
 CURRENT_LINK_NAME = "current"
 RELEASE_PREFIX = "release-"
@@ -898,7 +901,15 @@ class RuntimeInstaller:
 
         manifest = self.request.resolution.manifest
         variant = self.request.resolution.variant
-        assert manifest is not None and variant is not None  # garanti par refusal_reasons
+        if manifest is None or variant is None:
+            # Garanti par `refusal_reasons`, mais un `assert` disparaîtrait sous
+            # `python -O` — que rien n'interdit dans une unité systemd — et le
+            # refus deviendrait un `AttributeError` opaque (COR-021).
+            return self._echec(
+                step, context, debut, CODE_REFUSED,
+                "installation refusée : la résolution ne porte ni manifeste ni variante "
+                "exploitables — rien à installer, et rien à attester.",
+            )
 
         satisfait = await self._deja_satisfait(manifest)
         if satisfait.ok:

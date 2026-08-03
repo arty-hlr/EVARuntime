@@ -3,6 +3,20 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Source de vérité UNIQUE et déclarative. `docs/deployment.md` §1 doit les lister
+# toutes, et `gateway/tests/test_deploy_required_commands.py` DÉRIVE la liste
+# attendue de ces tableaux au lieu de la recopier. Aucun `command -v <nom
+# littéral>` ne doit exister ailleurs dans ce script.
+#
+# `rsync` est ici la dépendance qui a fait échouer deux installations réelles au
+# premier écran : elle n'est PAS installée sur une Debian 13 minimale et
+# n'apparaissait dans aucune documentation (OPS-011).
+AGENT_REQUIRED_COMMANDS=(openssl python3 rsync systemctl)
+# Absente, cette commande n'empêche pas l'installation : le script se contente
+# d'avertir que le filtrage doit être fait ailleurs.
+AGENT_OPTIONAL_COMMANDS=(ufw)
+
 NODE_ID="${NODE_ID:-node-a}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-9443}"
@@ -73,8 +87,9 @@ if (( AGENT_PORT >= BASE_LLAMA_PORT && AGENT_PORT <= LAST_LLAMA_PORT )); then
     die "Le port agent chevauche la plage data-plane."
 fi
 
-for command in python3 rsync openssl systemctl; do
-    command -v "$command" >/dev/null || die "Commande requise absente : $command"
+for command_name in "${AGENT_REQUIRED_COMMANDS[@]}"; do
+    command -v "$command_name" >/dev/null || \
+        die "Commande requise absente : $command_name (cf. docs/deployment.md §1)"
 done
 python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' || \
     die "Python 3.11 ou plus récent est requis."

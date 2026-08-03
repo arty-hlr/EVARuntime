@@ -66,6 +66,8 @@ jamais présenter une supposition comme un fait.
 from __future__ import annotations
 
 import ast
+import asyncio
+import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -144,13 +146,22 @@ _BACKEND_BUILD_FLAG: dict[str, str] = {
 # ── Niveaux de preuve de la matrice d'artefacts ───────────────────────────────
 
 # Affirmé par `codex-analyse.md` §6.
-EVIDENCE_SPEC = "constat-§6"
+EVIDENCE_SPEC = schema.EVIDENCE_SPEC
 # Plausible, non vérifié : ce module n'a pas d'accès réseau et ne consulte donc
 # aucune page de release. À confirmer contre la matrice amont avant de s'en
 # servir en production.
-EVIDENCE_ASSUMPTION = "hypothèse-à-confirmer"
+EVIDENCE_ASSUMPTION = schema.EVIDENCE_ASSUMPTION
+# Relevé par l'opérateur — ou par une CI — puis fourni via `ResolverPolicy`
+# (AUT-018, chargeur `runtime_variants`). Ce n'est ni une affirmation de §6, qui
+# ne connaît aucune empreinte, ni une hypothèse de ce module : c'est un constat
+# EXTERNE, dont le niveau de preuve appartient à celui qui l'a relevé. Le
+# chargeur impose ce niveau et interdit à un fichier de se réclamer de §6 : une
+# empreinte fournie ne devient pas une affirmation de la spécification.
+EVIDENCE_OPERATOR = schema.EVIDENCE_OPERATOR
 
-_EVIDENCE_LEVELS: frozenset[str] = frozenset({EVIDENCE_SPEC, EVIDENCE_ASSUMPTION})
+_EVIDENCE_LEVELS: frozenset[str] = frozenset({
+    EVIDENCE_SPEC, EVIDENCE_ASSUMPTION, EVIDENCE_OPERATOR,
+})
 
 # ── Signature du clone superficiel (§0.10) ────────────────────────────────────
 #
@@ -166,12 +177,40 @@ _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _PLATFORM_RE = re.compile(r"^[a-z0-9]+-[a-z0-9_]+$")
 
+# Nom du paquet, tel que la gateway l'importe (`from bootstrap import …`). Sert à
+# ramener les trois écritures d'un import de module frère — `from . import x`,
+# `from .x import y`, `from bootstrap import x` — à une seule forme canonique.
+PACKAGE = "bootstrap"
+
 # Modules dont l'import prouverait que le résolveur sort de son bac à sable :
 # réseau ou sous-processus arbitraire. Le seul sous-processus admissible est
 # `llama-server --version`, et il n'est pas lancé ici : il est délégué à
 # `llama_version.probe_llama_version`, injectable pour les tests.
 FORBIDDEN_IMPORTS: frozenset[str] = frozenset({
     "subprocess", "socket", "ssl", "urllib", "http", "httpx", "requests", "ftplib",
+})
+
+# TST-007 — la même interdiction, par la bande.
+#
+# Interdire `socket` sans interdire `from . import public_https` ne protège de
+# rien : le module frère apporte exactement la capacité qu'on refuse, et il
+# l'apporte sous un nom qui n'est dans aucune liste stdlib. C'est la porte par
+# laquelle AUT-018 a failli entrer.
+#
+# Cet ensemble est la fermeture transitive « modules du paquet qui atteignent un
+# `FORBIDDEN_IMPORTS` », et il n'a pas à être tenu à jour à la main : un test de
+# complétude le recalcule depuis les sources et échoue si un frère nouvellement
+# doté de réseau ou de sous-processus n'y figure pas.
+FORBIDDEN_SIBLING_IMPORTS: frozenset[str] = frozenset({
+    f"{PACKAGE}.applier",
+    f"{PACKAGE}.downloader",
+    f"{PACKAGE}.inventory",
+    f"{PACKAGE}.llmfit",
+    f"{PACKAGE}.planner",
+    f"{PACKAGE}.production",
+    f"{PACKAGE}.public_https",
+    f"{PACKAGE}.runtime_installer",
+    f"{PACKAGE}.runtime_variants",
 })
 
 
@@ -240,7 +279,11 @@ class ProvenanceManifest:
     def build_number(self) -> int:
         """Numéro de build entier, comparable à ce que rend `--version`."""
         match = _VERSION_RE.match(self.version)
-        assert match is not None  # garanti par __post_init__
+        if match is None:  # garanti par __post_init__ — mais `python -O` retirerait un assert
+            raise ProvenanceError(
+                f"manifeste de provenance incohérent : version {self.version!r} n'est pas un tag "
+                "de build llama.cpp « bNNNNN » et son numéro de build est donc indéterminable"
+            )
         return int(match.group(1))
 
     @property
@@ -392,6 +435,146 @@ def validate_manifest_document(document: Any) -> tuple[str, ...]:
         container_digest=runtime.get("container_digest"),
         build_options=runtime.get("build_options") or {},
     ))
+
+
+def attested_binary_sha256(document: Any) -> str | None:
+    """
+    Empreinte du binaire consignée par `runtime_installer` dans le bloc `install:`.
+
+    C'est la seule valeur du manifeste qui parle du **binaire posé** : le
+    `artifact_sha256` du bloc `runtime:` décrit l'archive téléchargée, pas ce qui
+    a été extrait puis publié. Retourne None si le manifeste n'a pas été écrit par
+    notre installateur, ou si le bloc a été retiré — auquel cas il n'atteste rien
+    et `_judge_existing_binary` refuse la réutilisation (SEC-009).
+    """
+    if not isinstance(document, Mapping):
+        return None
+    bloc = document.get("install")
+    if not isinstance(bloc, Mapping):
+        return None
+    empreinte = bloc.get("binary_sha256")
+    if isinstance(empreinte, str) and _SHA256_RE.match(empreinte):
+        return empreinte
+    return None
+
+
+# Nom du manifeste §6, posé À CÔTÉ du binaire par `runtime_installer` (AUT-016).
+#
+# SEC-017 — pourquoi ce nom vit ici et non seulement chez l'installateur : c'est
+# le résolveur qui DÉFINIT le manifeste (`ProvenanceManifest`, sa validation, son
+# empreinte de binaire). Le lire est donc une opération de décision, pas
+# d'exécution. Le sens de dépendance de `bootstrap/__init__.py` interdit au
+# résolveur d'importer `runtime_installer` — ce serait le décideur qui dépend de
+# l'exécuteur, et le garde-fou d'isolation (TST-007) le refuse. Un test recoupe
+# les deux constantes, de sorte qu'elles ne puissent pas diverger en silence.
+MANIFEST_FILENAME = "provenance.yaml"
+
+
+@dataclass(frozen=True)
+class ExistingAttestation:
+    """
+    Ce que le manifeste posé à côté d'un binaire permet — ou non — d'affirmer.
+
+    SEC-017 — fail-closed : `manifest` vaut `None` dès que le document est
+    absent, illisible ou incohérent. Une attestation partielle n'existe pas ; un
+    manifeste qu'on n'a pas su relire ne vaut pas mieux qu'aucun manifeste, et
+    `_judge_existing_binary` en tire alors le refus de réutilisation, pas une
+    réutilisation silencieuse.
+
+    `finding` est le **constat nommé** de ce qui a été trouvé sur disque : c'est
+    lui qui distingue « pas de manifeste » de « manifeste illisible » de
+    « manifeste incohérent », trois causes qui appellent trois gestes différents
+    et que le refus aval, à lui seul, confondrait.
+    """
+    manifest: ProvenanceManifest | None
+    binary_sha256: str | None
+    finding: schema.Finding | None
+
+
+def provenance_path(binary: Path) -> Path:
+    """Chemin du manifeste §6 attendu à côté d'un binaire `llama-server`."""
+    return binary.parent / MANIFEST_FILENAME
+
+
+def read_existing_attestation(binary: Path) -> ExistingAttestation:
+    """
+    Relit le manifeste posé à côté du binaire. Ne lève jamais.
+
+    SEC-017 — sans cette lecture, le recoupement manifeste ↔ binaire livré par
+    SEC-009 n'était exercé que par les tests : aucun appelant ne fournissait
+    jamais `existing_manifest`, et le parcours opérateur accordait donc
+    `reuse_existing` sans qu'aucune attestation soit confrontée à quoi que ce
+    soit. Le trou était réel, mais dormant.
+
+    Les quatre issues, toutes nommées, aucune fatale :
+
+    - **absent** — cas nominal sur un binaire compilé à la main. Constat `info`
+      qui dit **où** le manifeste était attendu ; le refus de réutilisation, lui,
+      vient de `_judge_existing_binary` (`runtime_provenance_unknown`) ;
+    - **illisible** — fichier absent de droits, tronqué, ou YAML invalide ;
+    - **incohérent** — relu, mais refusé par les règles de §6 ;
+    - **sain** — le manifeste et, s'il la porte, l'empreinte du binaire posé.
+
+    Dans les trois premiers cas `manifest` est `None` : l'absence de manifeste ne
+    vaut jamais attestation.
+    """
+    chemin = provenance_path(binary)
+
+    try:
+        texte = chemin.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_absent",
+            level="info",
+            message=(
+                f"Aucun manifeste de provenance §6 à côté de {binary} (attendu : {chemin}). "
+                "Le binaire en place ne peut donc pas être attesté. C'est le cas nominal "
+                "d'un binaire compilé à la main ; `runtime_installer` en écrit un à chaque "
+                "installation."
+            ),
+        ))
+    except OSError as exc:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_unreadable",
+            level="warn",
+            message=(
+                f"Le manifeste de provenance {chemin} existe mais n'a pas pu être lu "
+                f"({exc.__class__.__name__}). Un manifeste illisible ne vaut pas attestation : "
+                "le binaire en place sera traité comme dépourvu de provenance et remplacé. "
+                "Vérifiez ses droits de lecture."
+            ),
+        ))
+
+    try:
+        document = yaml.safe_load(texte)
+    except yaml.YAMLError as exc:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_unreadable",
+            level="warn",
+            message=(
+                f"Le manifeste de provenance {chemin} n'est pas un YAML valide "
+                f"({str(exc).splitlines()[0][:120]}). Il ne vaut pas attestation et le binaire "
+                "en place sera remplacé."
+            ),
+        ))
+
+    erreurs = validate_manifest_document(document)
+    if erreurs:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_invalid",
+            level="warn",
+            message=(
+                f"Le manifeste de provenance {chemin} est incohérent : {' ; '.join(erreurs)}. "
+                "Un manifeste approximatif vaut moins que pas de manifeste, parce qu'on lui "
+                "fait confiance : il est écarté et le binaire sera remplacé."
+            ),
+        ))
+
+    return ExistingAttestation(
+        manifest=manifest_from_document(document),
+        binary_sha256=attested_binary_sha256(document),
+        finding=None,
+    )
 
 
 def manifest_from_document(document: Any) -> ProvenanceManifest:
@@ -811,6 +994,17 @@ class RuntimeResolution:
     findings: tuple[schema.Finding, ...]
     rejected: tuple[str, ...]
 
+    # AUT-019 — la politique effectivement retenue, recopiée dans la décision.
+    #
+    # Ces trois drapeaux gouvernent quelles branches de §6 ont été ouvertes. Les
+    # laisser dans `ResolverPolicy` seulement, c'est-à-dire dans l'invocation,
+    # rendait le plan non interprétable : « aucune variante GPU sûre » ne veut pas
+    # dire la même chose selon que le conteneur était accepté ou non, et un repli
+    # CPU autorisé n'est pas un détail de ligne de commande.
+    allow_container: bool = False
+    allow_local_build: bool = True
+    allow_cpu_fallback: bool = False
+
     @property
     def backend(self) -> str | None:
         return self.variant.backend if self.variant else None
@@ -842,12 +1036,38 @@ class RuntimeResolution:
             "variant": self.variant.to_dict() if self.variant else None,
             "manifest": self.manifest.to_dict() if self.manifest else None,
             "rejected": list(self.rejected),
+            "policy": {
+                "allow_container": self.allow_container,
+                "allow_local_build": self.allow_local_build,
+                "allow_cpu_fallback": self.allow_cpu_fallback,
+            },
         }
 
 
 # ── Résolution ────────────────────────────────────────────────────────────────
 
 ProbeCallable = Callable[[Path], Awaitable[LlamaVersion]]
+DigestCallable = Callable[[Path], Awaitable[str | None]]
+
+
+async def sha256_binary(path: Path) -> str | None:
+    """
+    Empreinte SHA-256 du binaire en place, lue en flux et hors boucle d'événements.
+
+    Retourne None si le fichier est illisible : c'est un fait à constater, pas une
+    exception à propager — l'appelant en tire un refus nommé.
+    """
+    def _lire() -> str | None:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as flux:
+                for bloc in iter(lambda: flux.read(1024 * 1024), b""):
+                    digest.update(bloc)
+        except OSError:
+            return None
+        return digest.hexdigest()
+
+    return await asyncio.to_thread(_lire)
 
 
 async def resolve_runtime(
@@ -857,7 +1077,9 @@ async def resolve_runtime(
     installed_at: str,
     existing_binary: Path | None = None,
     existing_manifest: ProvenanceManifest | None = None,
+    existing_binary_sha256: str | None = None,
     probe: ProbeCallable | None = None,
+    digest: DigestCallable | None = None,
 ) -> RuntimeResolution:
     """
     Décide quel `llama-server` serait installé sur cet hôte, et pourquoi.
@@ -867,6 +1089,13 @@ async def resolve_runtime(
     à `llama_version.probe_llama_version` (réutilisé, pas réimplémenté) et
     injectable par `probe` pour les tests.
 
+    `existing_binary_sha256` est l'empreinte que l'installation avait **consignée**
+    à côté du manifeste (`attested_binary_sha256()` l'extrait du document YAML).
+    Elle n'est pas décorative : sans elle, un manifeste ne peut pas être recoupé
+    contre le binaire qu'il prétend décrire, et il ne vaut donc pas attestation
+    (SEC-009). L'empreinte réellement observée est calculée par `digest`,
+    injectable pour les tests — le binaire n'est lu que si un manifeste est fourni.
+
     `installed_at` est fourni par l'appelant, comme `generated_at` dans `schema` :
     le module ne lit pas l'horloge, pour que le manifeste produit soit
     reproductible en test.
@@ -874,6 +1103,37 @@ async def resolve_runtime(
     findings: list[schema.Finding] = []
     rejected: list[str] = []
     min_build = derive_min_build(policy.release)
+
+    # AUT-019 — la politique voyage avec la décision, sur TOUS les chemins de
+    # sortie. Un refus doit être aussi interprétable qu'un succès : « aucune
+    # variante GPU sûre » ne veut pas dire la même chose selon que le conteneur
+    # était accepté ou non.
+    politique = {
+        "allow_container": policy.allow_container,
+        "allow_local_build": policy.allow_local_build,
+        "allow_cpu_fallback": policy.allow_cpu_fallback,
+    }
+
+    # AUT-019 — un repli CPU AUTORISÉ se voit, qu'il soit emprunté ou non.
+    #
+    # §6 interdit le repli CPU silencieux. Le constat `cpu_fallback_degraded`
+    # couvre le cas où il est effectivement pris ; il ne couvre pas le cas, tout
+    # aussi important pour un relecteur, où l'autorisation était debout et n'a pas
+    # servi. Un plan relu six mois plus tard doit dire sous quelle politique il a
+    # été calculé, sans quoi on le compare à un autre plan sans savoir que les
+    # règles n'étaient pas les mêmes.
+    if policy.allow_cpu_fallback:
+        findings.append(schema.Finding(
+            code="cpu_fallback_authorized",
+            level="info",
+            message=(
+                "Le repli CPU est AUTORISÉ pour cette résolution (allow_cpu_fallback=True). "
+                "Ce n'est pas le défaut : §6 exige que la dégradation GPU → CPU soit demandée, "
+                "jamais subie. Si aucune variante GPU sûre n'est trouvée, une variante CPU sera "
+                "retenue et le plan sortira DÉGRADÉ — vérifiez le drapeau « degraded » de cette "
+                "section avant d'appliquer."
+            ),
+        ))
 
     if min_build == 0:
         findings.append(schema.Finding(
@@ -887,6 +1147,26 @@ async def resolve_runtime(
             ),
         ))
 
+    # Origine de la matrice employée (AUT-018). Un lecteur du plan ne doit jamais
+    # confondre la matrice LIVRÉE avec EVARuntime — qui ne porte aucune empreinte —
+    # et une matrice FOURNIE par l'opérateur. Le constat n'est émis que si des
+    # variantes opérateur sont présentes : sans lui, tous les plans par défaut
+    # gagneraient un constat qui ne leur apprend rien.
+    operator_variants = tuple(v for v in policy.variants if v.evidence == EVIDENCE_OPERATOR)
+    if operator_variants:
+        findings.append(schema.Finding(
+            code="runtime_variants_operator_supplied",
+            level="info",
+            message=(
+                f"Matrice d'artefacts fournie par l'opérateur : {len(operator_variants)} variante(s) "
+                f"sur {len(policy.variants)} portent un constat opérateur et non la matrice livrée "
+                f"avec EVARuntime ({', '.join(v.label() for v in operator_variants)}). Leur empreinte "
+                "sera recontrôlée à l'installation ; en revanche, rien ici ne prouve que l'archive "
+                "désignée contient un llama-server compilé pour le backend annoncé — `--version` ne "
+                "le dit pas."
+            ),
+        ))
+
     # ── Étape 0 : que vaut le binaire déjà en place ? ─────────────────────────
     observed_build: int | None = None
     reuse_existing = False
@@ -895,12 +1175,19 @@ async def resolve_runtime(
         probe_fn = probe or probe_llama_version
         version = await probe_fn(existing_binary)
         observed_build = version.build
+        # L'empreinte n'est calculée que s'il y a un manifeste à recouper : sans
+        # attestation à confronter, lire des centaines de Mo ne prouverait rien.
+        observed_sha256: str | None = None
+        if existing_manifest is not None:
+            observed_sha256 = await (digest or sha256_binary)(existing_binary)
         verdict = _judge_existing_binary(
             binary=existing_binary,
             version=version,
             min_build=min_build,
             existing_manifest=existing_manifest,
             profile=profile,
+            attested_sha256=existing_binary_sha256,
+            observed_sha256=observed_sha256,
         )
         findings.extend(verdict.findings)
         if verdict.fatal:
@@ -917,6 +1204,7 @@ async def resolve_runtime(
                 summary=verdict.summary,
                 findings=schema.merge_findings(findings),
                 rejected=tuple(rejected),
+                **politique,
             )
         reuse_existing = verdict.reuse
 
@@ -942,6 +1230,7 @@ async def resolve_runtime(
             ),
             findings=schema.merge_findings(findings),
             rejected=tuple(rejected),
+            **politique,
         )
 
     # ── Étapes 1 à 5 : sélection d'une variante ───────────────────────────────
@@ -962,6 +1251,7 @@ async def resolve_runtime(
             summary=selection.summary,
             findings=schema.merge_findings(findings),
             rejected=tuple(rejected),
+            **politique,
         )
 
     variant = selection.variant
@@ -1044,6 +1334,7 @@ async def resolve_runtime(
         summary=summary,
         findings=schema.merge_findings(findings),
         rejected=tuple(rejected),
+        **politique,
     )
 
 
@@ -1056,6 +1347,17 @@ class _BinaryVerdict:
     findings: tuple[schema.Finding, ...]
 
 
+def _commits_agree(declared: str, observed: str) -> bool:
+    """
+    Le commit du manifeste et celui rendu par `--version` désignent-ils la même révision ?
+
+    `--version` rend un SHA court (7 caractères), le manifeste un SHA de 7 à 40 :
+    la comparaison se fait par préfixe, dans les deux sens, sans distinction de casse.
+    """
+    a, b = declared.lower(), observed.lower()
+    return a.startswith(b) or b.startswith(a)
+
+
 def _judge_existing_binary(
     *,
     binary: Path,
@@ -1063,6 +1365,8 @@ def _judge_existing_binary(
     min_build: int,
     existing_manifest: ProvenanceManifest | None,
     profile: HardwareProfile,
+    attested_sha256: str | None = None,
+    observed_sha256: str | None = None,
 ) -> _BinaryVerdict:
     """
     Applique la politique `LLAMA_SERVER_MIN_BUILD` au binaire présent.
@@ -1075,6 +1379,15 @@ def _judge_existing_binary(
     llama.cpp produit un binaire qui se déclare `version: 1`. Le message doit
     désigner cette cause, sans quoi l'opérateur passe des heures à mettre à jour un
     dépôt déjà à jour.
+
+    SEC-009 (volet b) : quand un manifeste accompagne le binaire, il est **recoupé
+    contre le binaire** avant de valoir attestation — version, commit et empreinte.
+    Le manifeste est un fichier texte posé à côté d'un exécutable : rien n'empêche
+    de le recopier d'un autre hôte, ni de le laisser survivre à un remplacement
+    manuel du binaire. Non recoupé, il n'est pas une attestation, seulement une
+    affirmation. `runtime_installer._deja_satisfait` fait ce recoupement depuis
+    AUT-016 ; le résolveur ne le faisait pas et accordait `reuse_existing` sur
+    parole.
     """
     if version.build is None:
         if min_build > 0:
@@ -1202,6 +1515,46 @@ def _judge_existing_binary(
             ),),
         )
 
+    # ── Recoupement manifeste ↔ binaire (SEC-009) ─────────────────────────────
+    #
+    # Trois confrontations, dans l'ordre du moins cher au plus cher, et toutes
+    # nécessaires : le manifeste doit décrire CE binaire-ci, pas un binaire.
+
+    if existing_manifest.build_number != version.build:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_manifest_build_mismatch",
+                level="warn",
+                message=(
+                    f"Le manifeste de {binary} déclare {existing_manifest.version} "
+                    f"(build {existing_manifest.build_number}) alors que le binaire rend le build "
+                    f"{version.build}. Le manifeste ne décrit pas ce binaire : il a été recopié "
+                    "d'un autre hôte, ou il a survécu à un remplacement du binaire. Il ne vaut "
+                    "donc pas attestation de provenance et le binaire sera remplacé."
+                ),
+            ),),
+        )
+
+    if version.commit is not None and not _commits_agree(existing_manifest.commit, version.commit):
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_manifest_commit_mismatch",
+                level="warn",
+                message=(
+                    f"Le manifeste de {binary} déclare le commit {existing_manifest.commit} alors "
+                    f"que le binaire rend {version.commit}, pour un même numéro de build "
+                    f"{version.build}. Deux révisions différentes derrière une même étiquette : la "
+                    "provenance annoncée est fausse, le binaire sera remplacé."
+                ),
+            ),),
+        )
+
     if existing_manifest.backend not in profile.known_backends:
         return _BinaryVerdict(
             reuse=False,
@@ -1214,6 +1567,58 @@ def _judge_existing_binary(
                     f"Le manifeste du binaire en place annonce le backend « {existing_manifest.backend} », "
                     f"absent des candidats de cet hôte ({', '.join(profile.known_backends) or 'aucun'}). "
                     "Le conserver produirait un TTFT dégradé sans que rien ne le signale : il sera remplacé."
+                ),
+            ),),
+        )
+
+    if attested_sha256 is None:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_binary_unattested",
+                level="warn",
+                message=(
+                    f"Le manifeste de {binary} ne consigne aucune empreinte du binaire posé "
+                    "(bloc « install.binary_sha256 »). Version et commit concordent, mais rien ne "
+                    "distingue ce binaire d'un autre build de la même révision : la provenance "
+                    "n'est pas vérifiable et le binaire sera réinstallé. Réinstallez-le par "
+                    "`runtime_installer`, qui consigne cette empreinte à chaque passe."
+                ),
+            ),),
+        )
+
+    if observed_sha256 is None:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_binary_unreadable",
+                level="warn",
+                message=(
+                    f"L'empreinte de {binary} n'a pas pu être calculée (fichier illisible) : le "
+                    "manifeste ne peut pas être recoupé contre le binaire. Sans ce recoupement, "
+                    "la provenance n'est pas attestée et le binaire sera remplacé."
+                ),
+            ),),
+        )
+
+    if observed_sha256 != attested_sha256:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_binary_tampered",
+                level="warn",
+                message=(
+                    f"L'empreinte de {binary} ({observed_sha256[:16]}…) ne correspond pas à celle "
+                    f"consignée à l'installation ({attested_sha256[:16]}…), alors que version et "
+                    "commit concordent. Le binaire a été remplacé ou altéré sous une attestation "
+                    "restée en place : anomalie de chaîne d'approvisionnement, il sera réinstallé "
+                    "depuis la variante épinglée."
                 ),
             ),),
         )
@@ -1461,7 +1866,11 @@ def to_decision(resolution: RuntimeResolution) -> schema.Decision:
         )
 
     variant = resolution.variant
-    assert variant is not None  # garanti par resolved and not reuse_existing
+    if variant is None:  # garanti par resolved and not reuse_existing — sauf sous `python -O`
+        raise ProvenanceError(
+            "résolution incohérente : résolue et sans réutilisation, mais sans variante "
+            "retenue — aucune décision de runtime ne peut être motivée"
+        )
     rationale = (
         f"première variante sûre dans l'ordre de §6 pour {resolution.profile.platform} "
         f"({variant.evidence} : {variant.evidence_note})"
@@ -1483,7 +1892,7 @@ def to_plan_steps(
     resolution: RuntimeResolution,
     *,
     start_order: int = 1,
-    include_verify: bool = True,
+    include_verify: bool = False,
 ) -> tuple[schema.PlanStep, ...]:
     """
     Étapes que l'application du plan exécuterait pour poser ce runtime.
@@ -1494,6 +1903,43 @@ def to_plan_steps(
 
     La vérification précède l'installation, jamais l'inverse : contrôler
     l'empreinte après avoir posé le binaire ne protège de rien.
+
+    COR-030 — pourquoi `verify_artifact` n'est plus émise par défaut
+    ---------------------------------------------------------------
+    Ce module émettait, avant `install_runtime`, une étape `verify_artifact`
+    décrivant le contrôle d'empreinte de l'archive. Elle ne pouvait rien
+    vérifier : **à ce numéro d'étape l'archive n'est pas encore téléchargée**.
+    C'est `install_runtime` qui la récupère ET confronte son empreinte avant
+    d'extraire quoi que ce soit (AUT-016). `applier._verify_dispatcher` le
+    constatait déjà et rendait `STEP_SKIPPED` avec cette raison exacte — refuser
+    d'affirmer un contrôle qui n'a pas eu lieu était le bon geste.
+
+    Le coût de cette étape vide n'était pas cosmétique. `install_report`
+    considère — à juste titre — qu'une étape sautée ne prouve rien, donc la
+    **condition n°1 du jalon M2** (« runtime installé et vérifié ») ressortait
+    `unsatisfied` alors que l'installation avait réellement réussi : archive
+    récupérée, empreinte confrontée, build relu sur le binaire posé, manifeste §6
+    écrit. Le jalon ne pouvait pas être prononcé, et — conséquence plus large que
+    le seul rapport — `bootstrap-apply` sortait en `partial`, **code 3**, sur
+    chaque succès. Tout script d'exploitation testant le code 0 lisait un
+    demi-échec.
+
+    Deux voies existaient. Requalifier le résultat en `already_satisfied` a été
+    écarté : `execution` définit `STEP_SKIPPED` comme « décision délibérée de ne
+    pas exécuter », ce qui est exactement le cas, et l'autre domaine de la même
+    action — `downloader._execute_verify_artifact` — ne rend
+    `already_satisfied` qu'**après avoir relu les octets**. Verdir le statut
+    aurait déplacé la complaisance au lieu de supprimer le défaut. C'est donc
+    l'émetteur qui est corrigé : une étape qui ne peut rien vérifier n'est pas
+    émise.
+
+    Rien n'est perdu côté lisibilité : l'empreinte ou le digest attendus sont
+    désormais inscrits dans le détail de l'étape `install_runtime`, qui est celle
+    qui les confronte réellement.
+
+    `include_verify` reste et devient **opt-in**. Il n'est correct que pour un
+    appelant qui poserait l'archive AVANT ce numéro d'étape — ce qu'aucun ne fait
+    aujourd'hui. Le passer à vrai réintroduit le défaut.
     """
     if not resolution.resolved or resolution.reuse_existing or resolution.variant is None:
         return ()
@@ -1537,13 +1983,20 @@ def to_plan_steps(
         )
     elif variant.requires_container:
         detail = (
-            f"Déployer l'image {variant.reference or variant.label()} épinglée par digest et "
-            "écrire le manifeste de provenance. Nécessite un backend conteneur côté server_manager."
+            f"Déployer l'image {variant.reference or variant.label()} épinglée par digest "
+            f"{manifest.container_digest if manifest else '?'} et refuser tout autre contenu, "
+            "puis écrire le manifeste de provenance. Nécessite un backend conteneur côté "
+            "server_manager."
         )
     else:
+        # COR-030 : l'empreinte attendue est inscrite ICI, sur l'étape qui la
+        # confronte réellement, et non sur une `verify_artifact` qui la précédait
+        # sans pouvoir rien lire.
         detail = (
-            f"Installer l'artefact {variant.source} vérifié pour {variant.backend} et écrire le "
-            "manifeste de provenance à côté du binaire."
+            f"Récupérer l'artefact {variant.reference or variant.label()}, contrôler son "
+            f"empreinte contre sha256:{manifest.artifact_sha256 if manifest else '?'} AVANT "
+            f"toute extraction, installer le binaire {variant.backend} et écrire le manifeste "
+            "de provenance à côté de lui. L'installation est annulée si l'empreinte diverge."
         )
     if resolution.degraded:
         detail += " ATTENTION : runtime CPU sur un hôte GPU — dégradation assumée."
@@ -1568,19 +2021,69 @@ def _format_options(options: Mapping[str, Any]) -> str:
 
 def module_toplevel_imports(source_path: Path | None = None) -> frozenset[str]:
     """
-    Modules importés au premier niveau par ce fichier, par analyse statique.
+    Modules qu'un fichier peut tirer, par analyse statique de ses imports.
 
     Sert au test qui prouve que le résolveur ne peut ni parler au réseau ni lancer
-    un build : il n'importe aucun de `FORBIDDEN_IMPORTS`. Une assertion d'absence
-    doit pouvoir échouer — d'où cette fonction, qui rend l'ensemble observable au
-    lieu de laisser le test croire sur parole.
+    un build : il n'importe aucun de `FORBIDDEN_IMPORTS`, ni aucun module frère de
+    `FORBIDDEN_SIBLING_IMPORTS`. Une assertion d'absence doit pouvoir échouer —
+    d'où cette fonction, qui rend l'ensemble observable au lieu de laisser le test
+    croire sur parole.
+
+    TST-007 — ce que cette fonction ne voyait pas
+    ---------------------------------------------
+    Elle filtrait sur `node.level == 0`, donc `from . import public_https` lui
+    était **invisible**. Le garde-fou ne pouvait pas attraper l'ajout qu'il existe
+    précisément pour empêcher : importer un frère qui, lui, parle au réseau.
+    `from bootstrap import public_https` — la forme employée par `planner` et
+    `applier` — passait tout aussi bien, puisqu'elle ne rendait que « bootstrap ».
+
+    Les trois écritures sont désormais ramenées à une forme canonique unique,
+    `bootstrap.<frère>`, quelle que soit la syntaxe employée :
+
+    - `from . import public_https`        → `bootstrap.public_https`
+    - `from .public_https import fetch`   → `bootstrap.public_https`
+    - `from bootstrap import public_https`→ `bootstrap.public_https`
+    - `import bootstrap.public_https`     → `bootstrap.public_https`
+
+    Un import relatif remontant au-delà du paquet (`from .. import x`) est rendu
+    verbatim, avec ses points : il sort du périmètre canonique, et le laisser
+    visible sous une forme qui ne ressemble à aucun nom autorisé vaut mieux que le
+    normaliser à tort.
+
+    Le parcours est un `ast.walk` : un import différé dans le corps d'une fonction
+    est vu lui aussi. Le garde-fou perdrait tout son sens si déplacer `import
+    socket` de trois lignes suffisait à le contourner.
     """
     path = source_path or Path(__file__)
     tree = ast.parse(path.read_text(encoding="utf-8"))
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module.split(".")[0])
+            for alias in node.names:
+                parts = alias.name.split(".")
+                names.add(parts[0])
+                if parts[0] == PACKAGE and len(parts) > 1:
+                    names.add(f"{PACKAGE}.{parts[1]}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 1:
+                # `from .x import y` désigne le frère x ; `from . import x` aussi,
+                # mais c'est alors l'alias qui porte son nom.
+                if node.module:
+                    names.add(f"{PACKAGE}.{node.module.split('.')[0]}")
+                else:
+                    names.update(f"{PACKAGE}.{alias.name}" for alias in node.names)
+            elif node.level > 1:
+                prefix = "." * node.level
+                if node.module:
+                    names.add(f"{prefix}{node.module.split('.')[0]}")
+                else:
+                    names.update(f"{prefix}{alias.name}" for alias in node.names)
+            elif node.module:
+                base = node.module.split(".")[0]
+                names.add(base)
+                # `from bootstrap import public_https` nomme le frère dans l'alias,
+                # pas dans le module : sans cette branche, il ne resterait que
+                # « bootstrap », qui n'est interdit nulle part.
+                if base == PACKAGE:
+                    names.update(f"{PACKAGE}.{alias.name}" for alias in node.names)
     return frozenset(names)

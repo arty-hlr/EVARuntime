@@ -15,16 +15,20 @@ sa propre suite. Trois familles d'invariants :
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
+import struct
 
 import pytest
 
 from bootstrap import catalog as catalog_mod
+from bootstrap import downloader, execution, gguf_meta
 from bootstrap import llmfit as llmfit_mod
 from bootstrap import planner
 from bootstrap import runtime_resolver as runtime_mod
 from bootstrap import schema as sc
+from llama_version import LlamaVersion
 
 GENERATED_AT = "2026-07-31T12:00:00Z"
 GIB = 1024 ** 3
@@ -270,6 +274,57 @@ def test_la_sequence_suit_l_ordre_impose(tmp_path):
     ]
 
 
+def _politique_epinglee() -> runtime_mod.ResolverPolicy:
+    """
+    Matrice d'artefacts ÉPINGLÉE, telle que `--runtime-variants` en fournit une.
+
+    La matrice livrée avec EVARuntime ne porte aucune empreinte : seule une
+    variante `local-build` y est éligible, et un build local n'a rien à vérifier
+    avant construction. C'est pourquoi COR-030 ne se voyait pas sur le plan par
+    défaut — il n'est devenu atteignable qu'avec AUT-018.
+    """
+    return runtime_mod.ResolverPolicy(
+        release=_release(),
+        variants=(runtime_mod.ArtifactVariant(
+            source=runtime_mod.SOURCE_OFFICIAL_RELEASE,
+            backend="cuda12",
+            platform="linux-x86_64",
+            evidence=runtime_mod.EVIDENCE_OPERATOR,
+            evidence_note="Empreinte relevée par l'opérateur pour ce test.",
+            artifact_sha256="c" * 64,
+        ),),
+    )
+
+
+def test_un_runtime_epingle_n_ajoute_pas_d_etape_de_verification_vide(tmp_path):
+    """
+    COR-030 — le plan de l'opérateur ne porte qu'UNE `verify_artifact` : celle des
+    GGUF, qui relit réellement les octets.
+
+    L'étape jumelle du domaine runtime précédait `install_runtime` sans pouvoir
+    rien lire — l'archive n'est pas encore téléchargée à ce numéro. L'applicateur
+    la sautait, et une étape sautée fait retomber la condition n°1 du jalon M2 :
+    une installation réussie sortait en `partial`, code 3.
+    """
+    plan = _plan(_options(tmp_path, resolver_policy=_politique_epinglee()))
+    actions = _actions(plan)
+
+    # Contrôle positif : la variante épinglée est bien celle qui a été retenue,
+    # sans quoi ce test observerait le `local-build` par défaut et ne prouverait rien.
+    section = next(s for s in plan.sections if s.name == sc.SECTION_RUNTIME)
+    assert section.data["variant"]["source"] == runtime_mod.SOURCE_OFFICIAL_RELEASE
+    assert section.data["variant"]["artifact_sha256"] == "c" * 64
+
+    assert actions.count(sc.ACTION_VERIFY_ARTIFACT) == 1
+    verification = _etape(plan, sc.ACTION_VERIFY_ARTIFACT)
+    assert "llama-server" not in verification.target
+
+    # L'empreinte épinglée n'a pas disparu du plan : elle est portée par l'étape
+    # qui la confronte vraiment.
+    installation = _etape(plan, sc.ACTION_INSTALL_RUNTIME)
+    assert "c" * 64 in installation.detail
+
+
 def test_la_verification_suit_immediatement_le_telechargement(tmp_path):
     """Contrôler l'empreinte après avoir mis le modèle en service ne protège de rien."""
     actions = _actions(_plan(_options(tmp_path)))
@@ -505,6 +560,334 @@ def test_la_section_modeles_rappelle_que_les_ressources_sont_estimees(tmp_path):
     assert "calibrate_model" in texte
 
 
+# ── 4. AUT-014 — artefacts déjà présents ──────────────────────────────────────
+#
+# Sur le second déploiement réel (§0.13), les deux GGUF du catalogue étaient déjà
+# sur l'hôte et le plan annonçait quand même 837,1 Mio de téléchargement. Ce qui
+# est testé ici est le RAISONNEMENT, pas la collecte : le planificateur lisait
+# déjà les en-têtes, il n'en tirait rien.
+#
+# Le catalogue de production épingle des fichiers de plusieurs centaines de Mio :
+# les tests fabriquent donc leur propre catalogue, avec de vrais GGUF minimaux
+# de quelques dizaines d'octets et de vraies empreintes.
+
+ARTEFACT_REVISION = "0123456789abcdef0123456789abcdef01234567"
+ARTEFACT_ID = "modele-aut-014"
+POIDS = "modele-aut-014-q4_k_m.gguf"
+MMPROJ = "mmproj-modele-aut-014.gguf"
+
+
+def _gguf(taille: int, *, arch: str = "qwen2") -> bytes:
+    """
+    Un GGUF minimal mais RÉELLEMENT lisible, complété jusqu'à la taille voulue.
+
+    Un fichier illisible ferait apparaître un constat `gguf_illisible` dans la
+    section « modèles » et brouillerait ce qu'on cherche à observer ici.
+    """
+    valeur = arch.encode("utf-8")
+    cle = b"general.architecture"
+    kv = (
+        struct.pack("<Q", len(cle)) + cle
+        + struct.pack("<I", gguf_meta._T_STRING)
+        + struct.pack("<Q", len(valeur)) + valeur
+    )
+    tete = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", 1) + kv
+    assert taille >= len(tete)
+    return tete + b"\0" * (taille - len(tete))
+
+
+POIDS_OCTETS = _gguf(4096)
+MMPROJ_OCTETS = _gguf(2048)
+
+
+def _catalogue_artefact(tmp_path) -> catalog_mod.Catalog:
+    """Catalogue synthétique relu par le VRAI chargeur — contraintes du catalogue incluses."""
+    import yaml
+
+    def fichier(nom: str, role: str, data: bytes) -> dict:
+        return {
+            "name": nom,
+            "role": role,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+        }
+
+    document = {
+        "catalog_version": 1,
+        "downloader": {"name": "eva-bootstrap downloader", "license_id": "agpl-3.0"},
+        "models": [{
+            "id": ARTEFACT_ID,
+            "family": "test",
+            "display_name": "Modèle synthétique AUT-014",
+            "description": "Entrée fabriquée pour les régressions d'AUT-014.",
+            "use_cases": ["smoke_test"],
+            "source": {
+                "provider": "huggingface",
+                "repo_id": "organisation/depot-aut-014",
+                "repo_url": "https://huggingface.co/organisation/depot-aut-014",
+                "revision": ARTEFACT_REVISION,
+                "revision_recorded_on": "2026-08-01",
+                "files": [
+                    fichier(POIDS, "weights", POIDS_OCTETS),
+                    fichier(MMPROJ, "mmproj", MMPROJ_OCTETS),
+                ],
+            },
+            "license": {
+                "base_model": {"id": "apache-2.0"},
+                "fine_tune": {"id": "apache-2.0"},
+                "usage_terms": None,
+                "gated": False,
+                "redistribution_allowed": True,
+                "operator_acceptance_required": False,
+                "notes": None,
+            },
+            "runtime": {
+                "min_llama_build": 0,
+                "capabilities": ["text_generation"],
+                "requires_mmproj": True,
+                "defaults": {
+                    "ctx_size": 4096, "parallel": 1,
+                    "cache_type_k": "f16", "cache_type_v": "f16",
+                },
+            },
+            "resources": {
+                "disk_gb": 1.0, "initial_vram_gb": 1.0, "initial_ram_gb": 1.0,
+                "estimation_basis": "gguf_header",
+            },
+        }],
+    }
+    cible = tmp_path / "catalogue-aut-014.yaml"
+    cible.write_text(yaml.safe_dump(document, allow_unicode=True), encoding="utf-8")
+    return catalog_mod.load_catalog(cible)
+
+
+def _options_artefact(tmp_path, **overrides) -> planner.PlannerOptions:
+    _catalogue_artefact(tmp_path)
+    return _options(
+        tmp_path, catalog_path=tmp_path / "catalogue-aut-014.yaml", **overrides
+    )
+
+
+def _poser(options, *, poids: bytes | None = POIDS_OCTETS, mmproj: bytes | None = MMPROJ_OCTETS):
+    """Pose sur le disque ce qu'un déploiement antérieur y aurait laissé."""
+    if poids is not None:
+        (options.models_dir / POIDS).write_bytes(poids)
+    if mmproj is not None:
+        (options.models_dir / MMPROJ).write_bytes(mmproj)
+
+
+def _attester(options) -> None:
+    """
+    Écrit le manifeste de provenance par la VRAIE fabrique du téléchargeur.
+
+    Le recopier à la main dans le test ferait exactement ce que le module refuse
+    de faire dans le code : une seconde définition du manifeste, qui dériverait.
+    """
+    catalogue = catalog_mod.load_catalog(options.catalog_path)
+    entree = catalogue.get(ARTEFACT_ID)
+    downloader.provenance_path(options.models_dir, ARTEFACT_ID).write_text(
+        json.dumps(downloader.build_manifest(
+            entree, options.models_dir,
+            downloaded_at="2026-08-01T12:00:00Z", token_used=False,
+            acceptance=None, catalog=catalogue,
+        )),
+        encoding="utf-8",
+    )
+
+
+def _etape(plan, action):
+    return next((s for s in plan.steps if s.action == action), None)
+
+
+def test_un_artefact_absent_est_bien_planifie_au_telechargement(tmp_path):
+    """
+    Contrôle positif de toute la section : sans fichier sur l'hôte, le plan
+    propose le téléchargement et en annonce le volume. Sans lui, les tests
+    d'absence qui suivent seraient verts pour la mauvaise raison.
+    """
+    plan = _plan(_options_artefact(tmp_path))
+    telechargement = _etape(plan, sc.ACTION_DOWNLOAD_MODEL)
+
+    assert telechargement is not None
+    assert telechargement.estimated_bytes == len(POIDS_OCTETS) + len(MMPROJ_OCTETS)
+    assert plan.total_download_bytes() == telechargement.estimated_bytes
+    assert _actions(plan).index(sc.ACTION_VERIFY_ARTIFACT) == _actions(plan).index(
+        sc.ACTION_DOWNLOAD_MODEL
+    ) + 1
+
+
+def test_un_artefact_present_et_atteste_n_est_plus_retelecharge(tmp_path):
+    """
+    Le cas d'EvR-A : les fichiers étaient là, vérifiés, et le plan proposait
+    quand même 837,1 Mio. L'étape de téléchargement disparaît, son volume est
+    décompté, et la `verify_artifact` restée seule porte le motif.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    plan = _plan(options)
+
+    assert sc.ACTION_DOWNLOAD_MODEL not in _actions(plan)
+    assert plan.total_download_bytes() == 0
+    assert plan.applicable is True
+    assert sc.validate_plan_dict(plan.to_dict()) == ()
+
+    verification = _etape(plan, sc.ACTION_VERIFY_ARTIFACT)
+    assert verification is not None
+    assert "Aucun téléchargement proposé" in verification.detail
+    assert "manifeste de provenance atteste" in verification.detail
+    # Le motif reste aussi lisible dans la section « modèles », pour l'opérateur
+    # qui lit le plan et non ses étapes.
+    retenu = plan.section(sc.SECTION_MODELS).data["retained"][0]
+    assert retenu["local_artifact"]["attested"] is True
+
+
+def test_le_plan_qui_ne_telecharge_plus_reste_execute_par_l_applicateur(tmp_path):
+    """
+    Une `verify_artifact` seule doit s'inscrire proprement dans le journal.
+
+    L'applicateur enregistre bien un exécuteur pour elle, et cet exécuteur rend
+    `already_satisfied` — jamais `done` : une vérification qui réussit n'a rien
+    changé sur l'hôte, et `ExecutionReport.changed()` ne doit pas devenir vrai à
+    cause d'une lecture.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    plan = _plan(options)
+
+    catalogue = catalog_mod.load_catalog(options.catalog_path)
+    config = downloader.DownloadConfig(
+        catalog=catalogue,
+        models_dir=options.models_dir,
+        transport=None,
+        token_provider=lambda: None,
+        disk_free=lambda path: 10 ** 12,
+        chunk_bytes=64,
+    )
+    executeurs = downloader.make_executors(config)
+    registre = execution.ExecutorRegistry()
+    for action, executeur in executeurs.items():
+        registre.register(action, executeur)
+
+    assert registre.missing_actions(
+        [s for s in plan.steps if s.action in executeurs]
+    ) == ()
+
+    contexte = execution.ExecutionContext(
+        execution.ExecutionMode.APPLY,
+        allowed_roots=(tmp_path,),
+        now=lambda: "2026-08-01T12:00:00Z",
+        log=lambda message: None,
+    )
+    resultat = asyncio.run(
+        executeurs[sc.ACTION_VERIFY_ARTIFACT](
+            _etape(plan, sc.ACTION_VERIFY_ARTIFACT), contexte
+        )
+    )
+    assert resultat.status == execution.STEP_ALREADY_SATISFIED
+
+
+def test_un_artefact_present_mais_divergent_bloque_le_plan(tmp_path):
+    """
+    Une taille différente de celle épinglée interdit au SHA-256 de correspondre.
+
+    C'est une preuve, pas une présomption : le plan bloque, et ne propose ni de
+    réutiliser le fichier ni de l'écraser.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options, poids=_gguf(4096 + 64))
+    _attester(options)
+    plan = _plan(options)
+
+    assert "artefact_local_divergent" in [f.code for f in plan.blockers]
+    assert plan.applicable is False
+    assert plan.effective_steps() == ()
+    message = next(f.message for f in plan.blockers if f.code == "artefact_local_divergent")
+    assert POIDS in message
+    assert "supprimez-le vous-même" in message
+
+
+def test_un_ensemble_partiellement_present_reste_indivisible(tmp_path):
+    """
+    Un `mmproj` sans ses poids ne charge rien (§8), et l'inverse non plus.
+
+    Créditer la moitié présente annoncerait un volume que rien n'atteste : le
+    téléchargement reste proposé EN ENTIER, attestation ou pas.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options, mmproj=None)
+    _attester(options)
+    plan = _plan(options)
+
+    telechargement = _etape(plan, sc.ACTION_DOWNLOAD_MODEL)
+    assert telechargement is not None
+    assert telechargement.estimated_bytes == len(POIDS_OCTETS) + len(MMPROJ_OCTETS)
+    assert "ensemble incomplet" in telechargement.detail
+    assert "indivisible" in telechargement.detail
+
+
+def test_sans_attestation_le_telechargement_reste_propose(tmp_path):
+    """
+    Fichiers en place, tailles conformes, aucun manifeste : le plan ne présume
+    pas d'une empreinte qu'il n'a pas vérifiée. Le cas de l'opérateur qui a
+    recopié ses GGUF à la main.
+    """
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    plan = _plan(options)
+
+    telechargement = _etape(plan, sc.ACTION_DOWNLOAD_MODEL)
+    assert telechargement is not None
+    assert "aucune attestation de vérification exploitable" in telechargement.detail
+    assert plan.applicable is True
+
+
+def test_une_attestation_perimee_ne_credite_pas_l_ensemble(tmp_path):
+    """Un manifeste qui parle d'une autre révision décrit des fichiers que le catalogue n'approuve plus."""
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    chemin = downloader.provenance_path(options.models_dir, ARTEFACT_ID)
+    document = json.loads(chemin.read_text(encoding="utf-8"))
+    document["source"]["revision"] = "f" * 40
+    chemin.write_text(json.dumps(document), encoding="utf-8")
+
+    plan = _plan(options)
+    assert _etape(plan, sc.ACTION_DOWNLOAD_MODEL) is not None
+    retenu = plan.section(sc.SECTION_MODELS).data["retained"][0]
+    assert retenu["local_artifact"]["attested"] is False
+    assert retenu["local_artifact"]["attestation_problems"]
+
+
+def test_le_plan_ne_hache_aucun_octet_pour_conclure(tmp_path, monkeypatch):
+    """
+    L'arbitrage du chantier, rendu exécutable : `bootstrap-plan` doit rester une
+    commande rapide et rejouable. Hacher 40 Gio à chaque planification
+    échangerait un défaut d'affichage contre un défaut de conception.
+    """
+    appels: list[str] = []
+    vrai_sha256 = hashlib.sha256
+
+    def espion(*args, **kwargs):
+        appels.append("sha256")
+        return vrai_sha256(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "sha256", espion)
+
+    options = _options_artefact(tmp_path)
+    _poser(options)
+    _attester(options)
+    appels.clear()
+    plan = _plan(options)
+
+    assert sc.ACTION_DOWNLOAD_MODEL not in _actions(plan)
+    assert appels == []
+    # Contrôle positif : l'espion voit bien passer un hachage quand il y en a un.
+    hashlib.sha256(b"controle")
+    assert appels == ["sha256"]
+
+
 # ── Intégration CLI (`python cli.py bootstrap-plan`) ──────────────────────────
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -617,7 +1000,15 @@ def _options_de_la_commande(nom: str = "bootstrap-plan") -> set[str]:
 
     groupe = typer.main.get_command(cli.app)
     commande = groupe.commands[nom]  # type: ignore[attr-defined]
-    return {opt for param in commande.params for opt in getattr(param, "opts", ())}
+    # `secondary_opts` porte la face NÉGATIVE d'un drapeau booléen
+    # (`--allow-local-build/--no-local-build`). L'omettre rendait l'introspection
+    # aveugle à la moitié des options d'un drapeau à deux faces — et un test
+    # d'existence adossé à elle serait passé au vert sans rien prouver.
+    return {
+        opt
+        for param in commande.params
+        for opt in (*getattr(param, "opts", ()), *getattr(param, "secondary_opts", ()))
+    }
 
 
 def test_cli_expose_l_epinglage_llmfit(tmp_path):
@@ -691,3 +1082,460 @@ def test_cli_n_expose_aucun_secret(tmp_path, monkeypatch):
     assert "hf_zzzzzzzzzzzzzzzzzzzzzzzz" not in texte
     # Contrôle positif : la sortie n'est pas vide, le test voit bien quelque chose.
     assert "PLAN DE BOOTSTRAP" in texte
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEC-017 — le manifeste du binaire en place est réellement relu et recoupé
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# SEC-009 recoupait le manifeste contre le binaire — version, commit, backend,
+# empreinte — mais `_resolve_runtime` ne passait que `existing_binary` :
+# `existing_manifest` valait toujours `None`, et le recoupement n'avait donc
+# jamais lieu sur le parcours de l'opérateur. Ces tests exercent la chaîne
+# complète, depuis le fichier posé sur disque jusqu'au constat du plan.
+
+_COMMIT_POSE = "0123456789abcdef0123456789abcdef01234567"
+_SHA_BINAIRE = "d" * 64
+
+
+def _binaire_avec_manifeste(tmp_path, document=None, *, sans_manifeste=False):
+    """Pose un faux `llama-server` et, sauf demande contraire, son manifeste §6."""
+    bin_dir = tmp_path / "opt" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    binaire = bin_dir / "llama-server"
+    binaire.write_bytes(b"#!/bin/false\n")
+    if sans_manifeste:
+        return binaire
+
+    if document is None:
+        document = runtime_mod.ProvenanceManifest(
+            version="b6750", commit=_COMMIT_POSE, source=runtime_mod.SOURCE_LOCAL_BUILD,
+            backend="cuda12", platform="linux-x86_64", installed_at=GENERATED_AT,
+            build_options={"GGML_CUDA": True},
+        ).to_document()
+        document["install"] = {"binary_sha256": _SHA_BINAIRE}
+    if isinstance(document, str):
+        runtime_mod.provenance_path(binaire).write_text(document, encoding="utf-8")
+    else:
+        runtime_mod.provenance_path(binaire).write_text(
+            json.dumps(document), encoding="utf-8",  # JSON est un sous-ensemble de YAML
+        )
+    return binaire
+
+
+def _sonder(monkeypatch, *, build=6750, commit="0123456", empreinte=_SHA_BINAIRE):
+    """Sonde `--version` et empreinte injectées : aucun sous-processus ici non plus."""
+    async def probe(_binaire):
+        return LlamaVersion(build=build, raw=f"version: {build} ({commit})", commit=commit)
+
+    async def digest(_binaire):
+        return empreinte
+
+    monkeypatch.setattr(runtime_mod, "probe_llama_version", probe)
+    monkeypatch.setattr(runtime_mod, "sha256_binary", digest)
+
+
+def _section_runtime(plan):
+    return next(s for s in plan.sections if s.name == sc.SECTION_RUNTIME)
+
+
+def test_un_binaire_atteste_est_conserve_par_le_planificateur(tmp_path, monkeypatch):
+    """
+    Contrôle positif de la famille : manifeste cohérent, version, commit, backend
+    et empreinte concordants — le binaire est conservé.
+
+    Ce test ne peut passer QUE si le planificateur a effectivement lu le manifeste
+    sur disque : sans lecture, `existing_manifest` reste `None` et un hôte GPU
+    fait remplacer le binaire faute de provenance.
+    """
+    _sonder(monkeypatch)
+    binaire = _binaire_avec_manifeste(tmp_path)
+    plan = _plan(_options(tmp_path, existing_binary=binaire))
+
+    section = _section_runtime(plan)
+    assert section.data["reuse_existing"] is True
+    assert section.data["observed_build"] == 6750
+
+
+def test_un_manifeste_qui_ne_decrit_pas_ce_binaire_fait_remplacer(tmp_path, monkeypatch):
+    """
+    Le recoupement a lieu POUR DE VRAI : l'empreinte consignée ne correspond plus
+    au binaire, tout le reste concorde, et la réutilisation est refusée.
+
+    C'est la mutation qui prouve que SEC-009 n'est plus dormant.
+    """
+    _sonder(monkeypatch, empreinte="f" * 64)
+    binaire = _binaire_avec_manifeste(tmp_path)
+    plan = _plan(_options(tmp_path, existing_binary=binaire))
+
+    section = _section_runtime(plan)
+    assert section.data["reuse_existing"] is False
+    assert "runtime_binary_tampered" in {f.code for f in section.findings}
+
+
+@pytest.mark.parametrize("fabrique, code", [
+    (lambda: None, "runtime_manifest_absent"),
+    (lambda: "runtime: [pas du yaml\n  valide: du tout\n", "runtime_manifest_unreadable"),
+    (lambda: {"runtime": {"version": "pas-un-tag"}}, "runtime_manifest_invalid"),
+])
+def test_un_manifeste_absent_illisible_ou_incoherent_porte_son_constat(
+    tmp_path, monkeypatch, fabrique, code,
+):
+    """
+    Les trois issues dégradées produisent un CONSTAT NOMMÉ dans le plan — jamais
+    un plantage, jamais un silence — et aucune ne vaut attestation.
+    """
+    _sonder(monkeypatch)
+    document = fabrique()
+    binaire = _binaire_avec_manifeste(
+        tmp_path, document, sans_manifeste=document is None,
+    )
+    plan = _plan(_options(tmp_path, existing_binary=binaire))
+
+    section = _section_runtime(plan)
+    codes = {f.code for f in section.findings}
+    assert code in codes, codes
+    # Fail-closed : sur un hôte GPU, aucune de ces trois issues ne conserve le binaire.
+    assert section.data["reuse_existing"] is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUT-019 — les trois drapeaux de politique sont pilotables et visibles
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `ResolverPolicy` porte `allow_container`, `allow_local_build` et
+# `allow_cpu_fallback`, qu'aucune option n'exposait. Depuis AUT-018, un opérateur
+# pouvait fournir une variante `official-container` correctement épinglée par
+# digest et la voir systématiquement écartée : il avait le moyen de l'épingler et
+# aucun moyen de l'autoriser.
+
+_PIN = ("--pin-version", "b6800", "--pin-commit", "a" * 40, "--min-build", "6600")
+
+
+def test_cli_expose_les_trois_drapeaux_de_politique():
+    options = _options_de_la_commande()
+    for option in ("--allow-container", "--allow-local-build", "--no-local-build",
+                   "--allow-cpu-fallback"):
+        assert option in options, f"{option} absente de la CLI"
+
+
+def _politique_du_plan(document) -> dict:
+    section = next(s for s in document["sections"] if s["name"] == sc.SECTION_RUNTIME)
+    return section["data"]["policy"]
+
+
+def test_la_politique_retenue_est_inscrite_dans_le_plan(tmp_path):
+    """
+    AUT-019 — un plan doit dire sous quelles règles il a été calculé.
+
+    « Aucune variante GPU sûre » ne veut pas dire la même chose selon que le
+    conteneur était accepté ou non ; relire un plan sans sa politique, c'est le
+    comparer à un autre sans savoir que les règles différaient.
+    """
+    resultat = _invoke(tmp_path, "--json", *_PIN)
+    defaut = _politique_du_plan(json.loads(resultat.output))
+    assert defaut == {
+        "allow_container": False, "allow_local_build": True, "allow_cpu_fallback": False,
+    }
+
+    resultat = _invoke(
+        tmp_path, "--json", *_PIN, "--allow-container", "--allow-cpu-fallback",
+        "--no-local-build",
+    )
+    assert _politique_du_plan(json.loads(resultat.output)) == {
+        "allow_container": True, "allow_local_build": False, "allow_cpu_fallback": True,
+    }
+
+
+def test_une_variante_conteneur_epinglee_reste_ecartee_sans_l_option(tmp_path):
+    """Le défaut, tel qu'il se produisait : épinglée correctement, et jamais retenue."""
+    plan = _plan(_options(tmp_path, resolver_policy=runtime_mod.ResolverPolicy(
+        release=_release(), variants=(_variante_conteneur(),),
+    )))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is False
+    assert any("allow_container=False" in r for r in section.data["rejected"])
+
+
+def test_une_variante_conteneur_epinglee_est_retenue_avec_l_option(tmp_path):
+    """Le correctif : l'opérateur peut enfin autoriser ce qu'il a épinglé."""
+    plan = _plan(_options(tmp_path, resolver_policy=runtime_mod.ResolverPolicy(
+        release=_release(), variants=(_variante_conteneur(),), allow_container=True,
+    )))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is True
+    assert section.data["variant"]["source"] == runtime_mod.SOURCE_OFFICIAL_CONTAINER
+    assert section.data["policy"]["allow_container"] is True
+
+
+def _variante_conteneur() -> runtime_mod.ArtifactVariant:
+    return runtime_mod.ArtifactVariant(
+        source=runtime_mod.SOURCE_OFFICIAL_CONTAINER,
+        backend="cuda12",
+        platform="linux-x86_64",
+        evidence=runtime_mod.EVIDENCE_OPERATOR,
+        evidence_note="Digest relevé par l'opérateur pour ce test.",
+        container_digest="sha256:" + "b" * 64,
+    )
+
+
+def _politique_cpu(**kwargs) -> runtime_mod.ResolverPolicy:
+    """Aucune variante GPU : seule une variante CPU épinglée reste disponible."""
+    return runtime_mod.ResolverPolicy(
+        release=_release(),
+        variants=(runtime_mod.ArtifactVariant(
+            source=runtime_mod.SOURCE_OFFICIAL_RELEASE,
+            backend="cpu",
+            platform="linux-x86_64",
+            evidence=runtime_mod.EVIDENCE_OPERATOR,
+            evidence_note="Empreinte relevée par l'opérateur pour ce test.",
+            artifact_sha256="e" * 64,
+        ),),
+        **kwargs,
+    )
+
+
+def test_sans_autorisation_le_repli_cpu_reste_refuse(tmp_path):
+    """Le défaut qui compte : `allow_cpu_fallback` est faux, et le reste."""
+    plan = _plan(_options(tmp_path, resolver_policy=_politique_cpu()))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is False
+    assert section.data["degraded"] is False
+    assert "cpu_fallback_refused" in {f.code for f in section.findings}
+    # Aucune note : une politique par défaut n'a rien à annoncer.
+    assert section.notes == ()
+
+
+def test_un_repli_cpu_autorise_et_non_emprunte_se_voit_quand_meme(tmp_path):
+    """
+    L'autorisation seule est déjà une information : un plan calculé sous une
+    politique permissive ne doit pas se lire comme un plan calculé sous la
+    politique par défaut, même quand le repli n'a pas servi.
+    """
+    plan = _plan(_options(tmp_path, resolver_policy=runtime_mod.ResolverPolicy(
+        release=_release(), allow_cpu_fallback=True,  # matrice livrée : local-build cuda12 gagne
+    )))
+    section = _section_runtime(plan)
+
+    assert section.data["degraded"] is False
+    assert section.data["variant"]["backend"] == "cuda12"
+    assert "cpu_fallback_authorized" in {f.code for f in section.findings}
+    assert any("non emprunté" in n for n in section.notes), section.notes
+
+
+def test_un_repli_cpu_autorise_et_emprunte_est_annonce_en_toutes_lettres(tmp_path):
+    """
+    §6 : aucun repli CPU ne doit être silencieux. Quand il est autorisé ET pris,
+    le plan doit le dire dans ce que l'opérateur LIT — `data` n'est pas imprimé
+    par le rendu humain, `notes` l'est.
+    """
+    plan = _plan(_options(tmp_path, resolver_policy=_politique_cpu(allow_cpu_fallback=True)))
+    section = _section_runtime(plan)
+
+    assert section.data["resolved"] is True
+    assert section.data["degraded"] is True
+    assert section.data["variant"]["backend"] == "cpu"
+
+    codes = {f.code for f in section.findings}
+    assert {"cpu_fallback_authorized", "cpu_fallback_degraded"} <= codes
+    assert section.status == "warn"
+
+    texte = "\n".join(section.notes)
+    assert "EMPRUNTÉ" in texte
+    assert "CE PLAN EST DÉGRADÉ" in texte
+
+    # Et le rendu humain — ce que l'opérateur voit réellement — le porte aussi.
+    rendu = sc.render_human(plan, strict=False)
+    assert "CE PLAN EST DÉGRADÉ" in rendu
+
+
+def test_les_options_de_politique_exigent_un_epinglage(tmp_path):
+    """
+    Autoriser une branche de §6 sans épingler de version ne résout rien : la
+    commande le dit au lieu de laisser croire que l'option a été prise en compte.
+    """
+    for option in ("--allow-container", "--allow-cpu-fallback", "--no-local-build"):
+        resultat = _invoke(tmp_path, option)
+        assert resultat.exit_code == sc.EXIT_USAGE, option
+        assert "--pin-version" in _sans_ansi(resultat.output)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COR-027 — chaque modèle est estimé avec SES réglages
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `_inspect_local` calculait l'estimation de TOUS les GGUF avec
+# `retained[0].entry.runtime.defaults`. Avec `--max-models 2`, le second modèle
+# héritait du `ctx_size`, du `parallel` et des types de cache KV du premier. Le
+# cache KV domine l'estimation et croît avec le produit ctx × parallel : l'écart
+# n'est pas cosmétique, et il va dans le sens dangereux quand le premier modèle
+# est le plus modeste.
+
+_PETIT = "modele-cor-027-petit"
+_GRAND = "modele-cor-027-grand"
+
+
+def _gguf_dimensionne(taille: int, *, arch: str = "qwen2") -> bytes:
+    """
+    GGUF lisible portant les champs d'architecture dont dépend le cache KV.
+
+    `_gguf()` ne déclare que `general.architecture` : `block_count`,
+    `embedding_length` et le compte de têtes manquent, et `kv_cache_bytes` reste
+    alors `None`. Or c'est précisément ce poste que COR-027 fausse — sans ces
+    champs, le test observerait deux estimations vides et ne prouverait rien.
+    """
+    def _u32(valeur: int) -> bytes:
+        return struct.pack("<I", valeur)
+
+    def _kv_str(cle: str, valeur: str) -> bytes:
+        c, v = cle.encode(), valeur.encode()
+        return (struct.pack("<Q", len(c)) + c + _u32(gguf_meta._T_STRING)
+                + struct.pack("<Q", len(v)) + v)
+
+    def _kv_u32(cle: str, valeur: int) -> bytes:
+        c = cle.encode()
+        return struct.pack("<Q", len(c)) + c + _u32(gguf_meta._T_UINT32) + _u32(valeur)
+
+    kvs = [
+        _kv_str("general.architecture", arch),
+        _kv_u32(f"{arch}.block_count", 24),
+        _kv_u32(f"{arch}.embedding_length", 896),
+        _kv_u32(f"{arch}.attention.head_count", 14),
+        _kv_u32(f"{arch}.attention.head_count_kv", 2),
+    ]
+    tete = (
+        b"GGUF" + _u32(3) + struct.pack("<Q", 0) + struct.pack("<Q", len(kvs))
+        + b"".join(kvs)
+    )
+    assert taille >= len(tete)
+    return tete + b"\0" * (taille - len(tete))
+
+
+_PETIT_OCTETS = _gguf_dimensionne(8192)
+_GRAND_OCTETS = _gguf_dimensionne(6144)
+
+
+def _catalogue_deux_modeles(tmp_path):
+    """
+    Deux modèles aux `runtime.defaults` FRANCHEMENT différents.
+
+    Sans cet écart, le test ne verrait rien : c'est le produit ctx × parallel qui
+    porte le cache KV, et deux modèles aux réglages voisins produiraient deux
+    estimations voisines que le défaut n'aurait pas distinguées.
+    """
+    import yaml
+
+    def modele(identifiant: str, fichier: str, octets: bytes, defaults: dict) -> dict:
+        return {
+            "id": identifiant,
+            "family": "test",
+            "display_name": f"Modèle {identifiant}",
+            "description": "Entrée fabriquée pour la régression COR-027.",
+            "use_cases": ["smoke_test"],
+            "source": {
+                "provider": "huggingface",
+                "repo_id": f"organisation/{identifiant}",
+                "repo_url": f"https://huggingface.co/organisation/{identifiant}",
+                "revision": ARTEFACT_REVISION,
+                "revision_recorded_on": "2026-08-03",
+                "files": [{
+                    "name": fichier, "role": "weights",
+                    "sha256": hashlib.sha256(octets).hexdigest(),
+                    "size_bytes": len(octets),
+                }],
+            },
+            "license": {
+                "base_model": {"id": "apache-2.0"},
+                "fine_tune": {"id": "apache-2.0"},
+                "usage_terms": None, "gated": False,
+                "redistribution_allowed": True,
+                "operator_acceptance_required": False, "notes": None,
+            },
+            "runtime": {
+                "min_llama_build": 0,
+                "capabilities": ["text_generation"],
+                "requires_mmproj": False,
+                "defaults": defaults,
+            },
+            "resources": {
+                "disk_gb": 1.0, "initial_vram_gb": 1.0, "initial_ram_gb": 1.0,
+                "estimation_basis": "gguf_header",
+            },
+        }
+
+    document = {
+        "catalog_version": 1,
+        "downloader": {"name": "eva-bootstrap downloader", "license_id": "agpl-3.0"},
+        "models": [
+            modele(_PETIT, f"{_PETIT}.gguf", _PETIT_OCTETS, {
+                "ctx_size": 2048, "parallel": 1,
+                "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+            }),
+            modele(_GRAND, f"{_GRAND}.gguf", _GRAND_OCTETS, {
+                "ctx_size": 32768, "parallel": 8,
+                "cache_type_k": "f16", "cache_type_v": "f16",
+            }),
+        ],
+    }
+    cible = tmp_path / "catalogue-cor-027.yaml"
+    cible.write_text(yaml.safe_dump(document, allow_unicode=True), encoding="utf-8")
+    return cible
+
+
+def _estimations_par_modele(tmp_path):
+    """
+    Rend l'inspection locale rattachée à CHACUN des deux modèles retenus.
+
+    On lit `retained[].local_inspection`, c'est-à-dire l'association
+    modèle → estimation telle que le plan la publie, et non la liste à plat :
+    c'est cette association que le défaut faussait.
+    """
+    catalogue = _catalogue_deux_modeles(tmp_path)
+    options = _options(tmp_path, catalog_path=catalogue, max_models=2)
+    (options.models_dir / f"{_PETIT}.gguf").write_bytes(_PETIT_OCTETS)
+    (options.models_dir / f"{_GRAND}.gguf").write_bytes(_GRAND_OCTETS)
+
+    plan = _plan(options)
+    section = next(s for s in plan.sections if s.name == sc.SECTION_MODELS)
+    par_id = {r["id"]: r["local_inspection"] for r in section.data["retained"]}
+
+    # Contrôle positif : les deux modèles ont bien été retenus ET inspectés.
+    assert set(par_id) == {_PETIT, _GRAND}, par_id
+    assert all(v is not None for v in par_id.values()), par_id
+    return par_id[_PETIT], par_id[_GRAND]
+
+
+def test_chaque_modele_est_estime_avec_ses_propres_reglages(tmp_path):
+    """
+    Les deux entrées d'inspection doivent porter LEURS paramètres, pas ceux du
+    premier modèle retenu.
+    """
+    petit, grand = _estimations_par_modele(tmp_path)
+
+    assert petit["readable"] is True and grand["readable"] is True
+    assert petit["estimate"]["ctx_size"] == 2048
+    assert petit["estimate"]["parallel"] == 1
+    assert grand["estimate"]["ctx_size"] == 32768
+    assert grand["estimate"]["parallel"] == 8
+
+
+def test_l_empreinte_estimee_differe_reellement_entre_les_deux_modeles(tmp_path):
+    """
+    Le contrôle qui compte : les paramètres ne sont pas seulement recopiés dans
+    le rendu, ils entrent bien dans le CALCUL.
+
+    Vérifier `ctx_size` seul laisserait passer une régression où le champ serait
+    correct et l'estimation calculée avec l'autre jeu de réglages.
+    """
+    petit, grand = _estimations_par_modele(tmp_path)
+
+    kv_petit = petit["estimate"]["kv_cache_bytes"]
+    kv_grand = grand["estimate"]["kv_cache_bytes"]
+
+    assert kv_grand > kv_petit, (kv_petit, kv_grand)
+    # 32768×8 contre 2048×1, et f16 contre q8_0 : l'écart se compte en ordres de
+    # grandeur, pas en pourcents. Sous le défaut, les deux valaient le même chiffre.
+    assert kv_grand >= kv_petit * 100

@@ -255,6 +255,15 @@ Réponse de l'API :
   inchangés. C'est l'objectif même de cette politique.
 - **Journaux.** L'opération ne journalise que l'`id` technique — ni le nom, ni
   l'e-mail, ni les notes effacées ne réapparaissent dans les logs applicatifs.
+  Les **journaux d'accès** sont rédigés eux aussi, des deux côtés : le
+  middleware de la gateway remplace le segment de nom de `/admin/users/<nom>`
+  par `<redacted>`, et un filtre posé sur le logger `uvicorn.access` fait de même
+  sur SA ligne — celle que journald conserve, puisque `--access-log` est actif
+  dans les deux unités systemd. Cette seconde rédaction couvre aussi la **query
+  string** : `GET /admin/usage?username=<nom>` est journalisé
+  `?username=<redacted>` (SEC-010). Seuls `from_date`, `to_date`, `limit`,
+  `force` et `period` gardent une valeur lisible ; la valeur de tout autre
+  paramètre, présent ou futur, est rédigée par défaut.
 
 > **Désactiver ≠ anonymiser.** `disable-user` bloque l'accès en conservant toutes
 > les données et se réactive avec `enable-user`. `anonymize-user` efface les
@@ -967,6 +976,73 @@ chargement (au besoin `POST /admin/models/{id}/unload` puis `/load`).
 > de chaque **node** qui doit le supporter. Le bloc `speculative` est visible dans
 > `GET /admin/status` une fois le modèle chargé.
 
+### Ce qu'une mutation admin fait à `models.yaml` (COR-020)
+
+`POST /admin/models`, `PATCH /admin/models/{id}` et `DELETE /admin/models/{id}`
+persistent dans `models.yaml`. Depuis COR-020, la persistance **retouche le
+texte** du fichier au lieu de le resérialiser : les commentaires d'exploitation
+— l'en-tête du fichier livré, les notes de fin de ligne, les procédures de
+réactivation — sont de la documentation, pas du bruit.
+
+**Ce qui est préservé**
+
+| Cas | Ce que fait la gateway |
+|-----|------------------------|
+| Ajout (`POST`) | L'entrée est **ajoutée en fin de document**. Aucun octet de l'existant n'est réécrit. |
+| Mise à jour (`PATCH`) | Seules les **lignes de champ qui changent** sont retouchées, y compris à l'intérieur de `llama_params`. Le commentaire de fin de ligne survit (son alignement est normalisé à deux espaces). |
+| Suppression (`DELETE`) | Seul le **bloc de l'entrée** est retiré : en-tête du fichier et entrées voisines intacts. |
+| Mutation sans effet | Rien n'est écrit, aucune sauvegarde n'est produite. |
+
+**Ce qui n'est pas préservé**
+
+- Les commentaires **internes au bloc supprimé** par un `DELETE` : ils décrivent
+  l'entrée qui disparaît. La sauvegarde horodatée en garde une copie.
+- Un commentaire placé **après le dernier champ** d'une entrée supprimée est
+  conservé dans le fichier et devient orphelin — un commentaire orphelin se
+  relit, un commentaire effacé ne se retrouve pas.
+- Une entrée qui n'a pas de bloc `llama_params` et dont on modifie un paramètre
+  reçoit un bloc **complet** (paramètres effectifs), pas un bloc partiel.
+
+**Ce qui est refusé** — HTTP 422, message explicite, *rien n'est écrit et l'état
+mémoire de la gateway est restauré* :
+
+- `models.yaml` n'est plus lisible, ou n'est plus un registre (clé `models`
+  absente, valeur qui n'est pas une liste) ;
+- une entrée n'est pas identifiable avec certitude dans le texte : registre en
+  style « flow » (`models: [{...}]`), identifiant présent plusieurs fois ;
+- le texte candidat, reparsé, ne rend **pas** le document attendu — par exemple
+  une clé dupliquée dans une entrée, où YAML retient la dernière ;
+- le sens de `models.yaml` diverge du snapshot chargé par la gateway, scalaire
+  ou non scalaire, entrée ajoutée ou retirée : c'est une édition concurrente et
+  l'écraser avec l'ancien état mémoire serait une perte de données. Une
+  modification de **commentaire seulement** reste autorisée et préservée.
+
+Ces refus se lisent de la **même façon sur les trois verbes** (COR-029) :
+`POST`, `PATCH` et `DELETE` répondent tous `422` avec le message de refus dans
+`detail`. C'est ce message qui dit quoi corriger ; jusqu'à COR-029, `DELETE` le
+perdait dans un `500` au corps générique. Un identifiant inconnu reste, lui, un
+`404` — ce n'est pas la même panne et elle ne se répare pas pareil.
+
+Dans tous ces cas, corrigez le fichier à la main puis redémarrez la gateway (le
+registre relit `models.yaml` au démarrage). La gateway ne se rabat **jamais** sur
+une réécriture globale.
+
+**Sauvegardes et durabilité**
+
+- Avant chaque écriture, une copie `models.yaml.pre-admin.<horodatage>.bak` est
+  produite dans le même répertoire, avec le mode du fichier d'origine.
+- Ces sauvegardes sont **bornées à 5** (les plus anciennes sont purgées).
+  Contrairement aux `*.pre-migration.*.bak` des migrations SQLite, elles ne
+  s'accumulent pas. Le motif est distinct de celui du bootstrap
+  (`*.pre-bootstrap.*.bak`) : les deux jeux ne se purgent pas l'un l'autre.
+- L'écriture est atomique : fichier temporaire dans le même répertoire, `fsync`,
+  validation par le chargeur du registre lui-même, `os.replace`, puis `fsync`
+  du **répertoire parent** — sans lequel le renommage n'est pas durable.
+- Le **mode** du fichier est réappliqué (un `models.yaml` en 0640 le reste), et
+  le **propriétaire et le groupe** sont rétablis après le renommage. Si le
+  service n'a pas le droit de le faire, un avertissement est journalisé : vérifiez
+  alors `ls -l` sur le fichier.
+
 ### Enregistrer un nouveau modèle (sans redémarrage)
 
 ```bash
@@ -1357,7 +1433,7 @@ Contrôles propres à `doctor` :
 | `database_permissions` | base, `-wal`, `-shm` et répertoire non exposés (jugé avec la traversée des parents) | oui si atteignable par tous | contrôlé |
 | `disk_space` | espace libre sur les volumes de la base et des logs | oui sous 0,5 Go | contrôlé |
 | `llama_server_version` | `llama-server --version` confronté à `LLAMA_SERVER_MIN_BUILD` | oui | `skip` |
-| `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability | non (avertissement) | `skip` |
+| `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability. Distingue « GPU attendu mais absent » (`warn` / `nvidia_smi_unavailable`) de « pas de GPU, assumé » (`skip` / `gpu_absence_declared`, quand `ALLOW_NO_GPU=true` a été posé par `install.sh --allow-no-gpu`) ; une renonciation devenue fausse est signalée en `warn` / `gpu_waiver_stale` | non (avertissement) | `skip` |
 | `vram_detected` | budget VRAM net vs VRAM des devices **réellement exposés par `CUDA_VISIBLE_DEVICES`** | oui si le budget net dépasse le matériel ; avertissement si `TOTAL_VRAM_GB` est seulement nominalement supérieur | `skip` |
 | `model_artifacts` | taille et plausibilité des GGUF/mmproj ; intégrité SHA-256 **seulement** avec `--verify-hashes` | oui | `skip` |
 | `port_pool` | pool `BASE_LLAMA_PORT … +MAX_LOADED_MODELS-1` libre, pas de collision avec `GATEWAY_PORT` | oui pour la collision, avertissement pour un port occupé | `skip` |
@@ -1376,7 +1452,9 @@ Points de conception à connaître :
 - **Politique fail-closed de version.** Si `LLAMA_SERVER_MIN_BUILD > 0` mais que
   la version du binaire est illisible, le contrôle **échoue** : on ne peut pas
   prouver que le binaire est patché. Avec `LLAMA_SERVER_MIN_BUILD=0`, `doctor`
-  avertit que le garde-fou supply-chain est inerte.
+  avertit que le garde-fou supply-chain est inerte. Depuis SEC-009, la gateway et
+  le node-agent appliquent la **même** politique au démarrage : `doctor` n'est
+  plus le seul chemin fail-closed.
 - **`nvidia-smi` absent** n'est pas un échec bloquant : en mode cluster c'est
   normal (`skip`), en mode local c'est un avertissement (un hôte de
   développement sans GPU doit rester diagnosticable).
@@ -1589,6 +1667,10 @@ cd /opt/llm-gateway
 | `--pin-version` | Version llama.cpp épinglée, au format « bNNNNN » | aucune |
 | `--pin-commit` | Commit git correspondant à `--pin-version` | aucun |
 | `--min-build` | Premier build patché connu — plancher de sécurité | `0` |
+| `--runtime-variants` | Matrice d'artefacts `llama-server` épinglée par l'opérateur (YAML) — **remplace** la matrice livrée | matrice livrée |
+| `--allow-container` | Accepter une image conteneur épinglée par digest (étape 2 de §6) | refusé |
+| `--allow-local-build` / `--no-local-build` | Accepter le build local reproductible (étape 4 de §6) | accepté |
+| `--allow-cpu-fallback` | **Assumer** la dégradation GPU → CPU si aucune variante GPU sûre n'existe | refusé |
 | `--llmfit-bin` | Binaire LLMfit à consulter | recherché dans le `PATH` |
 | `--llmfit-version` | Version LLMfit attendue — va de pair avec `--llmfit-sha256` | aucune |
 | `--llmfit-sha256` | Empreinte attendue du binaire LLMfit (64 hex minuscules) | aucune |
@@ -1684,6 +1766,139 @@ n'est caché, seule la séquence est retenue. Pour débloquer, fournir la versio
 ./venv/bin/python cli.py bootstrap-plan \
     --pin-version b6210 --pin-commit <sha_git> --min-build 6120
 ```
+
+### Épingler son runtime — `--runtime-variants`
+
+`--pin-version`/`--pin-commit` disent **quelle version** installer. Ils ne disent
+pas **quel artefact** : c'est le rôle de la matrice d'artefacts, qui associe un
+couple (backend, plateforme) à une archive, une image ou un build local.
+
+La matrice **livrée** avec EVARuntime ne porte **aucune empreinte**. C'est
+délibéré : aucune n'a été vérifiée dans ce dépôt, et en inventer une
+transformerait le contrôle d'intégrité en théâtre. Deux conséquences à connaître :
+
+- seules ses variantes `local-build` sont éligibles — les autres apparaissent
+  dans les motifs de rejet du plan avec la mention « non épinglé » ;
+- aucune de ses variantes ne porte d'URL d'archive exploitable. Un plan produit
+  sans `--runtime-variants` est lisible et honnête, mais `bootstrap-apply` ne
+  peut pas en installer de runtime.
+
+Fournir sa propre matrice se fait avec un fichier YAML :
+
+```bash
+./venv/bin/python cli.py bootstrap-plan --json \
+    --pin-version b6210 --pin-commit <sha_git> --min-build 6120 \
+    --runtime-variants /etc/evaruntime/runtime-variants.yaml
+```
+
+Le modèle commenté est livré dans **`gateway/deploy/runtime-variants.yaml.example`**.
+Il ne se charge pas tel quel, et c'est voulu : les valeurs que le dépôt ne peut
+pas connaître y portent le marqueur `REMPLACER`, que le chargeur reconnaît et
+nomme dans son refus. Copiez-le, relevez les vraies valeurs, chargez-le.
+
+**Le fichier remplace la matrice livrée, il ne s'y ajoute pas.** Ce que vous y
+écrivez est l'intégralité de ce que le résolveur examinera. Si vous voulez
+conserver la voie du build local, redéclarez-la explicitement. Le remplacement
+est délibéré : en union, une faute de frappe dans `platform` rendrait votre
+entrée épinglée invisible et une variante `local-build` livrée l'emporterait en
+silence — vous liriez un plan réussi qui ignore intégralement votre épinglage.
+
+Champs, par source :
+
+| Source | `reference` | `artifact_sha256` | `container_digest` | `approx_bytes` |
+|---|---|---|---|---|
+| `official-release`, `evaruntime-build` | URL HTTPS d'**archive** | obligatoire | interdit | obligatoire |
+| `official-container` | `hôte/chemin:tag` | interdit | obligatoire | facultatif |
+| `local-build` | interdit | interdit | interdit | interdit |
+
+`evidence` et `recorded_on` sont obligatoires dans **tous** les cas. Ils ne sont
+pas décoratifs : une variante fournie ici est un **constat opérateur**, et le
+plan la présentera comme tel — jamais comme une affirmation de la spécification.
+Écrivez comment vous avez relevé l'empreinte, pas ce que vous supposez, et n'y
+mettez aucun nom de personne : le champ est recopié dans le plan et les journaux.
+
+Relever les valeurs :
+
+```bash
+curl -fL -o llama.zip \
+  https://github.com/ggml-org/llama.cpp/releases/download/<version>/<archive>
+sha256sum llama.zip   # -> artifact_sha256
+stat -c%s llama.zip   # -> approx_bytes
+
+docker buildx imagetools inspect ghcr.io/ggml-org/llama.cpp:server-cuda
+                      # -> container_digest, sous la forme sha256:<64 hex>
+```
+
+Recoupez la somme avec celle publiée par la release amont. Une somme calculée sur
+un fichier que vous venez de télécharger ne prouve que la cohérence du transfert ;
+c'est le recoupement avec la source qui prouve la provenance.
+
+La validation est **fail-closed et sans repli** : un fichier malformé fait sortir
+la commande en code `2` (erreur d'usage) sans produire de plan. Il ne retombe
+**jamais** sur la matrice livrée — un opérateur qui fournit un fichier attend que
+ce fichier soit employé, pas qu'il soit ignoré. Sont refusés, entre autres : une
+URL non HTTPS, une URL portant des identifiants ou une chaîne de requête (elle
+transporterait un secret jusque dans le plan et les journaux), une URL qui ne
+désigne pas une archive — une page de releases en est une —, une empreinte qui
+n'est pas 64 hexadécimaux minuscules, un champ hors schéma, deux entrées pour le
+même couple (source, backend, plateforme).
+
+`--runtime-variants` exige `--pin-version` et `--pin-commit` : la matrice dit
+quel artefact installer, l'épinglage dit quelle version il porte, et le manifeste
+de provenance a besoin des deux.
+
+L'option n'existe que sur `bootstrap-plan`. `bootstrap-apply` reconstruit la
+décision depuis le plan relu : c'est le plan qui porte la variante retenue, son
+empreinte et son URL, et rien ne se redécide au moment d'appliquer.
+
+Enfin, ce que fournir une matrice **ne fait pas** : cela n'autorise aucun repli
+CPU tacite (§6 reste appliqué à l'identique), et cela ne prouve pas que l'archive
+désignée contient un `llama-server` compilé pour le backend annoncé —
+`--version` ne le dit pas. Le plan porte ce constat.
+
+### Ouvrir une branche de §6 — les trois drapeaux de politique
+
+L'ordre de résolution de §6 comporte des branches que l'opérateur doit accepter
+explicitement. Elles étaient jusqu'ici inatteignables autrement que depuis du code
+Python : on pouvait épingler une image conteneur par digest et la voir
+**systématiquement** écartée — « mode conteneur non accepté par la politique ».
+
+| Option | Ce qu'elle ouvre ou ferme | Défaut |
+|---|---|---|
+| `--allow-container` | L'étape 2 de §6 : les images officielles épinglées **par digest** entrent dans l'ordre de résolution | refusé |
+| `--no-local-build` | Ferme l'étape 4. Sur la matrice livrée, qui ne porte aucune empreinte, il ne reste alors **aucune** variante éligible et la résolution échoue | l'étape est ouverte |
+| `--allow-cpu-fallback` | Assume la dégradation GPU → CPU quand aucune variante GPU sûre n'existe | refusé |
+
+Les trois exigent `--pin-version` et `--pin-commit`, pour la même raison que
+`--runtime-variants` : autoriser une branche sans épingler de version ne résout
+rien, et laisser passer l'option ferait croire qu'elle a été prise en compte.
+
+`--allow-container` a une limite qui n'est pas dans la politique mais dans le
+code : `server_manager` ne sait lancer que des sous-processus natifs. Le plan est
+descriptible, son application ne l'est pas encore — le plan porte ce constat.
+
+#### `--allow-cpu-fallback` n'est pas un détail d'invocation
+
+Le défaut qui compte est que ce drapeau soit **faux**. Une installation CPU
+démarre, répond et passe le smoke test : elle a toutes les apparences d'une
+installation réussie, et son TTFT ne se verra qu'en production, des semaines plus
+tard. §6 exige donc que cette dégradation soit demandée, jamais subie.
+
+La politique retenue est inscrite dans le plan, sous `sections.runtime.data.policy`,
+et pas seulement dans la ligne de commande : un plan relu six mois après doit dire
+sous quelles règles il a été calculé, sans quoi on le compare à un autre sans
+savoir que les règles différaient. Deux constats accompagnent le drapeau :
+
+- `cpu_fallback_authorized` (`info`) dès que l'autorisation est debout, **même si
+  le repli n'est pas emprunté** ;
+- `cpu_fallback_degraded` (`warn`) quand il l'est — avec ce que l'opérateur perd :
+  GPU inutilisé, TTFT et débit d'un ordre de grandeur inférieurs, `vram_gb` de
+  `models.yaml` privé de sens.
+
+Le rendu humain, lui, porte l'annonce en toutes lettres dans les notes de la
+section : `Repli CPU EMPRUNTÉ` et `CE PLAN EST DÉGRADÉ`. `data` n'est pas imprimé,
+`notes` l'est — et un repli CPU qui ne se lirait que dans le JSON serait un repli
+silencieux. Avec `--strict`, l'avertissement devient bloquant.
 
 ### Exemple de sortie humaine
 
@@ -1793,6 +2008,47 @@ dans le document d'architecture.
 > décrit ce qui *serait* fait ; `bootstrap-apply` l'exécute seulement après
 > relecture et avec `--apply`. `install.sh` reste chargé de poser le socle
 > système (utilisateur, venv, systemd, nginx et secrets).
+
+### Artefacts déjà présents sur l'hôte
+
+Sur une réinstallation, une bascule de branche ou un hôte de test, les GGUF du
+catalogue sont souvent **déjà là**. Le plan le constate et adapte sa séquence —
+il ne propose jamais de retélécharger ce qu'il sait déjà en place et vérifié.
+
+Trois situations, trois conduites :
+
+| État constaté au chemin cible | Ce que le plan propose |
+|---|---|
+| Ensemble complet, tailles conformes, manifeste de provenance cohérent | L'étape `download_model` **disparaît** ; son volume est décompté du total annoncé ; la `verify_artifact` reste seule et porte le motif |
+| Un fichier présent dont la **taille diffère** de celle épinglée | **Bloqueur** `artefact_local_divergent` : le plan sort en code 1, sans aucune étape. Le fichier n'est ni réutilisé ni écrasé — déplacez-le ou supprimez-le vous-même, puis régénérez le plan |
+| Tout autre cas — ensemble incomplet, taille non épinglée, manifeste absent ou périmé | Le téléchargement reste proposé **en entier**. L'ensemble est indivisible (§8) : une moitié présente n'est jamais créditée |
+
+La séquence devient alors, pour ce modèle :
+
+```text
+   2. [verify_artifact] qwen2.5-0.5b-instruct-q4_k_m
+      Aucun téléchargement proposé : les 1 fichier(s) de l'ensemble sont déjà au chemin cible, à la taille épinglée, et le manifeste de provenance atteste qu'ils ont été confrontés octet à octet aux empreintes du catalogue — aucun octet à retélécharger. Cette étape reste la seule preuve d'intégrité : elle relit les octets et confronte le SHA-256 de chaque fichier de l'ensemble au catalogue, avant toute mise en service. Un écart annule l'installation du modèle.
+```
+
+> **`bootstrap-plan` ne hache aucun octet.** Relire un GGUF de 40 Gio à chaque
+> planification transformerait une commande rapide et rejouable — appelée aussi
+> par `doctor` — en opération de plusieurs minutes. La conformité est donc
+> **attestée**, pas recalculée : le plan s'appuie sur le manifeste de provenance
+> écrit par un téléchargement vérifié antérieur, et c'est l'étape
+> `verify_artifact`, à l'application, qui relit réellement les octets et
+> confronte les empreintes. La **divergence**, elle, se prouve pour rien : une
+> taille différente interdit mathématiquement au SHA-256 de correspondre, et le
+> plan la traite lui-même.
+>
+> Conséquence à connaître : si les fichiers sont bien là mais qu'aucun manifeste
+> ne les atteste — GGUF recopiés à la main, par exemple —, le plan continue de
+> proposer le téléchargement. Ce n'est pas un gaspillage : le téléchargeur
+> revérifie et ne transfère rien s'il n'y a rien à transférer, puis écrit le
+> manifeste manquant.
+
+Le détail complet est lisible dans la sortie JSON, sous
+`sections[].data.retained[].local_artifact` : fichiers attendus, présents,
+manquants, divergents, chemin de l'attestation et motif en clair.
 
 ### Sortie JSON
 
@@ -2087,6 +2343,13 @@ distinguer.
 - **Le serveur de calibration est identifié.** Un port déjà occupé est refusé
   avant lancement ; le processus est encore vivant après `/health` et doit
   annoncer l'alias exact du modèle via `/v1/models`.
+- **La mise en page de `models.yaml` ne décide pas de l'issue** (COR-028).
+  L'écriture et l'activation localisent une entrée quel que soit l'ordre de ses
+  clés — un fichier déjà passé par une mutation admin a `capabilities` avant
+  `id`, et l'étape `enable_model` le refusait auparavant. Ce localisateur est
+  celui de `model_registry`, pas un second : il n'y a qu'une politique
+  d'écriture de `models.yaml` dans le dépôt. Une entrée réellement introuvable
+  ou présente deux fois reste **refusée**, sans rien écrire.
 - **Aucun secret dans la sortie**, y compris dans un message d'erreur, y compris
   le chemin du fichier de plan.
 
@@ -2104,6 +2367,28 @@ Deux propriétés à connaître :
   `llama-server` sont retenues sur hypothèse et non sur constat ; le rapport le
   dit, parce que c'est exactement ce qu'un lecteur pressé prendrait pour un fait
   vérifié six mois plus tard.
+
+#### Ce qui prouve quoi (COR-026)
+
+L'action `verify_artifact` sert **deux domaines** : l'archive de `llama-server`
+et les ensembles de GGUF. Une étape ne prouve donc une condition que si sa
+**cible** appartient au domaine de cette condition — la vérification du GGUF
+d'un modèle ne prouve rien du runtime, et réciproquement. Une vérification dont
+la cible n'est rattachable à aucun domaine ne prouve rien du tout, et le rapport
+écrit pourquoi.
+
+Conséquence pratique, sur un hôte où les GGUF étaient **déjà présents et
+attestés** : `bootstrap-plan` n'émet plus d'étape `download_model` (AUT-014), et
+la condition « Modèle en place à révision figée » est alors tenue par la seule
+`verify_artifact` du modèle. Le rapport écrit littéralement *« aucune étape
+"download_model" n'était au programme »* — à ne pas confondre avec *« rien
+n'atteste cette condition »*, qui reste le verdict quand aucune vérification
+n'a eu lieu. Les deux se lisent différemment parce qu'ils ne se réparent pas de
+la même façon.
+
+Élargir ce que le rapport sait voir ne l'a pas rendu plus complaisant : une
+vérification en échec, sautée, simulée ou jamais tentée laisse sa condition
+**non satisfaite**, exactement comme avant.
 
 `bootstrap-apply` ne remplace pas `doctor` (§8). `doctor` répond à « cet hôte
 peut-il démarrer **maintenant** ? » en sondant le système vivant ; le rapport

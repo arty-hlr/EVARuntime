@@ -44,6 +44,47 @@ GPU local et pilote des node-agents installés séparément.
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
+### Commandes exigées par les scripts de déploiement
+
+Les préflights refusent de continuer si l'une de ces commandes manque. La liste
+est **exhaustive** et **tenue à jour mécaniquement** : chaque script déclare ses
+dépendances dans un tableau bash unique (`INSTALL_REQUIRED_COMMANDS`,
+`AGENT_REQUIRED_COMMANDS`, …) et `gateway/tests/test_deploy_required_commands.py`
+dérive de ces tableaux la liste qui doit figurer ci-dessous. Une dépendance
+ajoutée à un script sans être documentée ici fait échouer la CI.
+
+| Commande | Exigée par | Paquet Debian/Ubuntu |
+|---|---|---|
+| `awk` | `install.sh`, `update.sh` | `mawk` ou `gawk` (présent) |
+| `chmod`, `chown`, `cp`, `id`, `mkdir`, `mktemp`, `mv` | `install.sh`, `update.sh` | `coreutils` (présent) |
+| `find` | `install.sh`, `update.sh` | `findutils` (présent) |
+| `python3` | tous | `python3` (≥ 3.11) |
+| `systemctl` | tous | `systemd` (présent) |
+| `useradd` | `install.sh` | `passwd` (présent) |
+| `usermod` | `install.sh` **mode local** | `passwd` (présent) |
+| `nvidia-smi` | `install.sh` / `update.sh` **mode local** | pilote NVIDIA — contournable par `--allow-no-gpu`, voir [§4](#4-installation-du-gateway) |
+| `curl` | `update.sh` | `curl` — **à installer** |
+| `git` | `update.sh`, `update-agent.sh` (sans `--no-pull`) | `git` — **à installer** |
+| `rsync` | `install-agent.sh`, `update-agent.sh` | `rsync` — **à installer**, absent d'une Debian 13 minimale |
+| `openssl` | `install-agent.sh` | `openssl` — **à installer** si absent |
+
+Commandes **optionnelles** : absentes, elles ne bloquent pas l'installation mais
+désactivent une fonction, et le script le dit.
+
+| Commande | Fonction perdue si absente | Paquet |
+|---|---|---|
+| `nginx` | reverse-proxy TLS non configuré ([§8](#8-configuration-nginx)) | `nginx` |
+| `sqlite3` | timer de sauvegarde quotidienne **non armé** ([§11](#11-mise-à-jour)) | `sqlite3` |
+| `ufw` | aucune règle firewall créée sur le nœud ; à faire dans le firewall réseau | `ufw` |
+
+```bash
+# Orchestrateur / gateway mono-nœud
+sudo apt install -y curl git sqlite3 nginx
+
+# CHAQUE nœud GPU, avant install-agent.sh
+sudo apt install -y rsync openssl
+```
+
 ### Vérifications initiales
 
 ```bash
@@ -98,6 +139,35 @@ Sans `--pin-version`/`--pin-commit`, le plan sort **bloqué** et ne propose aucu
 étape : le planificateur refuse d'inventer un numéro de build. Référence complète
 des options et des exit codes :
 [guide administrateur, section 9](admin.md#9-planificateur-damorçage--bootstrap-plan).
+
+Épingler la version ne suffit pas à rendre le plan **applicable** : la matrice
+d'artefacts livrée avec EVARuntime ne porte aucune empreinte et aucune URL
+d'archive, de sorte que seule la voie du build local y est éligible. Pour que
+`bootstrap-apply` installe réellement un runtime, fournissez votre propre matrice
+avec `--runtime-variants`, à partir du modèle commenté
+`gateway/deploy/runtime-variants.yaml.example` :
+
+```bash
+cp gateway/deploy/runtime-variants.yaml.example /etc/evaruntime/runtime-variants.yaml
+# relever les vraies empreintes — le fichier refuse de se charger tant que les
+# marqueurs REMPLACER y figurent
+./.venv/bin/python cli.py bootstrap-plan --json \
+    --pin-version b6210 --pin-commit <sha_git> --min-build 6120 \
+    --runtime-variants /etc/evaruntime/runtime-variants.yaml \
+    --models-dir /models > /tmp/plan.json
+```
+
+Le fichier **remplace** la matrice livrée : redéclarez-y la variante
+`local-build` si vous voulez conserver cette voie. Champs, contrôles et méthode
+de relevé : [guide administrateur, section 9](admin.md#épingler-son-runtime----runtime-variants).
+
+Si `--models-dir` contient déjà les GGUF du catalogue et qu'un manifeste de
+provenance les atteste, le plan **ne propose pas de les retélécharger** : l'étape
+`download_model` disparaît, le volume annoncé est décompté, et seule la
+vérification d'empreinte subsiste. Un fichier présent dont la **taille** diffère
+de celle épinglée bloque le plan au lieu d'être écrasé. Le détail des trois cas —
+et pourquoi le plan n'a jamais à hacher les fichiers pour conclure — est dans le
+[guide administrateur, section 9](admin.md#artefacts-déjà-présents-sur-lhôte).
 
 Les sections 2 et 3 qui suivent décrivent la procédure manuelle éprouvée
 (compilation de llama.cpp, téléchargement des GGUF). Le plan de bootstrap ne la
@@ -338,12 +408,53 @@ sudo bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode cluster
 `--cluster` reste accepté comme alias de compatibilité. `--dry-run` ne requiert
 pas root et n'exécute ni écriture, ni `pip`, ni `git`, ni `systemctl`.
 
+#### Installer en mode local sur un hôte sans GPU — `--allow-no-gpu`
+
+En mode local, le préflight exige `nvidia-smi` et **refuse** l'installation s'il
+est absent. Ce refus est délibéré : un gateway local sans GPU ne peut rien
+offloader. Il existe pourtant des cas légitimes — banc CPU, recette de bout en
+bout, maquette d'intégration — et le contournement pratiqué jusqu'ici consistait
+à éditer le script, ce qui ne laissait **aucune trace** : ni dans la
+configuration, ni dans le diagnostic.
+
+```bash
+# Refusé : l'hôte n'a pas de GPU et rien ne l'assume
+sudo bash install.sh --mode local
+# → le message liste les trois conduites à tenir possibles
+
+# Accepté : l'absence de GPU est ASSUMÉE, et tracée
+sudo bash install.sh --mode local --allow-no-gpu
+```
+
+L'option écrit `ALLOW_NO_GPU=true` dans `/etc/llm-gateway/env`. Conséquences :
+
+- `evaruntime doctor` rapporte `gpu_inventory` en **`skip` / `gpu_absence_declared`**
+  — « pas de GPU, par décision » — au lieu de **`warn` / `nvidia_smi_unavailable`**
+  — « GPU attendu mais absent ». Deux diagnostics distincts, deux verdicts
+  distincts : le premier ne colore pas le rapport, le second reste un signal ;
+- si un GPU apparaît plus tard alors que la clé est encore là, doctor le signale
+  en `warn` / `gpu_waiver_stale` : une renonciation ne doit pas survivre au
+  matériel qui la justifiait. Retirez la clé, ou relancez `install.sh` sans
+  l'option — l'installateur remet `ALLOW_NO_GPU=false` dès qu'il détecte un GPU ;
+- rien d'autre ne change : aucun offload GPU, `TOTAL_VRAM_GB` et les attentes de
+  latence sont à adapter à la main.
+
+`update.sh` relit cette décision avant son préflight : en mode local,
+`nvidia-smi` reste obligatoire par défaut, mais une installation portant déjà
+`ALLOW_NO_GPU=true` reste mise à jour sans nouvelle option ni modification du
+script. Sans cette trace persistée, la mise à jour conserve le refus historique
+et explique comment déclarer le banc CPU par `install.sh --allow-no-gpu`.
+
+En mode cluster, l'option est sans objet — l'orchestrateur n'a jamais de GPU
+local — et le script le dit.
+
 Le script effectue automatiquement :
 
 1. Création de l'utilisateur système `llmservice` (sans shell, sans home)
 2. Ajout au groupe `render,video` pour l'accès GPU
 3. Création des répertoires (`/opt/llm-gateway`, `/var/lib/llm-gateway`, `/var/log/llm-gateway`, `/etc/llm-gateway`)
-4. Copie du code source et création du virtualenv Python
+4. Copie du code source (`gateway`, `cluster/` et `bootstrap/` avec son
+   catalogue) et création du virtualenv Python
 5. Installation des dépendances Python
 6. **Génération automatique des secrets** (`INTERNAL_API_KEY`, `ADMIN_SECRET`) dans `/etc/llm-gateway/env`
 7. Copie du registre dans `/var/lib/llm-gateway/models.yaml` (writable par le
@@ -374,6 +485,30 @@ se trouvent dans `models.yaml` (voir section 6).
 ```bash
 sudo nano /etc/llm-gateway/env
 ```
+
+### Les trois durcissements posés par l'installateur
+
+`install.sh` écrit trois réglages de sécurité dans le fichier généré. Ils y sont
+**visibles et commentés** : un réglage absent du fichier n'existe pas pour
+l'exploitant.
+
+| Clé | Valeur posée | Ce qu'elle protège |
+|---|---|---|
+| `ALLOWED_MODEL_DIRS` | le répertoire de modèles créé par l'installateur **plus** les répertoires déclarés par le registre livré | seuls des `.gguf` de ces répertoires peuvent être déclarés dans `models.yaml` — barrière contre un chemin arbitraire injecté par l'API admin |
+| `CORS_ALLOW_ORIGINS` | **vide** = aucune origine navigateur | `*` autoriserait n'importe quelle page web à parler à la gateway. L'API est consommée par des clients serveur, que CORS ne concerne pas, et le dashboard admin est servi depuis la même origine |
+| `LLAMA_SERVER_MIN_BUILD` | `0` (aucun enforcement) | plancher de version `llama-server` contre GHSA-8947-pfff-2f3c. **À relever** : `doctor` le signale à chaque exécution tant qu'il vaut 0 |
+
+Deux pièges d'exploitation :
+
+- **`ALLOWED_MODEL_DIRS` est validée sur TOUTES les entrées de `models.yaml`,
+  activées ou non.** Une seule entrée hors allowlist et le service **refuse de
+  démarrer**. C'est pour cela que la valeur posée est dérivée du registre que
+  l'installateur pose, et non écrite en dur. Restreignez-la dès que vos chemins
+  réels sont fixés, puis validez avec `evaruntime doctor` avant de démarrer.
+- **`update.sh` ne pose pas ces clés sur une installation antérieure.** Il les
+  **signale** en préflight : ajouter `CORS_ALLOW_ORIGINS=` d'autorité couperait
+  un client navigateur existant au milieu d'une mise à jour. À vous de trancher,
+  clé par clé.
 
 ### Paramètres critiques à vérifier
 
@@ -826,6 +961,9 @@ tail -f /var/log/llm-gateway/llama-server.log
 
 # Filtrer les erreurs uniquement
 sudo journalctl -u llm-gateway -p err --since "1 hour ago"
+
+# Journal d'accès nginx — fichier DÉDIÉ, format rédigé (§16)
+tail -f /var/log/nginx/llm-gateway-access.log
 ```
 
 ---
@@ -900,6 +1038,10 @@ curl -s "$GW/admin/metrics/llama" \
 ### Mettre à jour le code de la gateway
 
 ```bash
+# Charger d'abord le script de mise à jour de la release visée. Un script bash
+# déjà en cours conserve son ancienne version même si son propre git pull réussit.
+git pull --ff-only
+
 # Conserve automatiquement le mode installé
 bash gateway/deploy/update.sh --dry-run
 sudo bash gateway/deploy/update.sh
@@ -913,10 +1055,16 @@ En cluster, cette commande met à jour **l'orchestrateur uniquement**. Exécuter
 ensuite `node_agent/deploy/update-agent.sh` sur chaque nœud GPU; aucun code n'est
 poussé à distance par l'orchestrateur.
 
+Le `git pull` explicite avant l'invocation est important quand la release modifie
+`update.sh` lui-même : le processus déjà lancé ne peut pas remplacer son propre
+code en mémoire. Le script conserve tout de même son `git pull --ff-only` interne
+comme garde-fou contre une révision arrivée entre la vérification et l'exécution.
+
 Ce que fait le script :
 
 1. Refuse un checkout sale puis exécute `git pull --ff-only`
-2. Synchronise les fichiers Python et `requirements.txt` vers `/opt/llm-gateway/`
+2. Synchronise les modules racine, `cluster/`, `bootstrap/` avec son catalogue et
+   `requirements.txt` vers `/opt/llm-gateway/`
 3. Synchronise le répertoire `static/` (dashboard HTML…)
 4. Construit un **nouveau venv**, installe les dépendances et exige `pip check`;
    l'ancien venv reste intact jusqu'au redémarrage
@@ -1266,7 +1414,12 @@ LLAMA_SERVER_MIN_BUILD=<build_patché>
 Au démarrage, la gateway (et chaque node-agent) sonde `llama-server --version` :
 
 - build lu `<` `LLAMA_SERVER_MIN_BUILD` (si > 0) → **démarrage refusé** (log critical) ;
-- version illisible / binaire absent → simple avertissement, démarrage poursuivi ;
+- version illisible / binaire absent **et** `LLAMA_SERVER_MIN_BUILD > 0` →
+  **démarrage refusé** (log critical). Politique fail-closed (SEC-009) : un
+  binaire qui ne sait pas dire ce qu'il est ne peut pas être attesté patché, et
+  `doctor` refusait déjà dans ce cas. Les deux chemins rendent le même verdict ;
+- version illisible / binaire absent **et** `LLAMA_SERVER_MIN_BUILD=0` → simple
+  avertissement, démarrage poursuivi ;
 - `LLAMA_SERVER_MIN_BUILD=0` (défaut) → aucun enforcement.
 
 > Le durcissement inclut aussi l'absence délibérée du flag `--context-shift`
@@ -2085,10 +2238,86 @@ La `location /v1/` est scindée :
 > dérivée du `load_timeout_seconds` maximal du registre, voir l'en-tête de
 > `gateway/deploy/nginx.conf`).
 
+### Journal d'accès rédigé — aucun nom d'utilisateur en clair (SEC-016)
+
+**Le problème.** La règle du projet est catégorique : ne jamais journaliser un
+`username`, un email ou le champ libre `notes`. L'anonymisation RGPD
+(`DELETE /admin/users/{username}`, §DEC-001) est vide de sens si un journal en
+garde copie. Le filtre posé sur `uvicorn.access` couvre la gateway, mais **nginx
+est devant et tient son propre journal** : son format `combined` par défaut écrit
+`$request`, c'est-à-dire la ligne de requête brute — méthode, URI complète *et*
+query string. Deux appels d'administration parfaitement normaux écrivaient donc
+le nom en clair dans `/var/log/nginx/access.log` :
+
+```
+10.1.2.3 - - [03/Aug/2026:11:22:33 +0200] "GET /admin/users/Jean-Dupont HTTP/1.1" 200 412 "-" "curl/8.4.0"
+10.1.2.3 - - [03/Aug/2026:11:22:34 +0200] "GET /admin/usage?username=Jean-Dupont HTTP/1.1" 200 8104 "-" "curl/8.4.0"
+```
+
+**La réponse.** *Pas* `access_log off` : couper le journal fermerait la fuite et
+rendrait tout diagnostic d'incident impossible. `nginx.conf` remplace `$request`
+par une reconstruction rédigée, via deux `map` et un `log_format eva_redacted` :
+
+```
+10.1.2.3 [03/Aug/2026:11:22:33 +0200] "GET /admin/users/<redacted> HTTP/1.1" 200 412 0.042 "curl/8.4.0"
+10.1.2.3 [03/Aug/2026:11:22:34 +0200] "GET /admin/usage?<redacted> HTTP/1.1" 200 8104 0.310 "curl/8.4.0"
+```
+
+Ce qui **reste** : adresse cliente, horodatage, méthode, forme de la route,
+protocole, statut, volume, durée (`$request_time`, absent de `combined` et
+précieux sur une passerelle d'inférence), user-agent. Ce qui **disparaît** :
+le seul segment de chemin et les seules valeurs de paramètres susceptibles de
+porter un nom.
+
+| Élément | Règle |
+|---------|-------|
+| Chemin | `map $uri $eva_log_path` — `/admin/users/<nom>` et `/admin/users/<nom>/keys` deviennent `/admin/users/<redacted>[/keys]`. Dérivé de `$uri` (pourcent-décodé), donc `/admin/users/%4Aean` est rédigé lui aussi. |
+| Query string | `map $args $eva_log_args` — **liste d'autorisation** : `from_date`, `to_date`, `limit`, `force`, `period` restent lisibles, **tout le reste est rédigé**, y compris un paramètre ajouté demain. |
+| Corps | Jamais journalisé. `$request_body` ne doit pas être ajouté : `email` et `notes` y transitent. |
+| `$http_referer`, `$remote_user` | Retirés de `combined` : le premier peut recopier l'URI d'une page admin, le second serait un identifiant si un `auth_basic` était ajouté. |
+
+La liste d'autorisation est **la même** que celle du filtre uvicorn
+(`_LOGGABLE_QUERY_PARAMS` dans `gateway/main.py`, SEC-010) — une seule politique,
+pas deux. Une seule divergence, assumée et toujours dans le sens conservateur :
+nginx ne sait pas itérer sur les paramètres dans un `map`, il décide donc sur la
+query string **entière**. Sur `?username=X&limit=50`, uvicorn journalise
+`username=<redacted>&limit=50`, nginx journalise `<redacted>` — nginx en dit
+moins, jamais plus. Si vous modifiez la liste d'un côté, modifiez l'autre :
+`gateway/tests/test_nginx_access_log_redaction.py` compare les deux et rougit
+sinon.
+
+**Fichier dédié.** Le journal part dans `/var/log/nginx/llm-gateway-access.log`
+et non dans `access.log`, pour ne pas mélanger deux formats dans un même fichier.
+Aucune configuration de rotation à ajouter : le logrotate nginx de Debian/Ubuntu
+porte sur `/var/log/nginx/*.log`. Les `access_log off` de `/health` et `/ready`
+sont **conservés** (sondes appelées en boucle).
+
+**Journal d'erreur.** nginx n'a pas d'équivalent de `log_format` pour son journal
+d'erreur : le format est figé dans le code et chaque ligne de niveau `error`
+traîne un contexte `request: "GET /admin/users/<nom> HTTP/1.1"` — l'URI brute,
+hors de portée des `map`. La seule parade native est le seuil : `location /admin/`
+porte `error_log /var/log/nginx/error.log crit;`. Conséquence à connaître —
+sur `/admin/` uniquement, trois messages disparaissent du journal d'erreur :
+`access forbidden by rule` (le filtrage IP campus), `upstream timed out` et
+`connect() failed`. Les événements correspondants restent visibles dans le
+journal d'accès rédigé sous leur statut (403, 502, 504), avec l'adresse cliente
+et la durée ; seul le commentaire de nginx est perdu. Les routes `/v1/*` gardent
+un journal d'erreur complet : leurs URI sont fixes et ne portent aucune donnée
+personnelle, et c'est là que se diagnostiquent les incidents d'inférence.
+
 Recharger après modification :
 
 ```bash
 sudo nginx -t && sudo nginx -s reload
+```
+
+Vérification manuelle de la rédaction, après reload :
+
+```bash
+curl -sk -H "X-Admin-Secret: $ADMIN_SECRET" \
+     "https://llm.eva.univ-pau.fr/admin/usage?username=CANARI-Prenom-Nom" >/dev/null
+sudo grep -c 'CANARI' /var/log/nginx/llm-gateway-access.log   # doit afficher 0
+sudo tail -1 /var/log/nginx/llm-gateway-access.log            # doit montrer « ?<redacted> »
 ```
 
 ---
@@ -2144,7 +2373,7 @@ consolide les réglages **récemment ajoutés** ; les paramètres historiques
 
 | Variable | Défaut | Rôle |
 |----------|--------|------|
-| `LLAMA_SERVER_MIN_BUILD` | `0` | Build minimal accepté du binaire `llama-server`. `0` = aucun enforcement. Si `> 0` et build lu strictement inférieur → **démarrage refusé** ; version illisible → simple avertissement (non fatal). À fixer sur le premier build patché (cf. [section 11](#11-mise-à-jour)). |
+| `LLAMA_SERVER_MIN_BUILD` | `0` | Build minimal accepté du binaire `llama-server`. `0` = aucun enforcement. Si `> 0` et build lu strictement inférieur → **démarrage refusé** ; si `> 0` et version illisible → **démarrage refusé** aussi (fail-closed, SEC-009). Version illisible avec `0` → simple avertissement. À fixer sur le premier build patché (cf. [section 11](#11-mise-à-jour)). |
 
 > Le champ `sha256` par modèle (intégrité GGUF) se configure dans `models.yaml`,
 > pas ici — voir [section 6](#6-registre-des-modèles-modelsyaml).

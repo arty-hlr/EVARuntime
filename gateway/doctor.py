@@ -164,6 +164,23 @@ _TLS_EXPIRY_WARN_DAYS = 30
 # Un GGUF plus petit que cela est un téléchargement interrompu, pas un modèle.
 _MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
 
+# Renonciation GPU explicite (OPS-012). `gateway/deploy/install.sh --allow-no-gpu`
+# écrit cette clé dans le fichier d'environnement; c'est la MÊME constante que
+# `GPU_WAIVER_ENV_KEY` dans `deploy/gpu-preflight-lib.sh`.
+#
+# La clé est lue dans le fichier d'environnement BRUT, pas dans `Settings` : ce
+# n'est pas un réglage de la gateway (aucun code de service ne la consulte), mais
+# la trace d'une décision d'installation. `Settings` la laisse passer sans bruit
+# grâce à `extra="ignore"`.
+GPU_WAIVER_ENV_KEY = "ALLOW_NO_GPU"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def gpu_waiver_declared(env_values: dict[str, str]) -> bool:
+    """True si l'opérateur a assumé l'absence de GPU à l'installation."""
+    return env_values.get(GPU_WAIVER_ENV_KEY, "").strip().lower() in _TRUTHY
+
 
 # ── Options et rapport ────────────────────────────────────────────────────────
 
@@ -991,6 +1008,8 @@ def check_gpu_inventory(
     config: Any,
     gpus: list[GpuInfo] | None,
     reason: str,
+    *,
+    waived: bool = False,
 ) -> CheckResult:
     """
     GPU, driver et compute capability détectés.
@@ -1001,6 +1020,25 @@ def check_gpu_inventory(
       hôte CPU-only ou un conteneur de développement doit rester diagnosticable
       → `warn` non bloquant. Le contrôle qui bloque vraiment est `vram_detected`
       quand la VRAM configurée dépasse la VRAM réelle.
+
+    Renonciation explicite (OPS-012)
+    --------------------------------
+    « Pas de GPU, assumé » et « GPU attendu mais absent » ne sont pas le même
+    diagnostic et ne rendent pas le même verdict :
+
+    | Situation                              | Statut | Code                     |
+    |----------------------------------------|--------|--------------------------|
+    | GPU absent, `ALLOW_NO_GPU` non déclaré  | `warn` | `nvidia_smi_unavailable` |
+    | GPU absent, `ALLOW_NO_GPU=true`         | `skip` | `gpu_absence_declared`   |
+    | GPU présent, `ALLOW_NO_GPU=true`        | `warn` | `gpu_waiver_stale`       |
+
+    Le `skip` est délibéré : un hôte installé exprès sans GPU ne doit pas rendre
+    doctor jaune à chaque exécution — un avertissement permanent qu'on apprend à
+    ignorer ne protège plus de rien, c'est exactement ce qui a discrédité le
+    préflight. Il reste VISIBLE dans le rapport, avec un code distinct : le
+    diagnostic dit « décision », pas « panne ». À l'inverse, une renonciation
+    devenue fausse (GPU présent) est signalée, pour qu'elle ne survive pas à
+    l'hôte qui l'a justifiée.
     """
     if str(getattr(config, "cluster_mode", "local")) == "cluster":
         return CheckResult(
@@ -1009,19 +1047,38 @@ def check_gpu_inventory(
             "matériel est celui des nœuds (heartbeat node-agent).",
             critical=False,
         )
-    if gpus is None:
-        return CheckResult(
-            "gpu_inventory", "warn", "nvidia_smi_unavailable",
-            f"Sonde GPU impossible : {reason}. En mode local, install.sh exige "
-            "nvidia-smi — vérifiez le pilote NVIDIA et le PATH du service. Sur "
-            "un hôte sans GPU, aucun modèle ne pourra être offloadé.",
-            critical=False,
+    if gpus is None or not gpus:
+        detail = (
+            f"Sonde GPU impossible : {reason}."
+            if gpus is None else
+            "nvidia-smi répond mais ne rapporte aucun GPU."
         )
-    if not gpus:
+        if waived:
+            return CheckResult(
+                "gpu_inventory", "skip", "gpu_absence_declared",
+                f"{detail} Absence de GPU ASSUMÉE à l'installation "
+                f"({GPU_WAIVER_ENV_KEY}=true, posé par « install.sh "
+                f"--allow-no-gpu ») : ce n'est pas une panne. Aucun modèle n'est "
+                f"offloadé, la génération se fait sur CPU. Retirez "
+                f"{GPU_WAIVER_ENV_KEY} du fichier d'environnement dès qu'un GPU "
+                f"est en place, pour que ce contrôle redevienne diagnostique.",
+                critical=False,
+            )
+        if gpus is None:
+            return CheckResult(
+                "gpu_inventory", "warn", "nvidia_smi_unavailable",
+                f"{detail} En mode local, install.sh exige nvidia-smi — vérifiez "
+                "le pilote NVIDIA et le PATH du service. Sur un hôte sans GPU, "
+                "aucun modèle ne pourra être offloadé ; si c'est délibéré, "
+                "réinstallez avec « install.sh --mode local --allow-no-gpu » "
+                f"pour que ce choix soit tracé ({GPU_WAIVER_ENV_KEY}) au lieu "
+                "d'être confondu avec une panne de pilote.",
+                critical=False,
+            )
         return CheckResult(
             "gpu_inventory", "warn", "no_gpu_detected",
-            "nvidia-smi répond mais ne rapporte aucun GPU : pilote chargé sans "
-            "carte visible (conteneur sans --gpus, ou GPU en erreur).",
+            f"{detail} Pilote chargé sans carte visible (conteneur sans --gpus, "
+            "ou GPU en erreur).",
             critical=False,
         )
 
@@ -1030,6 +1087,16 @@ def check_gpu_inventory(
         f"driver {g.driver_version}, compute {g.compute_capability}"
         for g in gpus
     )
+    if waived:
+        return CheckResult(
+            "gpu_inventory", "warn", "gpu_waiver_stale",
+            f"{len(gpus)} GPU détecté(s) — {described}. Or "
+            f"{GPU_WAIVER_ENV_KEY}=true déclare cet hôte sans GPU : la "
+            "renonciation a survécu au matériel qui la justifiait. Retirez-la du "
+            "fichier d'environnement, sinon une future panne de pilote sera "
+            "diagnostiquée comme une décision.",
+            critical=False,
+        )
     return CheckResult(
         "gpu_inventory", "pass", "ok",
         f"{len(gpus)} GPU détecté(s) — {described}.",
@@ -2274,7 +2341,8 @@ async def run_doctor(options: DoctorOptions | None = None) -> DoctorReport:
         except Exception as exc:  # pragma: no cover - probe_nvidia_smi attrape tout
             gpus, gpu_reason = None, type(exc).__name__
     checks["gpu_inventory"] = _safe1(
-        check_gpu_inventory, "gpu_inventory", config, gpus, gpu_reason
+        check_gpu_inventory, "gpu_inventory", config, gpus, gpu_reason,
+        waived=gpu_waiver_declared(env_values),
     )
     checks["vram_detected"] = _safe1(check_vram_detected, "vram_detected", config, gpus)
 

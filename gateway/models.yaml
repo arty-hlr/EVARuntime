@@ -4,6 +4,12 @@
 # Il est lu au démarrage de la gateway et peut être modifié via l'API admin.
 # Les modifications via l'API sont persistées automatiquement.
 #
+# CES COMMENTAIRES SURVIVENT AUX MUTATIONS ADMIN (COR-020) : la persistance
+# retouche le texte du fichier, elle ne le resérialise pas. Une sauvegarde
+# `models.yaml.pre-admin.<horodatage>.bak` est produite avant chaque écriture
+# (5 conservées). Si la mise en page empêche une retouche sûre, l'API refuse en
+# HTTP 422 sans rien écrire. Détails : docs/admin.md.
+#
 # Champs obligatoires :
 #   id       : identifiant unique (minuscules, chiffres, tirets, points, underscores)
 #   path     : chemin absolu vers le fichier .gguf
