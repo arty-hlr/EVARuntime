@@ -1361,3 +1361,181 @@ def test_les_options_de_politique_exigent_un_epinglage(tmp_path):
         resultat = _invoke(tmp_path, option)
         assert resultat.exit_code == sc.EXIT_USAGE, option
         assert "--pin-version" in _sans_ansi(resultat.output)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COR-027 — chaque modèle est estimé avec SES réglages
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `_inspect_local` calculait l'estimation de TOUS les GGUF avec
+# `retained[0].entry.runtime.defaults`. Avec `--max-models 2`, le second modèle
+# héritait du `ctx_size`, du `parallel` et des types de cache KV du premier. Le
+# cache KV domine l'estimation et croît avec le produit ctx × parallel : l'écart
+# n'est pas cosmétique, et il va dans le sens dangereux quand le premier modèle
+# est le plus modeste.
+
+_PETIT = "modele-cor-027-petit"
+_GRAND = "modele-cor-027-grand"
+
+
+def _gguf_dimensionne(taille: int, *, arch: str = "qwen2") -> bytes:
+    """
+    GGUF lisible portant les champs d'architecture dont dépend le cache KV.
+
+    `_gguf()` ne déclare que `general.architecture` : `block_count`,
+    `embedding_length` et le compte de têtes manquent, et `kv_cache_bytes` reste
+    alors `None`. Or c'est précisément ce poste que COR-027 fausse — sans ces
+    champs, le test observerait deux estimations vides et ne prouverait rien.
+    """
+    def _u32(valeur: int) -> bytes:
+        return struct.pack("<I", valeur)
+
+    def _kv_str(cle: str, valeur: str) -> bytes:
+        c, v = cle.encode(), valeur.encode()
+        return (struct.pack("<Q", len(c)) + c + _u32(gguf_meta._T_STRING)
+                + struct.pack("<Q", len(v)) + v)
+
+    def _kv_u32(cle: str, valeur: int) -> bytes:
+        c = cle.encode()
+        return struct.pack("<Q", len(c)) + c + _u32(gguf_meta._T_UINT32) + _u32(valeur)
+
+    kvs = [
+        _kv_str("general.architecture", arch),
+        _kv_u32(f"{arch}.block_count", 24),
+        _kv_u32(f"{arch}.embedding_length", 896),
+        _kv_u32(f"{arch}.attention.head_count", 14),
+        _kv_u32(f"{arch}.attention.head_count_kv", 2),
+    ]
+    tete = (
+        b"GGUF" + _u32(3) + struct.pack("<Q", 0) + struct.pack("<Q", len(kvs))
+        + b"".join(kvs)
+    )
+    assert taille >= len(tete)
+    return tete + b"\0" * (taille - len(tete))
+
+
+_PETIT_OCTETS = _gguf_dimensionne(8192)
+_GRAND_OCTETS = _gguf_dimensionne(6144)
+
+
+def _catalogue_deux_modeles(tmp_path):
+    """
+    Deux modèles aux `runtime.defaults` FRANCHEMENT différents.
+
+    Sans cet écart, le test ne verrait rien : c'est le produit ctx × parallel qui
+    porte le cache KV, et deux modèles aux réglages voisins produiraient deux
+    estimations voisines que le défaut n'aurait pas distinguées.
+    """
+    import yaml
+
+    def modele(identifiant: str, fichier: str, octets: bytes, defaults: dict) -> dict:
+        return {
+            "id": identifiant,
+            "family": "test",
+            "display_name": f"Modèle {identifiant}",
+            "description": "Entrée fabriquée pour la régression COR-027.",
+            "use_cases": ["smoke_test"],
+            "source": {
+                "provider": "huggingface",
+                "repo_id": f"organisation/{identifiant}",
+                "repo_url": f"https://huggingface.co/organisation/{identifiant}",
+                "revision": ARTEFACT_REVISION,
+                "revision_recorded_on": "2026-08-03",
+                "files": [{
+                    "name": fichier, "role": "weights",
+                    "sha256": hashlib.sha256(octets).hexdigest(),
+                    "size_bytes": len(octets),
+                }],
+            },
+            "license": {
+                "base_model": {"id": "apache-2.0"},
+                "fine_tune": {"id": "apache-2.0"},
+                "usage_terms": None, "gated": False,
+                "redistribution_allowed": True,
+                "operator_acceptance_required": False, "notes": None,
+            },
+            "runtime": {
+                "min_llama_build": 0,
+                "capabilities": ["text_generation"],
+                "requires_mmproj": False,
+                "defaults": defaults,
+            },
+            "resources": {
+                "disk_gb": 1.0, "initial_vram_gb": 1.0, "initial_ram_gb": 1.0,
+                "estimation_basis": "gguf_header",
+            },
+        }
+
+    document = {
+        "catalog_version": 1,
+        "downloader": {"name": "eva-bootstrap downloader", "license_id": "agpl-3.0"},
+        "models": [
+            modele(_PETIT, f"{_PETIT}.gguf", _PETIT_OCTETS, {
+                "ctx_size": 2048, "parallel": 1,
+                "cache_type_k": "q8_0", "cache_type_v": "q8_0",
+            }),
+            modele(_GRAND, f"{_GRAND}.gguf", _GRAND_OCTETS, {
+                "ctx_size": 32768, "parallel": 8,
+                "cache_type_k": "f16", "cache_type_v": "f16",
+            }),
+        ],
+    }
+    cible = tmp_path / "catalogue-cor-027.yaml"
+    cible.write_text(yaml.safe_dump(document, allow_unicode=True), encoding="utf-8")
+    return cible
+
+
+def _estimations_par_modele(tmp_path):
+    """
+    Rend l'inspection locale rattachée à CHACUN des deux modèles retenus.
+
+    On lit `retained[].local_inspection`, c'est-à-dire l'association
+    modèle → estimation telle que le plan la publie, et non la liste à plat :
+    c'est cette association que le défaut faussait.
+    """
+    catalogue = _catalogue_deux_modeles(tmp_path)
+    options = _options(tmp_path, catalog_path=catalogue, max_models=2)
+    (options.models_dir / f"{_PETIT}.gguf").write_bytes(_PETIT_OCTETS)
+    (options.models_dir / f"{_GRAND}.gguf").write_bytes(_GRAND_OCTETS)
+
+    plan = _plan(options)
+    section = next(s for s in plan.sections if s.name == sc.SECTION_MODELS)
+    par_id = {r["id"]: r["local_inspection"] for r in section.data["retained"]}
+
+    # Contrôle positif : les deux modèles ont bien été retenus ET inspectés.
+    assert set(par_id) == {_PETIT, _GRAND}, par_id
+    assert all(v is not None for v in par_id.values()), par_id
+    return par_id[_PETIT], par_id[_GRAND]
+
+
+def test_chaque_modele_est_estime_avec_ses_propres_reglages(tmp_path):
+    """
+    Les deux entrées d'inspection doivent porter LEURS paramètres, pas ceux du
+    premier modèle retenu.
+    """
+    petit, grand = _estimations_par_modele(tmp_path)
+
+    assert petit["readable"] is True and grand["readable"] is True
+    assert petit["estimate"]["ctx_size"] == 2048
+    assert petit["estimate"]["parallel"] == 1
+    assert grand["estimate"]["ctx_size"] == 32768
+    assert grand["estimate"]["parallel"] == 8
+
+
+def test_l_empreinte_estimee_differe_reellement_entre_les_deux_modeles(tmp_path):
+    """
+    Le contrôle qui compte : les paramètres ne sont pas seulement recopiés dans
+    le rendu, ils entrent bien dans le CALCUL.
+
+    Vérifier `ctx_size` seul laisserait passer une régression où le champ serait
+    correct et l'estimation calculée avec l'autre jeu de réglages.
+    """
+    petit, grand = _estimations_par_modele(tmp_path)
+
+    kv_petit = petit["estimate"]["kv_cache_bytes"]
+    kv_grand = grand["estimate"]["kv_cache_bytes"]
+
+    assert kv_grand > kv_petit, (kv_petit, kv_grand)
+    # 32768×8 contre 2048×1, et f16 contre q8_0 : l'écart se compte en ordres de
+    # grandeur, pas en pourcents. Sous le défaut, les deux valaient le même chiffre.
+    assert kv_grand >= kv_petit * 100

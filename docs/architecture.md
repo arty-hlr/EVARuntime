@@ -370,6 +370,14 @@ registre. `calibrate_model` est l'étape qui remplace l'estimation par des pics
 observés et **propose** un `vram_gb` sans l'appliquer silencieusement ; tant
 qu'elle n'a pas eu lieu, l'entrée reste `enabled: false`.
 
+Les « paramètres » de cette chaîne sont ceux du modèle inspecté, et de lui seul :
+`ctx_size`, `parallel` et les types de cache KV viennent des `runtime.defaults` de
+**son** entrée de catalogue (COR-027). Le poste dominant de l'estimation est le
+cache KV, proportionnel au produit `ctx_size × parallel` : appliquer à un modèle
+les réglages d'un autre — ce que faisait le planificateur au-delà du premier
+modèle retenu — produit un chiffre faux de plusieurs ordres de grandeur, et faux
+dans le sens de la sous-estimation quand le premier modèle est le plus modeste.
+
 ### LLMfit : conseiller, jamais autorité
 
 La règle d'activation, littéralement :

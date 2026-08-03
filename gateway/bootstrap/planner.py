@@ -733,21 +733,50 @@ def _inspect_local(
     `inspect_paths` rend alors `skip`. Quand un fichier est déjà là (réinstallation,
     hôte de test), son header vaut mieux que l'estimation déclarée du catalogue :
     il vient du fichier réel.
+
+    COR-027 — chaque modèle est estimé avec SES réglages
+    ----------------------------------------------------
+    L'estimation d'empreinte dépend du `ctx_size`, du `parallel` et des types de
+    cache KV : c'est le cache KV qui domine le calcul, et il est proportionnel au
+    produit des deux premiers. Ce module employait `retained[0].entry.runtime.defaults`
+    pour **tous** les GGUF inspectés : avec `--max-models 2`, le second modèle
+    était estimé avec les réglages du premier. Deux modèles aux `defaults`
+    différents produisaient donc un chiffre faux pour le second, et faux dans une
+    direction imprévisible — sous-estimé si le premier est plus modeste, ce qui
+    est le sens dangereux.
+
+    Chaque modèle est donc inspecté avec ses propres entrées, et les résultats
+    sont concaténés dans l'ordre des chemins.
+
+    Le statut, le résumé et les constats, eux, ne dépendent **que** de la
+    lisibilité des fichiers — jamais des réglages. Ils sont donc calculés une
+    seule fois, sur l'ensemble, par `gguf_meta` lui-même : redériver sa grille
+    ici en créerait une seconde définition, et c'est toujours celle qu'on oublie
+    de mettre à jour qui finit par mentir.
     """
     if not retained:
         return None
-    paths = [
+
+    entries: list[dict[str, Any]] = []
+    for choice in retained:
+        defaults = choice.entry.runtime.defaults
+        part = gguf_meta.inspect_paths(
+            [options.models_dir / file.name for file in choice.entry.files],
+            gguf_meta.EstimationInputs(
+                ctx_size=defaults.ctx_size,
+                parallel=defaults.parallel,
+                cache_type_k=defaults.cache_type_k,
+                cache_type_v=defaults.cache_type_v,
+            ),
+        )
+        entries.extend(part.entries)
+
+    ensemble = gguf_meta.inspect_paths([
         options.models_dir / file.name
         for choice in retained
         for file in choice.entry.files
-    ]
-    defaults = retained[0].entry.runtime.defaults
-    return gguf_meta.inspect_paths(paths, gguf_meta.EstimationInputs(
-        ctx_size=defaults.ctx_size,
-        parallel=defaults.parallel,
-        cache_type_k=defaults.cache_type_k,
-        cache_type_v=defaults.cache_type_v,
-    ))
+    ])
+    return replace(ensemble, entries=tuple(entries))
 
 
 def _inspection_for(
