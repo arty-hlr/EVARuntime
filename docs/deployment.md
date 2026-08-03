@@ -379,6 +379,40 @@ sudo bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode cluster
 `--cluster` reste accepté comme alias de compatibilité. `--dry-run` ne requiert
 pas root et n'exécute ni écriture, ni `pip`, ni `git`, ni `systemctl`.
 
+#### Installer en mode local sur un hôte sans GPU — `--allow-no-gpu`
+
+En mode local, le préflight exige `nvidia-smi` et **refuse** l'installation s'il
+est absent. Ce refus est délibéré : un gateway local sans GPU ne peut rien
+offloader. Il existe pourtant des cas légitimes — banc CPU, recette de bout en
+bout, maquette d'intégration — et le contournement pratiqué jusqu'ici consistait
+à éditer le script, ce qui ne laissait **aucune trace** : ni dans la
+configuration, ni dans le diagnostic.
+
+```bash
+# Refusé : l'hôte n'a pas de GPU et rien ne l'assume
+sudo bash install.sh --mode local
+# → le message liste les trois conduites à tenir possibles
+
+# Accepté : l'absence de GPU est ASSUMÉE, et tracée
+sudo bash install.sh --mode local --allow-no-gpu
+```
+
+L'option écrit `ALLOW_NO_GPU=true` dans `/etc/llm-gateway/env`. Conséquences :
+
+- `evaruntime doctor` rapporte `gpu_inventory` en **`skip` / `gpu_absence_declared`**
+  — « pas de GPU, par décision » — au lieu de **`warn` / `nvidia_smi_unavailable`**
+  — « GPU attendu mais absent ». Deux diagnostics distincts, deux verdicts
+  distincts : le premier ne colore pas le rapport, le second reste un signal ;
+- si un GPU apparaît plus tard alors que la clé est encore là, doctor le signale
+  en `warn` / `gpu_waiver_stale` : une renonciation ne doit pas survivre au
+  matériel qui la justifiait. Retirez la clé, ou relancez `install.sh` sans
+  l'option — l'installateur remet `ALLOW_NO_GPU=false` dès qu'il détecte un GPU ;
+- rien d'autre ne change : aucun offload GPU, `TOTAL_VRAM_GB` et les attentes de
+  latence sont à adapter à la main.
+
+En mode cluster, l'option est sans objet — l'orchestrateur n'a jamais de GPU
+local — et le script le dit.
+
 Le script effectue automatiquement :
 
 1. Création de l'utilisateur système `llmservice` (sans shell, sans home)
