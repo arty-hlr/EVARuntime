@@ -28,6 +28,7 @@ from bootstrap import llmfit as llmfit_mod
 from bootstrap import planner
 from bootstrap import runtime_resolver as runtime_mod
 from bootstrap import schema as sc
+from llama_version import LlamaVersion
 
 GENERATED_AT = "2026-07-31T12:00:00Z"
 GIB = 1024 ** 3
@@ -1073,3 +1074,118 @@ def test_cli_n_expose_aucun_secret(tmp_path, monkeypatch):
     assert "hf_zzzzzzzzzzzzzzzzzzzzzzzz" not in texte
     # Contrôle positif : la sortie n'est pas vide, le test voit bien quelque chose.
     assert "PLAN DE BOOTSTRAP" in texte
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEC-017 — le manifeste du binaire en place est réellement relu et recoupé
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# SEC-009 recoupait le manifeste contre le binaire — version, commit, backend,
+# empreinte — mais `_resolve_runtime` ne passait que `existing_binary` :
+# `existing_manifest` valait toujours `None`, et le recoupement n'avait donc
+# jamais lieu sur le parcours de l'opérateur. Ces tests exercent la chaîne
+# complète, depuis le fichier posé sur disque jusqu'au constat du plan.
+
+_COMMIT_POSE = "0123456789abcdef0123456789abcdef01234567"
+_SHA_BINAIRE = "d" * 64
+
+
+def _binaire_avec_manifeste(tmp_path, document=None, *, sans_manifeste=False):
+    """Pose un faux `llama-server` et, sauf demande contraire, son manifeste §6."""
+    bin_dir = tmp_path / "opt" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    binaire = bin_dir / "llama-server"
+    binaire.write_bytes(b"#!/bin/false\n")
+    if sans_manifeste:
+        return binaire
+
+    if document is None:
+        document = runtime_mod.ProvenanceManifest(
+            version="b6750", commit=_COMMIT_POSE, source=runtime_mod.SOURCE_LOCAL_BUILD,
+            backend="cuda12", platform="linux-x86_64", installed_at=GENERATED_AT,
+            build_options={"GGML_CUDA": True},
+        ).to_document()
+        document["install"] = {"binary_sha256": _SHA_BINAIRE}
+    if isinstance(document, str):
+        runtime_mod.provenance_path(binaire).write_text(document, encoding="utf-8")
+    else:
+        runtime_mod.provenance_path(binaire).write_text(
+            json.dumps(document), encoding="utf-8",  # JSON est un sous-ensemble de YAML
+        )
+    return binaire
+
+
+def _sonder(monkeypatch, *, build=6750, commit="0123456", empreinte=_SHA_BINAIRE):
+    """Sonde `--version` et empreinte injectées : aucun sous-processus ici non plus."""
+    async def probe(_binaire):
+        return LlamaVersion(build=build, raw=f"version: {build} ({commit})", commit=commit)
+
+    async def digest(_binaire):
+        return empreinte
+
+    monkeypatch.setattr(runtime_mod, "probe_llama_version", probe)
+    monkeypatch.setattr(runtime_mod, "sha256_binary", digest)
+
+
+def _section_runtime(plan):
+    return next(s for s in plan.sections if s.name == sc.SECTION_RUNTIME)
+
+
+def test_un_binaire_atteste_est_conserve_par_le_planificateur(tmp_path, monkeypatch):
+    """
+    Contrôle positif de la famille : manifeste cohérent, version, commit, backend
+    et empreinte concordants — le binaire est conservé.
+
+    Ce test ne peut passer QUE si le planificateur a effectivement lu le manifeste
+    sur disque : sans lecture, `existing_manifest` reste `None` et un hôte GPU
+    fait remplacer le binaire faute de provenance.
+    """
+    _sonder(monkeypatch)
+    binaire = _binaire_avec_manifeste(tmp_path)
+    plan = _plan(_options(tmp_path, existing_binary=binaire))
+
+    section = _section_runtime(plan)
+    assert section.data["reuse_existing"] is True
+    assert section.data["observed_build"] == 6750
+
+
+def test_un_manifeste_qui_ne_decrit_pas_ce_binaire_fait_remplacer(tmp_path, monkeypatch):
+    """
+    Le recoupement a lieu POUR DE VRAI : l'empreinte consignée ne correspond plus
+    au binaire, tout le reste concorde, et la réutilisation est refusée.
+
+    C'est la mutation qui prouve que SEC-009 n'est plus dormant.
+    """
+    _sonder(monkeypatch, empreinte="f" * 64)
+    binaire = _binaire_avec_manifeste(tmp_path)
+    plan = _plan(_options(tmp_path, existing_binary=binaire))
+
+    section = _section_runtime(plan)
+    assert section.data["reuse_existing"] is False
+    assert "runtime_binary_tampered" in {f.code for f in section.findings}
+
+
+@pytest.mark.parametrize("fabrique, code", [
+    (lambda: None, "runtime_manifest_absent"),
+    (lambda: "runtime: [pas du yaml\n  valide: du tout\n", "runtime_manifest_unreadable"),
+    (lambda: {"runtime": {"version": "pas-un-tag"}}, "runtime_manifest_invalid"),
+])
+def test_un_manifeste_absent_illisible_ou_incoherent_porte_son_constat(
+    tmp_path, monkeypatch, fabrique, code,
+):
+    """
+    Les trois issues dégradées produisent un CONSTAT NOMMÉ dans le plan — jamais
+    un plantage, jamais un silence — et aucune ne vaut attestation.
+    """
+    _sonder(monkeypatch)
+    document = fabrique()
+    binaire = _binaire_avec_manifeste(
+        tmp_path, document, sans_manifeste=document is None,
+    )
+    plan = _plan(_options(tmp_path, existing_binary=binaire))
+
+    section = _section_runtime(plan)
+    codes = {f.code for f in section.findings}
+    assert code in codes, codes
+    # Fail-closed : sur un hôte GPU, aucune de ces trois issues ne conserve le binaire.
+    assert section.data["reuse_existing"] is False

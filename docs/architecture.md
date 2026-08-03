@@ -829,6 +829,25 @@ Mo ne prouverait rien.
 Quand `--version` ne rend pas de commit, ce recoupement-là est simplement omis :
 on ne peut pas le faire, on ne l'invente pas. Les autres restent.
 
+##### D'où vient le manifeste confronté (SEC-017)
+
+Ces six confrontations n'ont de valeur que si un manifeste leur est réellement
+fourni. Elles ne l'étaient pas : `planner._resolve_runtime` ne passait au
+résolveur que le chemin du binaire, jamais son manifeste, et le recoupement
+n'avait donc lieu que dans les tests. Le planificateur relit désormais le
+`provenance.yaml` que `runtime_installer` pose **à côté du binaire**, et en tire
+trois issues dégradées, chacune portant son constat dans le plan :
+
+| Constat | Cause | Conséquence |
+|---|---|---|
+| `runtime_manifest_absent` (`info`) | aucun fichier au chemin attendu — cas nominal d'un binaire compilé à la main | pas d'attestation ; le constat dit **où** le manifeste était attendu |
+| `runtime_manifest_unreadable` (`warn`) | droits insuffisants, fichier tronqué, YAML invalide | pas d'attestation |
+| `runtime_manifest_invalid` (`warn`) | relu, mais refusé par les règles de §6 | pas d'attestation |
+
+Fail-closed dans les trois cas : **l'absence de manifeste ne vaut jamais
+attestation**. Un manifeste approximatif vaut d'ailleurs moins que pas de
+manifeste, précisément parce qu'on lui fait confiance.
+
 #### Aucun invariant de production porté par un `assert` (COR-021)
 
 `python -O` retire toutes les instructions `assert` du bytecode, et rien

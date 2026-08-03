@@ -458,6 +458,125 @@ def attested_binary_sha256(document: Any) -> str | None:
     return None
 
 
+# Nom du manifeste §6, posé À CÔTÉ du binaire par `runtime_installer` (AUT-016).
+#
+# SEC-017 — pourquoi ce nom vit ici et non seulement chez l'installateur : c'est
+# le résolveur qui DÉFINIT le manifeste (`ProvenanceManifest`, sa validation, son
+# empreinte de binaire). Le lire est donc une opération de décision, pas
+# d'exécution. Le sens de dépendance de `bootstrap/__init__.py` interdit au
+# résolveur d'importer `runtime_installer` — ce serait le décideur qui dépend de
+# l'exécuteur, et le garde-fou d'isolation (TST-007) le refuse. Un test recoupe
+# les deux constantes, de sorte qu'elles ne puissent pas diverger en silence.
+MANIFEST_FILENAME = "provenance.yaml"
+
+
+@dataclass(frozen=True)
+class ExistingAttestation:
+    """
+    Ce que le manifeste posé à côté d'un binaire permet — ou non — d'affirmer.
+
+    SEC-017 — fail-closed : `manifest` vaut `None` dès que le document est
+    absent, illisible ou incohérent. Une attestation partielle n'existe pas ; un
+    manifeste qu'on n'a pas su relire ne vaut pas mieux qu'aucun manifeste, et
+    `_judge_existing_binary` en tire alors le refus de réutilisation, pas une
+    réutilisation silencieuse.
+
+    `finding` est le **constat nommé** de ce qui a été trouvé sur disque : c'est
+    lui qui distingue « pas de manifeste » de « manifeste illisible » de
+    « manifeste incohérent », trois causes qui appellent trois gestes différents
+    et que le refus aval, à lui seul, confondrait.
+    """
+    manifest: ProvenanceManifest | None
+    binary_sha256: str | None
+    finding: schema.Finding | None
+
+
+def provenance_path(binary: Path) -> Path:
+    """Chemin du manifeste §6 attendu à côté d'un binaire `llama-server`."""
+    return binary.parent / MANIFEST_FILENAME
+
+
+def read_existing_attestation(binary: Path) -> ExistingAttestation:
+    """
+    Relit le manifeste posé à côté du binaire. Ne lève jamais.
+
+    SEC-017 — sans cette lecture, le recoupement manifeste ↔ binaire livré par
+    SEC-009 n'était exercé que par les tests : aucun appelant ne fournissait
+    jamais `existing_manifest`, et le parcours opérateur accordait donc
+    `reuse_existing` sans qu'aucune attestation soit confrontée à quoi que ce
+    soit. Le trou était réel, mais dormant.
+
+    Les quatre issues, toutes nommées, aucune fatale :
+
+    - **absent** — cas nominal sur un binaire compilé à la main. Constat `info`
+      qui dit **où** le manifeste était attendu ; le refus de réutilisation, lui,
+      vient de `_judge_existing_binary` (`runtime_provenance_unknown`) ;
+    - **illisible** — fichier absent de droits, tronqué, ou YAML invalide ;
+    - **incohérent** — relu, mais refusé par les règles de §6 ;
+    - **sain** — le manifeste et, s'il la porte, l'empreinte du binaire posé.
+
+    Dans les trois premiers cas `manifest` est `None` : l'absence de manifeste ne
+    vaut jamais attestation.
+    """
+    chemin = provenance_path(binary)
+
+    try:
+        texte = chemin.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_absent",
+            level="info",
+            message=(
+                f"Aucun manifeste de provenance §6 à côté de {binary} (attendu : {chemin}). "
+                "Le binaire en place ne peut donc pas être attesté. C'est le cas nominal "
+                "d'un binaire compilé à la main ; `runtime_installer` en écrit un à chaque "
+                "installation."
+            ),
+        ))
+    except OSError as exc:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_unreadable",
+            level="warn",
+            message=(
+                f"Le manifeste de provenance {chemin} existe mais n'a pas pu être lu "
+                f"({exc.__class__.__name__}). Un manifeste illisible ne vaut pas attestation : "
+                "le binaire en place sera traité comme dépourvu de provenance et remplacé. "
+                "Vérifiez ses droits de lecture."
+            ),
+        ))
+
+    try:
+        document = yaml.safe_load(texte)
+    except yaml.YAMLError as exc:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_unreadable",
+            level="warn",
+            message=(
+                f"Le manifeste de provenance {chemin} n'est pas un YAML valide "
+                f"({str(exc).splitlines()[0][:120]}). Il ne vaut pas attestation et le binaire "
+                "en place sera remplacé."
+            ),
+        ))
+
+    erreurs = validate_manifest_document(document)
+    if erreurs:
+        return ExistingAttestation(None, None, schema.Finding(
+            code="runtime_manifest_invalid",
+            level="warn",
+            message=(
+                f"Le manifeste de provenance {chemin} est incohérent : {' ; '.join(erreurs)}. "
+                "Un manifeste approximatif vaut moins que pas de manifeste, parce qu'on lui "
+                "fait confiance : il est écarté et le binaire sera remplacé."
+            ),
+        ))
+
+    return ExistingAttestation(
+        manifest=manifest_from_document(document),
+        binary_sha256=attested_binary_sha256(document),
+        finding=None,
+    )
+
+
 def manifest_from_document(document: Any) -> ProvenanceManifest:
     """Relit un manifeste YAML. Lève `ProvenanceError` s'il est incohérent."""
     errors = validate_manifest_document(document)

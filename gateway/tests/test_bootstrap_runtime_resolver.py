@@ -1354,3 +1354,113 @@ def test_parcours_sans_verify_et_runtime_non_verifie_reste_insatisfait(tmp_path)
     assert rapport_exec.exit_code() != ex.EXIT_OK
     assert rapport.exit_code() != ir.EXIT_OK
     assert rapport.verdict() == ir.VERDICT_FAILED
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEC-017 — relire le manifeste posé à côté du binaire
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# SEC-009 (volet b) a livré le recoupement manifeste ↔ binaire, mais AUCUN
+# appelant ne fournissait jamais `existing_manifest` : le chemin corrigé n'était
+# exercé que par les tests. Le trou était réel et dormant.
+# `read_existing_attestation` est la lecture qui manquait ; ses quatre issues
+# sont couvertes ici, et `test_bootstrap_planner.py` prouve qu'elle est empruntée.
+
+def _ecrire_manifeste(binaire: Path, document) -> Path:
+    chemin = rr.provenance_path(binaire)
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    chemin.write_text(
+        document if isinstance(document, str)
+        else yaml.safe_dump(document, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return chemin
+
+
+def _document_pose(**overrides) -> dict:
+    """Document tel que `runtime_installer` le pose : bloc §6 + bloc `install:`."""
+    document = posed_manifest().to_document()
+    document["install"] = {"installer": "eva-bootstrap", "binary_sha256": SHA_BINARY}
+    for cle, valeur in overrides.items():
+        document["runtime"][cle] = valeur
+    return document
+
+
+def test_le_nom_du_manifeste_ne_peut_pas_diverger_de_celui_de_l_installateur():
+    """
+    Le résolveur DÉFINIT le manifeste, l'installateur le POSE. Le nom vit donc
+    chez le décideur : le sens de dépendance de `bootstrap/__init__.py` interdit
+    l'inverse, et le garde-fou d'isolation (TST-007) le refuserait.
+
+    Deux constantes, une seule vérité : ce test est le lien qui les tient.
+    """
+    assert rr.MANIFEST_FILENAME == ri.MANIFEST_FILENAME == "provenance.yaml"
+    assert rr.provenance_path(Path("/opt/eva/bin/llama-server")) == Path(
+        "/opt/eva/bin/provenance.yaml"
+    )
+
+
+def test_un_manifeste_absent_est_un_constat_nomme_et_non_une_attestation(tmp_path):
+    """Fail-closed : l'absence de manifeste ne vaut jamais attestation."""
+    lu = rr.read_existing_attestation(tmp_path / "llama-server")
+
+    assert lu.manifest is None
+    assert lu.binary_sha256 is None
+    assert lu.finding is not None
+    assert lu.finding.code == "runtime_manifest_absent"
+    assert lu.finding.level == "info"
+    # Le constat dit OÙ le manifeste était attendu : sans ce chemin, l'opérateur
+    # ne sait pas où poser celui qui manque.
+    assert str(tmp_path / "provenance.yaml") in lu.finding.message
+
+
+def test_un_manifeste_illisible_est_un_constat_nomme(tmp_path):
+    binaire = tmp_path / "llama-server"
+    _ecrire_manifeste(binaire, "runtime: [ceci n'est pas\n  un: yaml valide\n")
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.manifest is None
+    assert lu.finding is not None and lu.finding.code == "runtime_manifest_unreadable"
+    assert lu.finding.level == "warn"
+
+
+def test_un_manifeste_incoherent_est_un_constat_nomme(tmp_path):
+    """Un manifeste approximatif vaut moins que pas de manifeste : on lui fait confiance."""
+    binaire = tmp_path / "llama-server"
+    _ecrire_manifeste(binaire, _document_pose(version="six-mille-huit-cents"))
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.manifest is None
+    assert lu.finding is not None and lu.finding.code == "runtime_manifest_invalid"
+    assert "version" in lu.finding.message
+
+
+def test_un_manifeste_sain_rend_le_manifeste_et_l_empreinte_du_binaire(tmp_path):
+    """Contrôle positif de la famille : le cas nominal produit bien une attestation."""
+    binaire = tmp_path / "llama-server"
+    _ecrire_manifeste(binaire, _document_pose())
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.finding is None
+    assert lu.manifest == posed_manifest()
+    assert lu.binary_sha256 == SHA_BINARY
+
+
+def test_un_manifeste_sans_empreinte_de_binaire_n_atteste_pas(tmp_path):
+    """
+    Le bloc `install.binary_sha256` rattache le manifeste à CE binaire-ci. Sans
+    lui, la lecture réussit mais n'atteste rien, et le recoupement aval refuse la
+    réutilisation.
+    """
+    binaire = tmp_path / "llama-server"
+    document = _document_pose()
+    del document["install"]["binary_sha256"]
+    _ecrire_manifeste(binaire, document)
+
+    lu = rr.read_existing_attestation(binaire)
+
+    assert lu.manifest is not None  # le bloc §6 est cohérent
+    assert lu.binary_sha256 is None  # mais rien ne le rattache au binaire

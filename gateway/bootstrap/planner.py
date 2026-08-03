@@ -96,6 +96,7 @@ place dans un module de contrat partagé, pas recopiées des deux côtés.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field, replace
@@ -311,12 +312,37 @@ async def _resolve_runtime(
         release=options.release_policy  # type: ignore[arg-type]
     )
     profile = runtime_mod.hardware_profile_from_mapping(hardware.to_dict())
-    return await runtime_mod.resolve_runtime(
+
+    # SEC-017 — relire le manifeste posé à côté du binaire par `runtime_installer`.
+    #
+    # Sans ce raccord, `existing_manifest` restait toujours `None` sur le parcours
+    # opérateur : le recoupement manifeste ↔ binaire livré par SEC-009 — version,
+    # commit, backend, empreinte — n'était exercé que par les tests, et le
+    # résolveur accordait `reuse_existing` sans confronter la moindre attestation.
+    # La lecture est déportée hors de la boucle d'événements : c'est un accès
+    # disque, court mais bloquant.
+    attestation: runtime_mod.ExistingAttestation | None = None
+    if options.existing_binary is not None:
+        attestation = await asyncio.to_thread(
+            runtime_mod.read_existing_attestation, options.existing_binary
+        )
+
+    resolution = await runtime_mod.resolve_runtime(
         profile,
         policy,
         installed_at=options.generated_at,
         existing_binary=options.existing_binary,
+        existing_manifest=attestation.manifest if attestation else None,
+        existing_binary_sha256=attestation.binary_sha256 if attestation else None,
     )
+
+    # Le constat de lecture précède ceux de la résolution : il dit ce qu'on a
+    # trouvé sur disque, les autres disent ce qu'on en conclut.
+    if attestation is not None and attestation.finding is not None:
+        return replace(resolution, findings=schema.merge_findings(
+            (attestation.finding,), resolution.findings,
+        ))
+    return resolution
 
 
 def _no_release_policy_section(options: PlannerOptions) -> schema.PlanSection:
