@@ -161,10 +161,11 @@ async def lifespan(app: FastAPI):
         )
 
     # ── Garde-fou supply-chain : version du binaire llama-server ──────────────
-    # NON FATAL par défaut : en test/CI il n'y a aucun binaire llama-server réel,
-    # donc la sonde se contente d'un avertissement et le démarrage continue. Le
-    # seul cas de refus est un enforcement EXPLICITE (LLAMA_SERVER_MIN_BUILD > 0)
-    # avec un build lu strictement inférieur au minimum patché.
+    # Inerte tant que LLAMA_SERVER_MIN_BUILD=0 (défaut) : en test/CI il n'y a
+    # aucun binaire llama-server réel, la sonde se contente d'un avertissement et
+    # le démarrage continue. Dès qu'un plancher est exigé, la politique est
+    # FAIL-CLOSED (SEC-009) : build lu inférieur au plancher OU version illisible
+    # → refus. Même sémantique que `doctor`, quel que soit le chemin de démarrage.
     # En local, ces artefacts vivent sur la gateway. En cluster, ils vivent sur
     # les nœuds et sont validés par le node-agent au moment du chargement.
     await _validate_inference_runtime(enabled_models)

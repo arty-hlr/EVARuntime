@@ -738,7 +738,7 @@ et overflows de parsing GGUF menant au RCE. Trois garde-fous :
 | Mesure | Mise en œuvre |
 |--------|---------------|
 | `--context-shift` désactivé | `build_llama_cmd` n'émet **jamais** ce flag — c'est le vecteur de la CVE `n_discard`. |
-| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; un build inférieur au minimum refuse le démarrage (0 = désactivé, non fatal si version illisible). |
+| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; **fail-closed** dès que le plancher est `> 0` — un build inférieur **ou une version illisible** refuse le démarrage (0 = désactivé, la sonde se contente alors d'un avertissement). Même verdict que `doctor`, quel que soit le chemin de démarrage (SEC-009). |
 | Intégrité GGUF | Champ `sha256` par modèle : le hash du fichier est recalculé et comparé avant chargement. |
 
 ### Isolation réseau
