@@ -416,9 +416,10 @@ async def lifespan(app: FastAPI):
         settings.total_vram_gb, settings.effective_vram_budget_gb(),
     )
 
-    # Garde-fou supply-chain : version du binaire llama-server. NON FATAL par
-    # défaut (aucun binaire réel en test). Refuse le démarrage UNIQUEMENT si
-    # LLAMA_SERVER_MIN_BUILD > 0 et build lu < minimum (cf. GHSA-8947-pfff-2f3c).
+    # Garde-fou supply-chain : version du binaire llama-server. Inerte tant que
+    # LLAMA_SERVER_MIN_BUILD=0 (défaut, aucun binaire réel en test). Dès qu'un
+    # plancher est exigé, la politique est FAIL-CLOSED (SEC-009) : build lu sous
+    # le plancher OU version illisible → refus (cf. GHSA-8947-pfff-2f3c).
     ok = await enforce_llama_min_build(
         settings.llama_server_bin, settings.llama_server_min_build
     )

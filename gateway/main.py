@@ -161,10 +161,11 @@ async def lifespan(app: FastAPI):
         )
 
     # ── Garde-fou supply-chain : version du binaire llama-server ──────────────
-    # NON FATAL par défaut : en test/CI il n'y a aucun binaire llama-server réel,
-    # donc la sonde se contente d'un avertissement et le démarrage continue. Le
-    # seul cas de refus est un enforcement EXPLICITE (LLAMA_SERVER_MIN_BUILD > 0)
-    # avec un build lu strictement inférieur au minimum patché.
+    # Inerte tant que LLAMA_SERVER_MIN_BUILD=0 (défaut) : en test/CI il n'y a
+    # aucun binaire llama-server réel, la sonde se contente d'un avertissement et
+    # le démarrage continue. Dès qu'un plancher est exigé, la politique est
+    # FAIL-CLOSED (SEC-009) : build lu inférieur au plancher OU version illisible
+    # → refus. Même sémantique que `doctor`, quel que soit le chemin de démarrage.
     # En local, ces artefacts vivent sur la gateway. En cluster, ils vivent sur
     # les nœuds et sont validés par le node-agent au moment du chargement.
     await _validate_inference_runtime(enabled_models)
@@ -252,6 +253,20 @@ app.include_router(metrics_router)
 _USER_PATH_PREFIX = "/admin/users/"
 
 
+# Paramètres de requête dont la VALEUR peut rester lisible : structurels,
+# jamais personnels. Tout le reste est rédigé (SEC-010). La liste est une
+# autorisation explicite, pas une interdiction : un paramètre ajouté demain est
+# rédigé par défaut, et c'est le bon sens de la faute. `GET /admin/usage`
+# accepte `username`, employé par `deploy/smoke_test.sh` — le nom y est éphémère
+# et généré, mais un opérateur qui interroge la route avec un vrai nom écrirait
+# ce nom au journal, ce que SEC-008 interdit.
+_LOGGABLE_QUERY_PARAMS = frozenset({
+    "from_date", "to_date", "limit", "force", "period",
+})
+
+_REDACTED = "<redacted>"
+
+
 def _redact_path(path: str) -> str:
     """
     Remplace un nom d'utilisateur présent dans le chemin par `<redacted>`.
@@ -269,6 +284,80 @@ def _redact_path(path: str) -> str:
     return f"{_USER_PATH_PREFIX}<redacted>{sep}{tail}"
 
 
+def _redact_query(query: str) -> str:
+    """
+    Rédige la valeur de tout paramètre qui n'est pas explicitement structurel.
+
+    Les NOMS de paramètres sont conservés : ils décrivent la forme de l'appel et
+    n'identifient personne. Seules les valeurs disparaissent, sauf autorisation
+    explicite dans `_LOGGABLE_QUERY_PARAMS`.
+    """
+    if not query:
+        return query
+    morceaux: list[str] = []
+    for paire in query.split("&"):
+        if not paire:
+            continue
+        nom, sep, _valeur = paire.partition("=")
+        if not sep:
+            # Paramètre sans valeur : le nom seul ne porte pas de donnée.
+            morceaux.append(nom)
+        elif nom.lower() in _LOGGABLE_QUERY_PARAMS:
+            morceaux.append(paire)
+        else:
+            morceaux.append(f"{nom}={_REDACTED}")
+    return "&".join(morceaux)
+
+
+def _redact_target(target: str) -> str:
+    """
+    Rédige une cible complète « chemin[?requête] », telle qu'un journal d'accès l'écrit.
+
+    `_redact_path` seul ne suffisait pas : le journal d'accès d'uvicorn écrit
+    `get_path_with_query_string(scope)`, donc chemin ET requête (SEC-010).
+    """
+    chemin, sep, requete = target.partition("?")
+    if not sep:
+        return _redact_path(chemin)
+    return f"{_redact_path(chemin)}?{_redact_query(requete)}"
+
+
+class _UvicornAccessRedactor(logging.Filter):
+    """
+    Rédige la cible dans le journal d'accès d'uvicorn (SEC-010).
+
+    Le middleware ci-dessous ne journalise que `request.url.path` : la requête
+    n'y a jamais transité. Mais uvicorn tient SON propre journal d'accès —
+    `--access-log` est actif dans les deux unités systemd — et il écrit
+    `'%s - "%s %s HTTP/%s" %d'` où le troisième argument est
+    `get_path_with_query_string(scope)` : chemin **et** query string, sans
+    rédaction. `GET /admin/users/<username>` comme `GET /admin/usage?username=…`
+    atterrissaient donc en clair dans journald, ce qui vidait `_redact_path` de
+    son sens en production.
+
+    Un filtre est le bon point d'accroche : il s'applique à tout handler du
+    logger, ne dépend pas du format, et ne peut pas être contourné par un
+    changement de configuration côté uvicorn. Il ne lève jamais — un journal ne
+    doit pas casser une requête.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            record.args = (args[0], args[1], _redact_target(args[2]), args[3], args[4])
+        return True
+
+
+def install_access_log_redaction() -> None:
+    """Pose le filtre de rédaction sur `uvicorn.access`, une seule fois."""
+    logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _UvicornAccessRedactor) for f in logger.filters):
+        logger.addFilter(_UvicornAccessRedactor())
+
+
+install_access_log_redaction()
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
@@ -280,7 +369,7 @@ async def log_requests(request: Request, call_next):
         log.info(
             "%s %s %d %dms",
             request.method,
-            _redact_path(request.url.path),
+            _redact_target(request.url.path),
             response.status_code,
             duration_ms,
         )

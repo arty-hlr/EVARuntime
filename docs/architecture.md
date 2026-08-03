@@ -756,8 +756,53 @@ et overflows de parsing GGUF menant au RCE. Trois garde-fous :
 | Mesure | Mise en œuvre |
 |--------|---------------|
 | `--context-shift` désactivé | `build_llama_cmd` n'émet **jamais** ce flag — c'est le vecteur de la CVE `n_discard`. |
-| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; un build inférieur au minimum refuse le démarrage (0 = désactivé, non fatal si version illisible). |
+| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; **fail-closed** dès que le plancher est `> 0` — un build inférieur **ou une version illisible** refuse le démarrage (0 = désactivé, la sonde se contente alors d'un avertissement). Même verdict que `doctor`, quel que soit le chemin de démarrage (SEC-009). |
 | Intégrité GGUF | Champ `sha256` par modèle : le hash du fichier est recalculé et comparé avant chargement. |
+| Manifeste recoupé | Un manifeste de provenance §6 posé à côté du binaire ne vaut attestation qu'après confrontation **au binaire lui-même** : version et commit rendus par `--version`, puis empreinte SHA-256 du binaire face à celle consignée dans `install.binary_sha256`. Voir ci-dessous. |
+
+#### Un manifeste non recoupé n'est pas une attestation (SEC-009)
+
+Le manifeste de provenance est un fichier texte posé à côté d'un exécutable.
+Rien n'empêche de le recopier d'un autre hôte, ni de le laisser survivre au
+remplacement manuel du binaire qu'il décrit. `bootstrap/runtime_installer` le
+savait déjà : son contrôle d'idempotence recalcule l'empreinte du binaire posé à
+chaque passe. `bootstrap/runtime_resolver._judge_existing_binary` ne le faisait
+pas et accordait `reuse_existing` sur parole.
+
+Un binaire en place n'est désormais conservé qu'après quatre confrontations,
+toutes nécessaires, du moins cher au plus cher :
+
+| Constat | Ce qui est confronté | Verdict |
+|---|---|---|
+| `runtime_manifest_build_mismatch` | `version:` du manifeste ↔ build rendu par `--version` | remplacé |
+| `runtime_manifest_commit_mismatch` | `commit:` du manifeste ↔ SHA court rendu par `--version` (comparaison par préfixe, le binaire n'en rend que 7 caractères) | remplacé |
+| `runtime_backend_mismatch` | backend déclaré ↔ candidats de l'hôte | remplacé |
+| `runtime_binary_unattested` | aucun `install.binary_sha256` dans le manifeste | remplacé |
+| `runtime_binary_unreadable` | empreinte du binaire incalculable | remplacé |
+| `runtime_binary_tampered` | empreinte observée ↔ empreinte consignée | remplacé |
+
+Le refus est toujours **nommé** : la réinstallation depuis la variante épinglée
+est le remède, jamais un repli silencieux. Le binaire n'est lu — donc haché — que
+si un manifeste est fourni : sans attestation à confronter, lire des centaines de
+Mo ne prouverait rien.
+
+Quand `--version` ne rend pas de commit, ce recoupement-là est simplement omis :
+on ne peut pas le faire, on ne l'invente pas. Les autres restent.
+
+#### Aucun invariant de production porté par un `assert` (COR-021)
+
+`python -O` retire toutes les instructions `assert` du bytecode, et rien
+n'interdit `-O` dans une unité systemd (`ExecStart=… python -O …`, ou
+`PYTHONOPTIMIZE=1` dans l'`EnvironmentFile`). Un garde-fou écrit
+`assert x is not None` disparaît alors en silence, et le refus explicite se
+transforme en `AttributeError` opaque quelques lignes plus loin.
+
+Le code de production des deux composants n'en contient donc aucun : un invariant
+dont la violation doit produire une erreur lève une exception nommée
+(`ProvenanceError`, `LLMfitError`) ou retourne un refus explicite. Un test balaie
+l'AST de tous les modules de `gateway/` et `node_agent/` — tests exclus — et
+échoue à la première occurrence. Il porte deux contrôles positifs : le scanner
+sait voir un `assert` imbriqué, et son périmètre couvre bien les deux composants.
 
 ### Isolation réseau
 

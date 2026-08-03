@@ -255,6 +255,15 @@ Réponse de l'API :
   inchangés. C'est l'objectif même de cette politique.
 - **Journaux.** L'opération ne journalise que l'`id` technique — ni le nom, ni
   l'e-mail, ni les notes effacées ne réapparaissent dans les logs applicatifs.
+  Les **journaux d'accès** sont rédigés eux aussi, des deux côtés : le
+  middleware de la gateway remplace le segment de nom de `/admin/users/<nom>`
+  par `<redacted>`, et un filtre posé sur le logger `uvicorn.access` fait de même
+  sur SA ligne — celle que journald conserve, puisque `--access-log` est actif
+  dans les deux unités systemd. Cette seconde rédaction couvre aussi la **query
+  string** : `GET /admin/usage?username=<nom>` est journalisé
+  `?username=<redacted>` (SEC-010). Seuls `from_date`, `to_date`, `limit`,
+  `force` et `period` gardent une valeur lisible ; la valeur de tout autre
+  paramètre, présent ou futur, est rédigée par défaut.
 
 > **Désactiver ≠ anonymiser.** `disable-user` bloque l'accès en conservant toutes
 > les données et se réactive avec `enable-user`. `anonymize-user` efface les
@@ -1437,7 +1446,9 @@ Points de conception à connaître :
 - **Politique fail-closed de version.** Si `LLAMA_SERVER_MIN_BUILD > 0` mais que
   la version du binaire est illisible, le contrôle **échoue** : on ne peut pas
   prouver que le binaire est patché. Avec `LLAMA_SERVER_MIN_BUILD=0`, `doctor`
-  avertit que le garde-fou supply-chain est inerte.
+  avertit que le garde-fou supply-chain est inerte. Depuis SEC-009, la gateway et
+  le node-agent appliquent la **même** politique au démarrage : `doctor` n'est
+  plus le seul chemin fail-closed.
 - **`nvidia-smi` absent** n'est pas un échec bloquant : en mode cluster c'est
   normal (`skip`), en mode local c'est un avertissement (un hôte de
   développement sans GPU doit rester diagnosticable).

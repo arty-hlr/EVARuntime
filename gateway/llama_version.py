@@ -10,10 +10,16 @@ Ce module est volontairement partagé entre la gateway et le node_agent (qui ajo
 gateway/ à son sys.path, donc `from llama_version import ...` fonctionne des deux
 côtés). Il n'ajoute aucune dépendance : subprocess + re, stdlib uniquement.
 
-Politique : NON FATAL par défaut. Si le binaire est injoignable ou sa version
-illisible, on n'échoue jamais — c'est un simple avertissement. Le seul cas de refus
-de démarrage est un enforcement EXPLICITE (llama_server_min_build > 0) combiné à une
-version lue strictement inférieure.
+Politique (SEC-009) : **fail-closed dès qu'un plancher est exigé**. Tant que
+`llama_server_min_build == 0`, aucun enforcement n'est demandé et une version
+illisible reste un simple avertissement. Mais dès que l'opérateur exige un build
+minimal, une version illisible est un refus : on ne peut pas prouver que le binaire
+est patché, donc on ne sert pas dessus.
+
+Cette sémantique est celle de `doctor.check_llama_server_version` et de
+`bootstrap.runtime_installer._verdict_version`. Elle l'est désormais aussi ici :
+avant SEC-009, une gateway démarrée sans passer par `doctor` pouvait servir sur un
+binaire inattestable, parce que ce module se contentait d'un `log.warning`.
 """
 from __future__ import annotations
 
@@ -25,11 +31,34 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# llama.cpp affiche typiquement, sur stderr, une ligne du style :
+# llama.cpp écrit sur stderr une ligne de build canonique :
 #   version: 4567 (abc1234)
-# ou parfois « build: 4567 (abc1234) ». On extrait le numéro de build entier de
-# façon défensive et on tolère tout format inconnu (retour None).
-_VERSION_RE = re.compile(r"\b(?:version|build)\s*[:=]?\s*(\d+)\b", re.IGNORECASE)
+# ou parfois « build: 4567 (abc1234) », suivie de « built with cc … ».
+#
+# SEC-009 : l'ancien motif cherchait `\b(?:version|build)…` n'importe où dans la
+# sortie et prenait le PREMIER résultat. Sur un build CUDA, `--version` est
+# précédé de lignes d'initialisation de backend (`ggml_cuda_init: …`,
+# `load_backend: …`, `register_backend: …`) ; il suffisait qu'une seule d'entre
+# elles contienne « version » ou « build » suivi d'un nombre pour que la sonde
+# rende un numéro parasite — potentiellement sous le plancher (faux refus), ou
+# au-dessus (attestation mensongère). Deux corrections :
+#
+#  1. les deux motifs sont **ancrés en début de ligne** : une ligne de trace de
+#     backend ne commence jamais par « version » ou « build » ;
+#  2. si plusieurs lignes candidates annoncent des numéros **différents**, la
+#     sortie est ambiguë et la sonde REFUSE explicitement (retour None) plutôt
+#     que de départager au hasard. Fail-closed en aval fait le reste.
+_BUILD_LINE_RE = re.compile(
+    r"^[ \t]*(?:version|build)[ \t]*:[ \t]*(?P<build>\d+)"
+    r"(?:[ \t]*\((?P<commit>[0-9a-fA-F]{7,40})\))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Repli tolérant, toujours ancré : « VERSION 999 », « build = 4567 ».
+_LOOSE_BUILD_RE = re.compile(
+    r"^[ \t]*(?:version|build)[ \t]*[:=]?[ \t]*(?P<build>\d+)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 # Timeout court : la sonde ne doit jamais bloquer le démarrage longtemps.
 _PROBE_TIMEOUT_SECONDS = 5.0
@@ -37,9 +66,53 @@ _PROBE_TIMEOUT_SECONDS = 5.0
 
 @dataclass(frozen=True)
 class LlamaVersion:
-    """Résultat de la sonde. `build` est None si la version n'a pas pu être lue."""
+    """
+    Résultat de la sonde. `build` est None si la version n'a pas pu être lue.
+
+    `commit` porte le SHA court rendu entre parenthèses par la ligne canonique
+    (`version: 4567 (abc1234)`). Il vaut None si la sortie ne le donne pas ; il
+    permet de recouper un manifeste de provenance contre le binaire réel (SEC-009).
+    """
     build: int | None
     raw: str  # sortie brute (tronquée) pour diagnostic
+    commit: str | None = None
+
+
+def parse_llama_build(output: str) -> tuple[int | None, str | None]:
+    """
+    Extrait `(build, commit)` d'une sortie `llama-server --version`.
+
+    Défensif (ne lève jamais) — appelé sur une sortie non fiable de sous-processus.
+    Retourne `(None, None)` si aucune ligne canonique n'est reconnue, ou si
+    plusieurs lignes candidates se contredisent : mieux vaut ne rien affirmer que
+    d'affirmer le mauvais numéro sur une attestation de sécurité.
+    """
+    if not output:
+        return None, None
+
+    canonical = list(_BUILD_LINE_RE.finditer(output))
+    if canonical:
+        builds = {m.group("build") for m in canonical}
+        if len(builds) > 1:
+            return None, None  # sortie ambiguë : refus explicite
+        commit = next(
+            (m.group("commit") for m in canonical if m.group("commit")), None
+        )
+        try:
+            return int(canonical[0].group("build")), (commit.lower() if commit else None)
+        except (ValueError, IndexError):
+            return None, None
+
+    loose = list(_LOOSE_BUILD_RE.finditer(output))
+    if not loose:
+        return None, None
+    builds = {m.group("build") for m in loose}
+    if len(builds) > 1:
+        return None, None  # sortie ambiguë : refus explicite
+    try:
+        return int(loose[0].group("build")), None
+    except (ValueError, IndexError):
+        return None, None
 
 
 def parse_llama_version(output: str) -> int | None:
@@ -49,15 +122,7 @@ def parse_llama_version(output: str) -> int | None:
     Tolère les formats inconnus : retourne None si aucun motif reconnu. Défensif
     (ne lève jamais) — appelé sur une sortie non fiable de sous-processus.
     """
-    if not output:
-        return None
-    match = _VERSION_RE.search(output)
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except (ValueError, IndexError):
-        return None
+    return parse_llama_build(output)[0]
 
 
 async def probe_llama_version(binary: Path) -> LlamaVersion:
@@ -90,28 +155,45 @@ async def probe_llama_version(binary: Path) -> LlamaVersion:
         return LlamaVersion(build=None, raw=f"<erreur de sonde : {exc}>")
 
     raw = (stdout or b"").decode("utf-8", errors="replace").strip()
-    return LlamaVersion(build=parse_llama_version(raw), raw=raw[:500])
+    build, commit = parse_llama_build(raw)
+    return LlamaVersion(build=build, raw=raw[:500], commit=commit)
 
 
 async def enforce_llama_min_build(binary: Path, min_build: int) -> bool:
     """
     Sonde le binaire et applique la politique d'épinglage de version.
 
-    Retourne True si le démarrage peut continuer, False UNIQUEMENT en cas
-    d'enforcement explicite violé (min_build > 0 et build lu < min_build).
+    Retourne True si le démarrage peut continuer, False dès qu'un enforcement
+    explicite (min_build > 0) ne peut pas être prouvé satisfait.
 
-    Comportement :
-      - binaire injoignable / version illisible → log.warning, retourne True.
-      - build lu OK, min_build == 0 (défaut)      → log.info, retourne True.
-      - build lu < min_build (min_build > 0)       → log.critical, retourne False.
-      - build lu ≥ min_build                       → log.info, retourne True.
+    Comportement (SEC-009) :
+      - version illisible et min_build == 0 (défaut) → log.warning, retourne True.
+      - version illisible et min_build > 0           → log.critical, retourne False.
+      - build lu OK, min_build == 0 (défaut)         → log.info, retourne True.
+      - build lu < min_build (min_build > 0)         → log.critical, retourne False.
+      - build lu ≥ min_build                         → log.info, retourne True.
+
+    Le cas « illisible + plancher exigé » était l'écart de SEC-009 : il valait
+    `log.warning` puis démarrage, alors que `doctor` refusait déjà. Un binaire qui
+    ne sait pas dire ce qu'il est ne peut pas être attesté patché, et la seule
+    réponse sûre à un plancher qu'on ne peut pas vérifier est le refus.
     """
     version = await probe_llama_version(binary)
 
     if version.build is None:
+        if min_build > 0:
+            log.critical(
+                "LLAMA_SERVER_MIN_BUILD=%d est exigé mais la version de %s est illisible (%s). "
+                "Politique fail-closed : impossible de prouver que ce binaire est patché "
+                "(cf. GHSA-8947-pfff-2f3c) — DÉMARRAGE REFUSÉ. Réinstallez un llama-server dont "
+                "`--version` répond, ou retirez le plancher en connaissance de cause.",
+                min_build, binary, version.raw,
+            )
+            return False
         log.warning(
-            "Version de llama-server illisible (%s) — sonde non fatale, on continue. "
-            "Binaire : %s. Pensez à fixer LLAMA_SERVER_MIN_BUILD sur un build patché.",
+            "Version de llama-server illisible (%s) — aucun plancher exigé "
+            "(LLAMA_SERVER_MIN_BUILD=0), le garde-fou supply-chain reste inerte. "
+            "Binaire : %s. Fixez LLAMA_SERVER_MIN_BUILD sur un build patché.",
             version.raw, binary,
         )
         return True

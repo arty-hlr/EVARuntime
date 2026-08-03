@@ -1373,7 +1373,12 @@ LLAMA_SERVER_MIN_BUILD=<build_patché>
 Au démarrage, la gateway (et chaque node-agent) sonde `llama-server --version` :
 
 - build lu `<` `LLAMA_SERVER_MIN_BUILD` (si > 0) → **démarrage refusé** (log critical) ;
-- version illisible / binaire absent → simple avertissement, démarrage poursuivi ;
+- version illisible / binaire absent **et** `LLAMA_SERVER_MIN_BUILD > 0` →
+  **démarrage refusé** (log critical). Politique fail-closed (SEC-009) : un
+  binaire qui ne sait pas dire ce qu'il est ne peut pas être attesté patché, et
+  `doctor` refusait déjà dans ce cas. Les deux chemins rendent le même verdict ;
+- version illisible / binaire absent **et** `LLAMA_SERVER_MIN_BUILD=0` → simple
+  avertissement, démarrage poursuivi ;
 - `LLAMA_SERVER_MIN_BUILD=0` (défaut) → aucun enforcement.
 
 > Le durcissement inclut aussi l'absence délibérée du flag `--context-shift`
@@ -2251,7 +2256,7 @@ consolide les réglages **récemment ajoutés** ; les paramètres historiques
 
 | Variable | Défaut | Rôle |
 |----------|--------|------|
-| `LLAMA_SERVER_MIN_BUILD` | `0` | Build minimal accepté du binaire `llama-server`. `0` = aucun enforcement. Si `> 0` et build lu strictement inférieur → **démarrage refusé** ; version illisible → simple avertissement (non fatal). À fixer sur le premier build patché (cf. [section 11](#11-mise-à-jour)). |
+| `LLAMA_SERVER_MIN_BUILD` | `0` | Build minimal accepté du binaire `llama-server`. `0` = aucun enforcement. Si `> 0` et build lu strictement inférieur → **démarrage refusé** ; si `> 0` et version illisible → **démarrage refusé** aussi (fail-closed, SEC-009). Version illisible avec `0` → simple avertissement. À fixer sur le premier build patché (cf. [section 11](#11-mise-à-jour)). |
 
 > Le champ `sha256` par modèle (intégrité GGUF) se configure dans `models.yaml`,
 > pas ici — voir [section 6](#6-registre-des-modèles-modelsyaml).
