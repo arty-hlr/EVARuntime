@@ -10,6 +10,18 @@ une copie dans les logs ne satisfait pas la Definition of Done (§14 :
 
 Ces tests verrouillent la rédaction du segment de nom, tout en vérifiant que la
 forme de la route reste exploitable pour le diagnostic.
+
+SEC-010 étend la couverture à deux fuites que `_redact_path` ne pouvait pas
+fermer :
+
+- la **query string** (`GET /admin/usage?username=…`, employé par
+  `deploy/smoke_test.sh`), que le middleware ne journalisait pas — il ne passe
+  que `request.url.path` — mais qui transitait ailleurs ;
+- le **journal d'accès d'uvicorn**, qui tient sa propre ligne
+  `'%s - "%s %s HTTP/%s" %d'` où le troisième argument est
+  `get_path_with_query_string(scope)` : chemin ET requête, sans rédaction.
+  `--access-log` est actif dans les deux unités systemd, donc en production
+  `_redact_path` était contourné pour le chemin lui-même.
 """
 from __future__ import annotations
 
@@ -133,6 +145,110 @@ def test_access_log_still_records_method_status_and_route(
     assert "GET" in logged
     assert "404" in logged
     assert "/admin/users/<redacted>" in logged
+
+
+# ── SEC-010 : la query string ─────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "target, expected",
+    [
+        # Le paramètre visé par SEC-010 : `GET /admin/usage?username=…`.
+        (f"/admin/usage?username={CANARY}", "/admin/usage?username=<redacted>"),
+        # Les paramètres structurels restent lisibles : le journal doit rester utile.
+        (
+            f"/admin/usage?username={CANARY}&from_date=2026-01-01&limit=50",
+            "/admin/usage?username=<redacted>&from_date=2026-01-01&limit=50",
+        ),
+        # Chemin ET requête, tous deux porteurs du nom.
+        (
+            f"/admin/users/{CANARY}/keys?username={CANARY}",
+            "/admin/users/<redacted>/keys?username=<redacted>",
+        ),
+        # Autorisation explicite : un paramètre inconnu est rédigé par défaut.
+        ("/admin/usage?email=a@b.test", "/admin/usage?email=<redacted>"),
+        ("/admin/models/m/unload?force=true", "/admin/models/m/unload?force=true"),
+        # Paramètre sans valeur : le nom seul ne porte rien.
+        ("/admin/usage?verbose", "/admin/usage?verbose"),
+        # Sans requête, le comportement historique est inchangé.
+        ("/v1/chat/completions", "/v1/chat/completions"),
+    ],
+)
+def test_redact_target(target: str, expected: str) -> None:
+    assert main._redact_target(target) == expected
+
+
+def test_redact_query_keeps_parameter_names_but_not_their_values() -> None:
+    """Le nom décrit la forme de l'appel ; la valeur seule est une donnée."""
+    assert main._redact_query(f"username={CANARY}").startswith("username=")
+    assert CANARY not in main._redact_query(f"username={CANARY}")
+
+
+# ── SEC-010 : le journal d'accès d'uvicorn ────────────────────────────────────
+
+def _emit_uvicorn_access(target: str) -> None:
+    """Reproduit exactement l'appel d'uvicorn (h11_impl / httptools_impl)."""
+    logging.getLogger("uvicorn.access").info(
+        '%s - "%s %s HTTP/%s" %d', "127.0.0.1:5000", "GET", target, "1.1", 200,
+    )
+
+
+def test_uvicorn_access_log_redacts_the_query_string(caplog) -> None:
+    with caplog.at_level(logging.INFO, logger="uvicorn.access"):
+        _emit_uvicorn_access(f"/admin/usage?username={CANARY}")
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert CANARY not in logged, f"nom d'utilisateur journalisé par uvicorn : {logged}"
+    assert "/admin/usage?username=<redacted>" in logged
+
+
+def test_uvicorn_access_log_redacts_the_path_segment_too(caplog) -> None:
+    """
+    Le contournement le plus grave : uvicorn journalise le chemin en clair.
+
+    `_redact_path` protégeait la ligne du middleware ; celle d'uvicorn passait à
+    côté, et c'est elle que journald conserve en production (`--access-log` dans
+    les deux unités systemd).
+    """
+    with caplog.at_level(logging.INFO, logger="uvicorn.access"):
+        _emit_uvicorn_access(f"/admin/users/{CANARY}/keys")
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert CANARY not in logged
+    assert "/admin/users/<redacted>/keys" in logged
+
+
+def test_uvicorn_access_log_still_records_method_status_and_route(caplog) -> None:
+    """Contrôle positif : le filtre rédige, il ne vide pas la ligne."""
+    with caplog.at_level(logging.INFO, logger="uvicorn.access"):
+        _emit_uvicorn_access("/v1/chat/completions")
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "127.0.0.1:5000" in logged
+    assert "GET" in logged
+    assert "/v1/chat/completions" in logged
+    assert "200" in logged
+
+
+def test_access_redaction_filter_is_installed_at_import() -> None:
+    """
+    Sans ce test, retirer l'appel d'installation laisserait tous les tests
+    ci-dessus verts uniquement s'ils installaient le filtre eux-mêmes. Ici on
+    vérifie l'état du logger réel, tel qu'il existe après l'import de `main`.
+    """
+    filtres = logging.getLogger("uvicorn.access").filters
+    assert any(isinstance(f, main._UvicornAccessRedactor) for f in filtres)
+
+
+def test_installing_the_filter_twice_does_not_duplicate_it() -> None:
+    avant = len(logging.getLogger("uvicorn.access").filters)
+    main.install_access_log_redaction()
+    assert len(logging.getLogger("uvicorn.access").filters) == avant
+
+
+def test_access_filter_never_raises_on_an_unexpected_record() -> None:
+    """Un journal ne doit pas casser une requête : le filtre tolère tout."""
+    filtre = main._UvicornAccessRedactor()
+    for args in ((), ("a",), ("a", "b", None, "d", 200), "pas-un-tuple", None):
+        record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, "%s", None, None)
+        record.args = args
+        assert filtre.filter(record) is True
 
 
 def test_unhandled_error_handler_redacts_path(caplog) -> None:
