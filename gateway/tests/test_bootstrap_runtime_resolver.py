@@ -28,6 +28,10 @@ from llama_version import LlamaVersion
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
+# Empreinte du binaire POSÉ (bloc `install:` du manifeste), distincte de celle de
+# l'archive téléchargée (`artifact_sha256`, bloc `runtime:`).
+SHA_BINARY = "d" * 64
+SHA_OTHER = "e" * 64
 DIGEST = "sha256:" + "c" * 64
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 NOW = "2026-07-31T09:00:00+00:00"
@@ -77,11 +81,29 @@ def resolve(profile: rr.HardwareProfile, policy: rr.ResolverPolicy, **kwargs) ->
     return asyncio.run(rr.resolve_runtime(profile, policy, installed_at=NOW, **kwargs))
 
 
-def probing(build: int | None, raw: str = "version: ?"):
+def probing(build: int | None, raw: str = "version: ?", commit: str | None = None):
     """Sonde `--version` injectée : le résolveur ne lance aucun sous-processus en test."""
     async def _probe(_binary: Path) -> LlamaVersion:
-        return LlamaVersion(build=build, raw=raw)
+        return LlamaVersion(build=build, raw=raw, commit=commit)
     return _probe
+
+
+def digesting(empreinte: str | None):
+    """Empreinte du binaire posé, injectée : aucun fichier réel n'est lu en test."""
+    async def _digest(_binary: Path) -> str | None:
+        return empreinte
+    return _digest
+
+
+def posed_manifest(**kwargs) -> rr.ProvenanceManifest:
+    """Manifeste cohérent avec le binaire simulé : build 6750, commit COMMIT."""
+    defaults: dict = {
+        "version": "b6750", "commit": COMMIT, "source": rr.SOURCE_LOCAL_BUILD,
+        "backend": "cuda12", "platform": "linux-x86_64", "installed_at": NOW,
+        "build_options": {"GGML_CUDA": True},
+    }
+    defaults.update(kwargs)
+    return rr.ProvenanceManifest(**defaults)
 
 
 def codes(resolution: rr.RuntimeResolution) -> set[str]:
@@ -454,15 +476,13 @@ def test_gpu_search_covers_every_source_before_cpu_is_considered():
 # ── LLAMA_SERVER_MIN_BUILD appliqué au binaire présent ────────────────────────
 
 def test_existing_binary_above_floor_is_kept_when_its_manifest_matches():
-    manifest = rr.ProvenanceManifest(
-        version="b6750", commit=COMMIT, source=rr.SOURCE_LOCAL_BUILD, backend="cuda12",
-        platform="linux-x86_64", installed_at=NOW, build_options={"GGML_CUDA": True},
-    )
     resolution = resolve(
         nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
         existing_binary=Path("/usr/local/bin/llama-server"),
-        existing_manifest=manifest,
-        probe=probing(6750, "version: 6750 (abc1234)"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750 (0123456)", commit="0123456"),
+        digest=digesting(SHA_BINARY),
     )
     assert resolution.resolved is True
     assert resolution.reuse_existing is True
@@ -517,6 +537,181 @@ def test_existing_binary_without_manifest_is_not_kept_on_a_gpu_host():
     )
     assert resolution.reuse_existing is False
     assert "runtime_provenance_unknown" in codes(resolution)
+
+
+# ── SEC-009 volet b : le manifeste recoupé contre le binaire ──────────────────
+#
+# Avant SEC-009, `_judge_existing_binary` accordait `reuse_existing` sur la foi
+# d'un manifeste qu'il ne confrontait jamais au binaire : ni la version, ni le
+# commit, ni aucune empreinte. Un manifeste recopié d'un autre hôte, ou survivant
+# à un remplacement manuel du binaire, valait attestation de provenance.
+
+def test_manifest_declaring_another_build_is_not_an_attestation():
+    """Manifeste b6750 posé à côté d'un binaire qui rend 6900 : il décrit autre chose."""
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6900, "version: 6900 (0123456)", commit="0123456"),
+        digest=digesting(SHA_BINARY),
+    )
+    assert resolution.reuse_existing is False
+    assert "runtime_manifest_build_mismatch" in codes(resolution)
+
+
+def test_manifest_declaring_another_commit_is_not_an_attestation():
+    """Même numéro de build, révision différente : l'étiquette ment."""
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750 (fedcba9)", commit="fedcba9"),
+        digest=digesting(SHA_BINARY),
+    )
+    assert resolution.reuse_existing is False
+    assert "runtime_manifest_commit_mismatch" in codes(resolution)
+
+
+def test_short_commit_is_accepted_as_a_prefix_of_the_declared_one():
+    """
+    Contrôle positif du test précédent : `--version` rend un SHA court, le
+    manifeste un SHA long. Sans cette tolérance, le recoupement refuserait TOUT
+    binaire sain et l'item serait « fermé » par un refus systématique.
+    """
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750 (0123456)", commit="0123456"),
+        digest=digesting(SHA_BINARY),
+    )
+    assert resolution.reuse_existing is True
+    assert "runtime_manifest_commit_mismatch" not in codes(resolution)
+
+
+def test_unreadable_commit_does_not_block_a_coherent_binary():
+    """`--version` ne rend pas toujours le commit : on ne peut pas recouper, on n'invente pas."""
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750"),
+        digest=digesting(SHA_BINARY),
+    )
+    assert resolution.reuse_existing is True
+
+
+def test_manifest_without_a_binary_fingerprint_is_not_an_attestation():
+    """Version et commit concordent, mais rien ne distingue ce binaire d'un autre."""
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        probe=probing(6750, "version: 6750 (0123456)", commit="0123456"),
+        digest=digesting(SHA_BINARY),
+    )
+    assert resolution.reuse_existing is False
+    assert "runtime_binary_unattested" in codes(resolution)
+
+
+def test_replaced_binary_under_a_surviving_manifest_is_detected():
+    """Le scénario nommé par SEC-009 : le manifeste survit au remplacement du binaire."""
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750 (0123456)", commit="0123456"),
+        digest=digesting(SHA_OTHER),
+    )
+    assert resolution.reuse_existing is False
+    finding = next(f for f in resolution.findings if f.code == "runtime_binary_tampered")
+    assert "remplacé ou altéré" in finding.message
+
+
+def test_unreadable_binary_refuses_the_attestation():
+    resolution = resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750 (0123456)", commit="0123456"),
+        digest=digesting(None),
+    )
+    assert resolution.reuse_existing is False
+    assert "runtime_binary_unreadable" in codes(resolution)
+
+
+def test_binary_is_not_hashed_when_no_manifest_is_offered():
+    """
+    Sans manifeste, il n'y a rien à recouper : lire des centaines de Mo ne
+    prouverait rien. Le test échoue si le résolveur hache quand même.
+    """
+    appels: list[Path] = []
+
+    async def _digest(binary: Path) -> str | None:
+        appels.append(binary)
+        return SHA_BINARY
+
+    resolution = resolve(
+        cpu_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD, "cpu"),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        probe=probing(6900, "version: 6900 (0123456)", commit="0123456"),
+        digest=_digest,
+    )
+    assert appels == []
+    # Contrôle positif : la sonde de digest est bien appelée quand un manifeste existe.
+    resolve(
+        nvidia_profile(), make_policy((variant(rr.SOURCE_LOCAL_BUILD),)),
+        existing_binary=Path("/usr/local/bin/llama-server"),
+        existing_manifest=posed_manifest(),
+        existing_binary_sha256=SHA_BINARY,
+        probe=probing(6750, "version: 6750 (0123456)", commit="0123456"),
+        digest=_digest,
+    )
+    assert appels == [Path("/usr/local/bin/llama-server")]
+    # Le binaire sans manifeste reste conservé sur un hôte CPU, mais sa provenance
+    # est signalée inconnue : l'absence de recoupement est dite, pas dissimulée.
+    assert resolution.reuse_existing is True
+    assert "runtime_provenance_unknown" in codes(resolution)
+
+
+def test_attested_binary_sha256_reads_the_installer_block():
+    document = {
+        "runtime": posed_manifest().to_dict(),
+        "install": {"binary_sha256": SHA_BINARY, "binary": "/opt/llama/llama-server"},
+    }
+    assert rr.attested_binary_sha256(document) == SHA_BINARY
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"runtime": {}},                                  # aucun bloc install
+        {"runtime": {}, "install": {}},                    # bloc vide
+        {"runtime": {}, "install": {"binary_sha256": ""}},  # valeur vide
+        {"runtime": {}, "install": {"binary_sha256": "pas-une-empreinte"}},
+        {"runtime": {}, "install": "not-a-mapping"},
+        "pas un document",
+    ],
+)
+def test_attested_binary_sha256_refuses_anything_that_is_not_an_attestation(document):
+    assert rr.attested_binary_sha256(document) is None
+
+
+def test_sha256_binary_reads_a_real_file(tmp_path):
+    """Le calcul par défaut n'est pas un bouchon : il lit vraiment le fichier."""
+    import hashlib
+
+    binaire = tmp_path / "llama-server"
+    binaire.write_bytes(b"ELF" + b"\x00" * 4096)
+    attendu = hashlib.sha256(binaire.read_bytes()).hexdigest()
+    assert asyncio.run(rr.sha256_binary(binaire)) == attendu
+    assert asyncio.run(rr.sha256_binary(tmp_path / "absent")) is None
 
 
 def test_manifest_announcing_a_foreign_backend_forces_a_replacement():

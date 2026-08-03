@@ -66,6 +66,8 @@ jamais présenter une supposition comme un fait.
 from __future__ import annotations
 
 import ast
+import asyncio
+import hashlib
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -392,6 +394,27 @@ def validate_manifest_document(document: Any) -> tuple[str, ...]:
         container_digest=runtime.get("container_digest"),
         build_options=runtime.get("build_options") or {},
     ))
+
+
+def attested_binary_sha256(document: Any) -> str | None:
+    """
+    Empreinte du binaire consignée par `runtime_installer` dans le bloc `install:`.
+
+    C'est la seule valeur du manifeste qui parle du **binaire posé** : le
+    `artifact_sha256` du bloc `runtime:` décrit l'archive téléchargée, pas ce qui
+    a été extrait puis publié. Retourne None si le manifeste n'a pas été écrit par
+    notre installateur, ou si le bloc a été retiré — auquel cas il n'atteste rien
+    et `_judge_existing_binary` refuse la réutilisation (SEC-009).
+    """
+    if not isinstance(document, Mapping):
+        return None
+    bloc = document.get("install")
+    if not isinstance(bloc, Mapping):
+        return None
+    empreinte = bloc.get("binary_sha256")
+    if isinstance(empreinte, str) and _SHA256_RE.match(empreinte):
+        return empreinte
+    return None
 
 
 def manifest_from_document(document: Any) -> ProvenanceManifest:
@@ -848,6 +871,27 @@ class RuntimeResolution:
 # ── Résolution ────────────────────────────────────────────────────────────────
 
 ProbeCallable = Callable[[Path], Awaitable[LlamaVersion]]
+DigestCallable = Callable[[Path], Awaitable[str | None]]
+
+
+async def sha256_binary(path: Path) -> str | None:
+    """
+    Empreinte SHA-256 du binaire en place, lue en flux et hors boucle d'événements.
+
+    Retourne None si le fichier est illisible : c'est un fait à constater, pas une
+    exception à propager — l'appelant en tire un refus nommé.
+    """
+    def _lire() -> str | None:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as flux:
+                for bloc in iter(lambda: flux.read(1024 * 1024), b""):
+                    digest.update(bloc)
+        except OSError:
+            return None
+        return digest.hexdigest()
+
+    return await asyncio.to_thread(_lire)
 
 
 async def resolve_runtime(
@@ -857,7 +901,9 @@ async def resolve_runtime(
     installed_at: str,
     existing_binary: Path | None = None,
     existing_manifest: ProvenanceManifest | None = None,
+    existing_binary_sha256: str | None = None,
     probe: ProbeCallable | None = None,
+    digest: DigestCallable | None = None,
 ) -> RuntimeResolution:
     """
     Décide quel `llama-server` serait installé sur cet hôte, et pourquoi.
@@ -866,6 +912,13 @@ async def resolve_runtime(
     possible est `llama-server --version` sur un binaire **déjà présent**, délégué
     à `llama_version.probe_llama_version` (réutilisé, pas réimplémenté) et
     injectable par `probe` pour les tests.
+
+    `existing_binary_sha256` est l'empreinte que l'installation avait **consignée**
+    à côté du manifeste (`attested_binary_sha256()` l'extrait du document YAML).
+    Elle n'est pas décorative : sans elle, un manifeste ne peut pas être recoupé
+    contre le binaire qu'il prétend décrire, et il ne vaut donc pas attestation
+    (SEC-009). L'empreinte réellement observée est calculée par `digest`,
+    injectable pour les tests — le binaire n'est lu que si un manifeste est fourni.
 
     `installed_at` est fourni par l'appelant, comme `generated_at` dans `schema` :
     le module ne lit pas l'horloge, pour que le manifeste produit soit
@@ -895,12 +948,19 @@ async def resolve_runtime(
         probe_fn = probe or probe_llama_version
         version = await probe_fn(existing_binary)
         observed_build = version.build
+        # L'empreinte n'est calculée que s'il y a un manifeste à recouper : sans
+        # attestation à confronter, lire des centaines de Mo ne prouverait rien.
+        observed_sha256: str | None = None
+        if existing_manifest is not None:
+            observed_sha256 = await (digest or sha256_binary)(existing_binary)
         verdict = _judge_existing_binary(
             binary=existing_binary,
             version=version,
             min_build=min_build,
             existing_manifest=existing_manifest,
             profile=profile,
+            attested_sha256=existing_binary_sha256,
+            observed_sha256=observed_sha256,
         )
         findings.extend(verdict.findings)
         if verdict.fatal:
@@ -1056,6 +1116,17 @@ class _BinaryVerdict:
     findings: tuple[schema.Finding, ...]
 
 
+def _commits_agree(declared: str, observed: str) -> bool:
+    """
+    Le commit du manifeste et celui rendu par `--version` désignent-ils la même révision ?
+
+    `--version` rend un SHA court (7 caractères), le manifeste un SHA de 7 à 40 :
+    la comparaison se fait par préfixe, dans les deux sens, sans distinction de casse.
+    """
+    a, b = declared.lower(), observed.lower()
+    return a.startswith(b) or b.startswith(a)
+
+
 def _judge_existing_binary(
     *,
     binary: Path,
@@ -1063,6 +1134,8 @@ def _judge_existing_binary(
     min_build: int,
     existing_manifest: ProvenanceManifest | None,
     profile: HardwareProfile,
+    attested_sha256: str | None = None,
+    observed_sha256: str | None = None,
 ) -> _BinaryVerdict:
     """
     Applique la politique `LLAMA_SERVER_MIN_BUILD` au binaire présent.
@@ -1075,6 +1148,15 @@ def _judge_existing_binary(
     llama.cpp produit un binaire qui se déclare `version: 1`. Le message doit
     désigner cette cause, sans quoi l'opérateur passe des heures à mettre à jour un
     dépôt déjà à jour.
+
+    SEC-009 (volet b) : quand un manifeste accompagne le binaire, il est **recoupé
+    contre le binaire** avant de valoir attestation — version, commit et empreinte.
+    Le manifeste est un fichier texte posé à côté d'un exécutable : rien n'empêche
+    de le recopier d'un autre hôte, ni de le laisser survivre à un remplacement
+    manuel du binaire. Non recoupé, il n'est pas une attestation, seulement une
+    affirmation. `runtime_installer._deja_satisfait` fait ce recoupement depuis
+    AUT-016 ; le résolveur ne le faisait pas et accordait `reuse_existing` sur
+    parole.
     """
     if version.build is None:
         if min_build > 0:
@@ -1202,6 +1284,46 @@ def _judge_existing_binary(
             ),),
         )
 
+    # ── Recoupement manifeste ↔ binaire (SEC-009) ─────────────────────────────
+    #
+    # Trois confrontations, dans l'ordre du moins cher au plus cher, et toutes
+    # nécessaires : le manifeste doit décrire CE binaire-ci, pas un binaire.
+
+    if existing_manifest.build_number != version.build:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_manifest_build_mismatch",
+                level="warn",
+                message=(
+                    f"Le manifeste de {binary} déclare {existing_manifest.version} "
+                    f"(build {existing_manifest.build_number}) alors que le binaire rend le build "
+                    f"{version.build}. Le manifeste ne décrit pas ce binaire : il a été recopié "
+                    "d'un autre hôte, ou il a survécu à un remplacement du binaire. Il ne vaut "
+                    "donc pas attestation de provenance et le binaire sera remplacé."
+                ),
+            ),),
+        )
+
+    if version.commit is not None and not _commits_agree(existing_manifest.commit, version.commit):
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_manifest_commit_mismatch",
+                level="warn",
+                message=(
+                    f"Le manifeste de {binary} déclare le commit {existing_manifest.commit} alors "
+                    f"que le binaire rend {version.commit}, pour un même numéro de build "
+                    f"{version.build}. Deux révisions différentes derrière une même étiquette : la "
+                    "provenance annoncée est fausse, le binaire sera remplacé."
+                ),
+            ),),
+        )
+
     if existing_manifest.backend not in profile.known_backends:
         return _BinaryVerdict(
             reuse=False,
@@ -1214,6 +1336,58 @@ def _judge_existing_binary(
                     f"Le manifeste du binaire en place annonce le backend « {existing_manifest.backend} », "
                     f"absent des candidats de cet hôte ({', '.join(profile.known_backends) or 'aucun'}). "
                     "Le conserver produirait un TTFT dégradé sans que rien ne le signale : il sera remplacé."
+                ),
+            ),),
+        )
+
+    if attested_sha256 is None:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_binary_unattested",
+                level="warn",
+                message=(
+                    f"Le manifeste de {binary} ne consigne aucune empreinte du binaire posé "
+                    "(bloc « install.binary_sha256 »). Version et commit concordent, mais rien ne "
+                    "distingue ce binaire d'un autre build de la même révision : la provenance "
+                    "n'est pas vérifiable et le binaire sera réinstallé. Réinstallez-le par "
+                    "`runtime_installer`, qui consigne cette empreinte à chaque passe."
+                ),
+            ),),
+        )
+
+    if observed_sha256 is None:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_binary_unreadable",
+                level="warn",
+                message=(
+                    f"L'empreinte de {binary} n'a pas pu être calculée (fichier illisible) : le "
+                    "manifeste ne peut pas être recoupé contre le binaire. Sans ce recoupement, "
+                    "la provenance n'est pas attestée et le binaire sera remplacé."
+                ),
+            ),),
+        )
+
+    if observed_sha256 != attested_sha256:
+        return _BinaryVerdict(
+            reuse=False,
+            fatal=False,
+            summary="",
+            findings=(schema.Finding(
+                code="runtime_binary_tampered",
+                level="warn",
+                message=(
+                    f"L'empreinte de {binary} ({observed_sha256[:16]}…) ne correspond pas à celle "
+                    f"consignée à l'installation ({attested_sha256[:16]}…), alors que version et "
+                    "commit concordent. Le binaire a été remplacé ou altéré sous une attestation "
+                    "restée en place : anomalie de chaîne d'approvisionnement, il sera réinstallé "
+                    "depuis la variante épinglée."
                 ),
             ),),
         )
