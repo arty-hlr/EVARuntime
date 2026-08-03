@@ -99,6 +99,8 @@ source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
 source "$SCRIPT_DIR/deploy/nginx-lib.sh"
 # shellcheck source=venv-retention-lib.sh
 source "$SCRIPT_DIR/deploy/venv-retention-lib.sh"
+# shellcheck source=env-template-lib.sh
+source "$SCRIPT_DIR/deploy/env-template-lib.sh"
 
 usage() {
     cat <<EOF
@@ -187,6 +189,18 @@ SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
 NGINX_SITE="/etc/nginx/sites-available/llm-gateway"
 
 # Répertoires
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Même convention déclarative que `install.sh` : source unique, dérivée par
+# `gateway/tests/test_deploy_required_commands.py` et documentée en
+# `docs/deployment.md` §1. Aucun `command -v <nom littéral>` ailleurs.
+UPDATE_REQUIRED_COMMANDS=(awk chmod chown cp curl find git mkdir mktemp mv systemctl)
+# Mode local uniquement : l'orchestrateur cluster n'a pas de GPU.
+UPDATE_REQUIRED_COMMANDS_LOCAL=(nvidia-smi)
+# Exigée seulement quand la recette du premier token est jouée (COR-006).
+UPDATE_REQUIRED_COMMANDS_SMOKE=(python3)
+# Absentes, ces commandes désactivent une fonction sans bloquer la mise à jour.
+UPDATE_OPTIONAL_COMMANDS=(nginx sqlite3)
+
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
 DATA_DIR="${LLM_GATEWAY_DATA_DIR:-/var/lib/llm-gateway}"
 CONFIG_DIR="${LLM_GATEWAY_CONFIG_DIR:-/etc/llm-gateway}"
@@ -252,22 +266,43 @@ fi
 [[ -d "$INSTALL_DIR" ]] || error "$INSTALL_DIR n'existe pas — lancez d'abord install.sh"
 [[ -f "$INSTALL_DIR/venv/bin/python" ]] || error "venv introuvable — lancez d'abord install.sh"
 [[ -f "$CONFIG_FILE" ]] || error "Configuration introuvable : $CONFIG_FILE"
-for required in awk chmod chown cp curl find git mkdir mktemp mv systemctl; do
-    command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
+required=()
+required+=("${UPDATE_REQUIRED_COMMANDS[@]}")
+[[ "$EFFECTIVE_MODE" == "cluster" ]] || required+=("${UPDATE_REQUIRED_COMMANDS_LOCAL[@]}")
+[[ "$RUN_SMOKE_TEST" != true ]] || required+=("${UPDATE_REQUIRED_COMMANDS_SMOKE[@]}")
+for command_name in "${required[@]}"; do
+    command -v "$command_name" &>/dev/null || \
+        error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
 if [[ "$RUN_SMOKE_TEST" == true ]]; then
     [[ -f "$SMOKE_TEST_SCRIPT" ]] || \
         error "Préflight : recette du premier token introuvable ($SMOKE_TEST_SCRIPT). Utilisez --skip-smoke-test en connaissance de cause."
-    command -v python3 &>/dev/null || \
-        error "Préflight : python3 requis par la recette du premier token."
 fi
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité orchestrateur introuvable"
 else
-    command -v nvidia-smi &>/dev/null || error "Préflight local : nvidia-smi introuvable"
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
     [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
 fi
+# ── Durcissements absents d'un environnement antérieur à SEC-002 ──────────────
+# `update.sh` ne régénère JAMAIS /etc/llm-gateway/env : un hôte installé avant
+# SEC-002 n'aurait donc jamais ces clés. Elles ne sont PAS ajoutées d'autorité —
+# écrire « CORS_ALLOW_ORIGINS= » sur une installation qui sert un client
+# navigateur la casserait en silence, au milieu d'une mise à jour. On signale,
+# l'opérateur tranche.
+MISSING_HARDENING=()
+for hardening_key in "${DEPLOY_HARDENING_KEYS[@]}"; do
+    if ! grep -qE "^[[:space:]]*${hardening_key}=" "$CONFIG_FILE"; then
+        MISSING_HARDENING+=("$hardening_key")
+    fi
+done
+if (( ${#MISSING_HARDENING[@]} > 0 )); then
+    warn "Durcissements SEC-002 absents de $CONFIG_FILE : ${MISSING_HARDENING[*]}"
+    warn "→ Cette mise à jour ne les ajoute pas : les poser sans vous demander"
+    warn "  pourrait couper un client navigateur ou refuser le démarrage."
+    warn "→ Voir docs/deployment.md §5, puis « evaruntime doctor » avant de démarrer."
+fi
+
 info "Préflight validé; mise à jour en mode $EFFECTIVE_MODE."
 
 prepare_model_registry() {

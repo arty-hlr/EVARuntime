@@ -44,6 +44,47 @@ GPU local et pilote des node-agents installés séparément.
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
 
+### Commandes exigées par les scripts de déploiement
+
+Les préflights refusent de continuer si l'une de ces commandes manque. La liste
+est **exhaustive** et **tenue à jour mécaniquement** : chaque script déclare ses
+dépendances dans un tableau bash unique (`INSTALL_REQUIRED_COMMANDS`,
+`AGENT_REQUIRED_COMMANDS`, …) et `gateway/tests/test_deploy_required_commands.py`
+dérive de ces tableaux la liste qui doit figurer ci-dessous. Une dépendance
+ajoutée à un script sans être documentée ici fait échouer la CI.
+
+| Commande | Exigée par | Paquet Debian/Ubuntu |
+|---|---|---|
+| `awk` | `install.sh`, `update.sh` | `mawk` ou `gawk` (présent) |
+| `chmod`, `chown`, `cp`, `id`, `mkdir`, `mktemp`, `mv` | `install.sh`, `update.sh` | `coreutils` (présent) |
+| `find` | `install.sh`, `update.sh` | `findutils` (présent) |
+| `python3` | tous | `python3` (≥ 3.11) |
+| `systemctl` | tous | `systemd` (présent) |
+| `useradd` | `install.sh` | `passwd` (présent) |
+| `usermod` | `install.sh` **mode local** | `passwd` (présent) |
+| `nvidia-smi` | `install.sh` / `update.sh` **mode local** | pilote NVIDIA — contournable par `--allow-no-gpu`, voir [§4](#4-installation-du-gateway) |
+| `curl` | `update.sh` | `curl` — **à installer** |
+| `git` | `update.sh`, `update-agent.sh` (sans `--no-pull`) | `git` — **à installer** |
+| `rsync` | `install-agent.sh`, `update-agent.sh` | `rsync` — **à installer**, absent d'une Debian 13 minimale |
+| `openssl` | `install-agent.sh` | `openssl` — **à installer** si absent |
+
+Commandes **optionnelles** : absentes, elles ne bloquent pas l'installation mais
+désactivent une fonction, et le script le dit.
+
+| Commande | Fonction perdue si absente | Paquet |
+|---|---|---|
+| `nginx` | reverse-proxy TLS non configuré ([§8](#8-configuration-nginx)) | `nginx` |
+| `sqlite3` | timer de sauvegarde quotidienne **non armé** ([§11](#11-mise-à-jour)) | `sqlite3` |
+| `ufw` | aucune règle firewall créée sur le nœud ; à faire dans le firewall réseau | `ufw` |
+
+```bash
+# Orchestrateur / gateway mono-nœud
+sudo apt install -y curl git sqlite3 nginx
+
+# CHAQUE nœud GPU, avant install-agent.sh
+sudo apt install -y rsync openssl
+```
+
 ### Vérifications initiales
 
 ```bash
@@ -346,6 +387,40 @@ sudo bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode cluster
 `--cluster` reste accepté comme alias de compatibilité. `--dry-run` ne requiert
 pas root et n'exécute ni écriture, ni `pip`, ni `git`, ni `systemctl`.
 
+#### Installer en mode local sur un hôte sans GPU — `--allow-no-gpu`
+
+En mode local, le préflight exige `nvidia-smi` et **refuse** l'installation s'il
+est absent. Ce refus est délibéré : un gateway local sans GPU ne peut rien
+offloader. Il existe pourtant des cas légitimes — banc CPU, recette de bout en
+bout, maquette d'intégration — et le contournement pratiqué jusqu'ici consistait
+à éditer le script, ce qui ne laissait **aucune trace** : ni dans la
+configuration, ni dans le diagnostic.
+
+```bash
+# Refusé : l'hôte n'a pas de GPU et rien ne l'assume
+sudo bash install.sh --mode local
+# → le message liste les trois conduites à tenir possibles
+
+# Accepté : l'absence de GPU est ASSUMÉE, et tracée
+sudo bash install.sh --mode local --allow-no-gpu
+```
+
+L'option écrit `ALLOW_NO_GPU=true` dans `/etc/llm-gateway/env`. Conséquences :
+
+- `evaruntime doctor` rapporte `gpu_inventory` en **`skip` / `gpu_absence_declared`**
+  — « pas de GPU, par décision » — au lieu de **`warn` / `nvidia_smi_unavailable`**
+  — « GPU attendu mais absent ». Deux diagnostics distincts, deux verdicts
+  distincts : le premier ne colore pas le rapport, le second reste un signal ;
+- si un GPU apparaît plus tard alors que la clé est encore là, doctor le signale
+  en `warn` / `gpu_waiver_stale` : une renonciation ne doit pas survivre au
+  matériel qui la justifiait. Retirez la clé, ou relancez `install.sh` sans
+  l'option — l'installateur remet `ALLOW_NO_GPU=false` dès qu'il détecte un GPU ;
+- rien d'autre ne change : aucun offload GPU, `TOTAL_VRAM_GB` et les attentes de
+  latence sont à adapter à la main.
+
+En mode cluster, l'option est sans objet — l'orchestrateur n'a jamais de GPU
+local — et le script le dit.
+
 Le script effectue automatiquement :
 
 1. Création de l'utilisateur système `llmservice` (sans shell, sans home)
@@ -382,6 +457,30 @@ se trouvent dans `models.yaml` (voir section 6).
 ```bash
 sudo nano /etc/llm-gateway/env
 ```
+
+### Les trois durcissements posés par l'installateur
+
+`install.sh` écrit trois réglages de sécurité dans le fichier généré. Ils y sont
+**visibles et commentés** : un réglage absent du fichier n'existe pas pour
+l'exploitant.
+
+| Clé | Valeur posée | Ce qu'elle protège |
+|---|---|---|
+| `ALLOWED_MODEL_DIRS` | le répertoire de modèles créé par l'installateur **plus** les répertoires déclarés par le registre livré | seuls des `.gguf` de ces répertoires peuvent être déclarés dans `models.yaml` — barrière contre un chemin arbitraire injecté par l'API admin |
+| `CORS_ALLOW_ORIGINS` | **vide** = aucune origine navigateur | `*` autoriserait n'importe quelle page web à parler à la gateway. L'API est consommée par des clients serveur, que CORS ne concerne pas, et le dashboard admin est servi depuis la même origine |
+| `LLAMA_SERVER_MIN_BUILD` | `0` (aucun enforcement) | plancher de version `llama-server` contre GHSA-8947-pfff-2f3c. **À relever** : `doctor` le signale à chaque exécution tant qu'il vaut 0 |
+
+Deux pièges d'exploitation :
+
+- **`ALLOWED_MODEL_DIRS` est validée sur TOUTES les entrées de `models.yaml`,
+  activées ou non.** Une seule entrée hors allowlist et le service **refuse de
+  démarrer**. C'est pour cela que la valeur posée est dérivée du registre que
+  l'installateur pose, et non écrite en dur. Restreignez-la dès que vos chemins
+  réels sont fixés, puis validez avec `evaruntime doctor` avant de démarrer.
+- **`update.sh` ne pose pas ces clés sur une installation antérieure.** Il les
+  **signale** en préflight : ajouter `CORS_ALLOW_ORIGINS=` d'autorité couperait
+  un client navigateur existant au milieu d'une mise à jour. À vous de trancher,
+  clé par clé.
 
 ### Paramètres critiques à vérifier
 

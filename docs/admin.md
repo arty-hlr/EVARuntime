@@ -1418,7 +1418,7 @@ Contrôles propres à `doctor` :
 | `database_permissions` | base, `-wal`, `-shm` et répertoire non exposés (jugé avec la traversée des parents) | oui si atteignable par tous | contrôlé |
 | `disk_space` | espace libre sur les volumes de la base et des logs | oui sous 0,5 Go | contrôlé |
 | `llama_server_version` | `llama-server --version` confronté à `LLAMA_SERVER_MIN_BUILD` | oui | `skip` |
-| `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability | non (avertissement) | `skip` |
+| `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability. Distingue « GPU attendu mais absent » (`warn` / `nvidia_smi_unavailable`) de « pas de GPU, assumé » (`skip` / `gpu_absence_declared`, quand `ALLOW_NO_GPU=true` a été posé par `install.sh --allow-no-gpu`) ; une renonciation devenue fausse est signalée en `warn` / `gpu_waiver_stale` | non (avertissement) | `skip` |
 | `vram_detected` | budget VRAM net vs VRAM des devices **réellement exposés par `CUDA_VISIBLE_DEVICES`** | oui si le budget net dépasse le matériel ; avertissement si `TOTAL_VRAM_GB` est seulement nominalement supérieur | `skip` |
 | `model_artifacts` | taille et plausibilité des GGUF/mmproj ; intégrité SHA-256 **seulement** avec `--verify-hashes` | oui | `skip` |
 | `port_pool` | pool `BASE_LLAMA_PORT … +MAX_LOADED_MODELS-1` libre, pas de collision avec `GATEWAY_PORT` | oui pour la collision, avertissement pour un port occupé | `skip` |

@@ -15,6 +15,14 @@ IFS=$'\n\t'
 
 EXIT_SERVICE_DOWN=9
 
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Même convention déclarative que `install-agent.sh` : source unique, dérivée par
+# `gateway/tests/test_deploy_required_commands.py`, documentée en
+# `docs/deployment.md` §1. Aucun `command -v <nom littéral>` ailleurs.
+AGENT_UPDATE_REQUIRED_COMMANDS=(python3 rsync systemctl)
+# Exigée seulement quand le dépôt est rafraîchi (sans --no-pull).
+AGENT_UPDATE_REQUIRED_COMMANDS_PULL=(git)
+
 DRY_RUN=false
 PULL_REPOSITORY=true
 INSTALL_DIR="/opt/llm-gateway"
@@ -64,8 +72,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $EUID -eq 0 ]] || die "Exécutez ce script avec sudo/root."
-for command in python3 rsync systemctl; do
-    command -v "$command" >/dev/null || die "Commande requise absente : $command"
+required=()
+required+=("${AGENT_UPDATE_REQUIRED_COMMANDS[@]}")
+[[ "$PULL_REPOSITORY" != true ]] || required+=("${AGENT_UPDATE_REQUIRED_COMMANDS_PULL[@]}")
+for command_name in "${required[@]}"; do
+    command -v "$command_name" >/dev/null || \
+        die "Commande requise absente : $command_name (cf. docs/deployment.md §1)"
 done
 
 # Une valeur inexploitable doit se voir maintenant, pas au moment de la purge :
@@ -127,7 +139,8 @@ if [[ "$DRY_RUN" == true ]]; then
 fi
 
 if [[ "$PULL_REPOSITORY" == true ]]; then
-    command -v git >/dev/null || die "git est requis sans --no-pull."
+    # `git` est déjà exigé par le préflight quand PULL_REPOSITORY est vrai
+    # (AGENT_UPDATE_REQUIRED_COMMANDS_PULL) : rien à revérifier ici.
     git -C "$REPO_ROOT" diff --quiet --ignore-submodules -- || \
         die "Checkout modifié localement; committez/stashez ou utilisez --no-pull."
     git -C "$REPO_ROOT" diff --cached --quiet --ignore-submodules -- || \

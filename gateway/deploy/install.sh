@@ -18,16 +18,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
 # shellcheck source=nginx-lib.sh
 source "$SCRIPT_DIR/deploy/nginx-lib.sh"
+# shellcheck source=gpu-preflight-lib.sh
+source "$SCRIPT_DIR/deploy/gpu-preflight-lib.sh"
+# shellcheck source=env-template-lib.sh
+source "$SCRIPT_DIR/deploy/env-template-lib.sh"
 
 usage() {
     cat <<EOF
-Usage: $0 [--mode local|cluster] [--cluster] [--allow-mode-change] [--dry-run]
+Usage: $0 [--mode local|cluster] [--cluster] [--allow-mode-change] [--allow-no-gpu] [--dry-run]
 
   --mode local       Gateway mono-nœud (défaut sur une installation neuve).
   --mode cluster     Orchestrateur multi-nœuds; les agents s'installent à part.
   --cluster          Alias historique de --mode cluster.
   --allow-mode-change
                      Confirme une migration d'une installation existante.
+  --allow-no-gpu     Mode local sur un hôte SANS GPU NVIDIA. Assume l'absence au
+                     lieu de la subir : le choix est inscrit dans
+                     $GPU_WAIVER_ENV_KEY du fichier d'environnement généré et
+                     remonté par « evaruntime doctor ».
   --dry-run          Affiche le mode et le plan sans modifier l'hôte.
 
 Sans option, install.sh choisit local. Sur une installation existante, indiquez
@@ -38,6 +46,7 @@ EOF
 REQUESTED_MODE="local"
 MODE_WAS_EXPLICIT=false
 ALLOW_MODE_CHANGE=false
+ALLOW_NO_GPU=false
 DRY_RUN=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,6 +65,7 @@ while [[ $# -gt 0 ]]; do
             [[ "$MODE_WAS_EXPLICIT" != true || "$REQUESTED_MODE" == "cluster" ]] || { echo "--cluster contredit --mode $REQUESTED_MODE" >&2; exit 2; }
             REQUESTED_MODE="cluster"; MODE_WAS_EXPLICIT=true; shift ;;
         --allow-mode-change) ALLOW_MODE_CHANGE=true; shift ;;
+        --allow-no-gpu) ALLOW_NO_GPU=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Option inconnue : $1" >&2; usage; exit 2 ;;
@@ -89,6 +99,26 @@ systemctl_enable_now() {
     systemctl reset-failed "$unit" 2>/dev/null || true
     systemctl enable --now "$unit"
 }
+
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Source de vérité UNIQUE et déclarative des dépendances de commandes de ce
+# script. `docs/deployment.md` §1 doit les lister toutes, et
+# `gateway/tests/test_deploy_required_commands.py` DÉRIVE la liste attendue de
+# ces tableaux au lieu de la recopier : ajouter une commande ici suffit pour que
+# le test exige sa documentation. Corollaire, vérifié par le même test : aucun
+# `command -v <nom littéral>` ne doit exister ailleurs dans ce script, sinon la
+# dépendance échappe à la documentation — c'est exactement ainsi que `rsync`
+# avait disparu des prérequis du node-agent.
+INSTALL_REQUIRED_COMMANDS=(awk chmod chown cp find id mkdir mktemp mv python3 systemctl useradd)
+# Mode local uniquement : l'orchestrateur cluster ne touche pas aux groupes GPU.
+INSTALL_REQUIRED_COMMANDS_LOCAL=(usermod)
+# Mode local SANS --allow-no-gpu. Séparée des précédentes parce que c'est la
+# seule dépendance à laquelle l'opérateur peut renoncer explicitement (OPS-012) ;
+# la sonde et le message de refus vivent dans deploy/gpu-preflight-lib.sh.
+INSTALL_REQUIRED_COMMANDS_GPU=(nvidia-smi)
+# Absentes, ces commandes ne bloquent pas l'installation mais désactivent une
+# fonction : `nginx` (reverse-proxy) et `sqlite3` (armement du timer de backup).
+INSTALL_OPTIONAL_COMMANDS=(nginx sqlite3)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -131,13 +161,28 @@ if [[ "$DRY_RUN" == true ]]; then
         echo "  Parcours       : orchestrateur sans GPU local; agents, TLS et ports inter-nœuds à configurer séparément"
     else
         echo "  Parcours       : llama-server et modèles sur cet hôte"
+        if [[ "$ALLOW_NO_GPU" == true ]]; then
+            echo "  GPU            : absence ASSUMÉE (--allow-no-gpu) → $GPU_WAIVER_ENV_KEY=true dans $CONFIG_FILE"
+        else
+            echo "  GPU            : exigé; sans nvidia-smi le préflight refusera (échappatoire : --allow-no-gpu)"
+        fi
     fi
     exit 0
 fi
 
 [[ $EUID -eq 0 ]] || error "Ce script doit être exécuté en root (sudo bash install.sh)"
-for required in awk chmod chown cp find id mkdir mktemp mv systemctl useradd "$PYTHON"; do
-    command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
+
+required=()
+required+=("${INSTALL_REQUIRED_COMMANDS[@]}")
+if [[ "$EFFECTIVE_MODE" != "cluster" ]]; then
+    required+=("${INSTALL_REQUIRED_COMMANDS_LOCAL[@]}")
+fi
+for command_name in "${required[@]}"; do
+    # `python3` est le nom DOCUMENTÉ ; PYTHON= substitue l'interpréteur contrôlé
+    # sans changer la dépendance annoncée.
+    [[ "$command_name" == python3 ]] && command_name="$PYTHON"
+    command -v "$command_name" &>/dev/null || \
+        error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
 [[ -f "$SCRIPT_DIR/requirements.txt" ]] || error "Préflight : requirements.txt introuvable"
 [[ -f "$SCRIPT_DIR/deploy/llm-gateway.service" ]] || error "Préflight : unité systemd locale introuvable"
@@ -145,10 +190,22 @@ if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité systemd orchestrateur introuvable"
     [[ -f "$SCRIPT_DIR/deploy/nodes.yaml.example" ]] || error "Préflight : template nodes.yaml introuvable"
 else
-    command -v usermod &>/dev/null || error "Préflight : commande requise introuvable : usermod"
-    command -v nvidia-smi &>/dev/null || error "Préflight local : nvidia-smi introuvable"
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
     [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
+fi
+
+# Verdict GPU (OPS-012). Sans --allow-no-gpu, le refus historique est conservé;
+# la bibliothèque écrit alors la conduite à tenir sur stderr avant de rendre 1.
+GPU_VERDICT="$(deploy_gpu_verdict "$EFFECTIVE_MODE" "$ALLOW_NO_GPU" "${INSTALL_REQUIRED_COMMANDS_GPU[0]}")" || \
+    error "Préflight local : hôte sans GPU, aucune échappatoire demandée (conduite à tenir ci-dessus)."
+if [[ "$GPU_VERDICT" == "waived" ]]; then
+    warn "Hôte SANS GPU, absence assumée par --allow-no-gpu."
+    warn "→ Inscrit dans $CONFIG_FILE ($GPU_WAIVER_ENV_KEY=true) et remonté par « evaruntime doctor »."
+    warn "→ Aucun modèle ne sera offloadé sur GPU; adaptez TOTAL_VRAM_GB et les attentes de latence."
+elif [[ "$ALLOW_NO_GPU" == true && "$GPU_VERDICT" == "detected" ]]; then
+    warn "--allow-no-gpu ignoré : un GPU est bien détecté sur cet hôte."
+elif [[ "$ALLOW_NO_GPU" == true && "$GPU_VERDICT" == "delegated" ]]; then
+    warn "--allow-no-gpu sans objet en mode cluster : l'orchestrateur n'a jamais de GPU local."
 fi
 info "Préflight validé; installation en mode $EFFECTIVE_MODE."
 
@@ -255,64 +312,11 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     INTERNAL_KEY=$(python3 -c "import secrets; print('llmgw-internal-' + secrets.token_urlsafe(32))")
     ADMIN_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 
-    cat > "$CONFIG_FILE" << EOF
-# LLM Gateway UPPA — Configuration
-# Généré le $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-# Modifier selon votre environnement.
-# Les modèles (chemins, paramètres llama-server) sont dans $DATA_DIR/models.yaml
-
-# ── Chemins ───────────────────────────────────────────────────────────────────
-MODELS_CONFIG_PATH=${DATA_DIR}/models.yaml
-LLAMA_SERVER_BIN=/usr/local/bin/llama-server
-DB_PATH=${DATA_DIR}/gateway.db
-LOG_DIR=${LOG_DIR}
-
-# ── Pool de ports multi-modèles ───────────────────────────────────────────────
-BASE_LLAMA_PORT=8081
-MAX_LOADED_MODELS=5
-
-# ── Budget VRAM (L40S 48 GB — adapter selon GPU) ─────────────────────────────
-TOTAL_VRAM_GB=48.0
-VRAM_OVERHEAD_GB=2.0
-VRAM_SAFETY_MARGIN=0.05
-
-# ── Modèle par défaut (vide = premier modèle activé du registre) ─────────────
-DEFAULT_MODEL_ID=
-
-# ── Lifecycle ─────────────────────────────────────────────────────────────────
-IDLE_TIMEOUT_SECONDS=300
-MODEL_LOAD_TIMEOUT_SECONDS=180
-IDLE_CHECK_INTERVAL_SECONDS=30
-
-# ── Queue d'admission VRAM ───────────────────────────────────────────────────
-CAPACITY_QUEUE_ENABLED=true
-CAPACITY_QUEUE_TIMEOUT_SECONDS=120
-CAPACITY_QUEUE_MAX_WAITERS=100
-CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
-
-# ── Sécurité (NE PAS PARTAGER) ────────────────────────────────────────────────
-INTERNAL_API_KEY=${INTERNAL_KEY}
-ADMIN_SECRET=${ADMIN_SECRET}
-
-# ── Réseau ────────────────────────────────────────────────────────────────────
-GATEWAY_HOST=127.0.0.1
-GATEWAY_PORT=8000
-LLAMA_SERVER_HOST=127.0.0.1
-CUDA_VISIBLE_DEVICES=0
-
-# ── Rate limiting par défaut ───────────────────────────────────────────────────
-DEFAULT_RPM_LIMIT=20
-DEFAULT_MONTHLY_TOKEN_LIMIT=0
-
-# ── Cluster multi-nœuds (désactivé par défaut — activer avec --cluster) ───────
-CLUSTER_MODE=local
-# CLUSTER_NODES_PATH=${CONFIG_DIR}/nodes.yaml
-# AGENT_SECRET=CHANGE_ME_GENERATE_WITH_python3_-c_import_secrets;_print(secrets.token_urlsafe(32))
-# CLUSTER_REQUEST_TIMEOUT=10.0
-# CLUSTER_LOAD_TIMEOUT=300.0
-# CLUSTER_HEALTH_INTERVAL=10
-# CLUSTER_HEALTH_FAILURES_TO_OFFLINE=3
-EOF
+    # Le rendu vit dans deploy/env-template-lib.sh : il porte les trois
+    # durcissements de SEC-002 et il est exerçable en test, hors root.
+    deploy_render_env_file \
+        "$CONFIG_FILE" "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" \
+        "$MODELS_DIR" "$SCRIPT_DIR/models.yaml" "$INTERNAL_KEY" "$ADMIN_SECRET"
 
     chmod 640 "$CONFIG_FILE"
     chown root:"$SERVICE_USER" "$CONFIG_FILE"
@@ -321,6 +325,23 @@ EOF
     warn "ADMIN_SECRET = $ADMIN_SECRET — notez-le maintenant."
 else
     info "Configuration existante conservée : $CONFIG_FILE"
+fi
+
+# ── 6a. Renonciation GPU explicite (OPS-012) ──────────────────────────────────
+# Le choix est INSCRIT dans l'environnement, pas seulement subi par le shell qui
+# a lancé l'installation : c'est ce qui permet à `doctor` de distinguer « pas de
+# GPU, assumé » de « GPU attendu mais absent ». Écrit après la génération de la
+# configuration pour couvrir aussi une réinstallation sur un env existant.
+if [[ "$GPU_VERDICT" == "waived" ]]; then
+    deploy_set_env_value "$CONFIG_FILE" "$GPU_WAIVER_ENV_KEY" true
+    info "Absence de GPU inscrite dans $CONFIG_FILE ($GPU_WAIVER_ENV_KEY=true)."
+elif [[ "$GPU_VERDICT" == "detected" ]]; then
+    # Une renonciation périmée doit disparaître dès qu'un GPU est là, sinon
+    # doctor tairait une vraie panne de pilote sur la foi d'un ancien choix.
+    if [[ -n "$(deploy_env_value "$CONFIG_FILE" "$GPU_WAIVER_ENV_KEY")" ]]; then
+        deploy_set_env_value "$CONFIG_FILE" "$GPU_WAIVER_ENV_KEY" false
+        info "GPU détecté : renonciation $GPU_WAIVER_ENV_KEY remise à false."
+    fi
 fi
 
 # ── 6c. Configuration cluster (optionnel, --cluster seulement) ────────────────
