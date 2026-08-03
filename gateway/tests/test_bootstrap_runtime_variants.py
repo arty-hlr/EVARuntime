@@ -609,13 +609,22 @@ def test_le_resolveur_n_herite_pas_du_reseau_par_le_chargeur():
     """
     `runtime_variants` réutilise `public_https` — donc `socket` et `http.client`.
     Le placer dans `runtime_resolver` y ferait entrer ces modules par la bande et
-    viderait le garde-fou d'isolation de sa substance. Le test le fige.
+    viderait le garde-fou d'isolation de sa substance.
+
+    L'assertion porte sur le TEXTE du résolveur, pas sur `module_toplevel_imports()` :
+    celle-ci ignore les imports relatifs (`node.level == 0`), et `from . import
+    public_https` lui serait donc invisible. Un test d'absence adossé au garde-fou
+    aurait été vert sans rien prouver.
     """
     importes = rr.module_toplevel_imports()
     assert not (importes & rr.FORBIDDEN_IMPORTS)
-    assert "runtime_variants" not in importes
-    # Contrôle positif : l'analyse statique voit bien les imports du résolveur.
-    assert "yaml" in importes
+    assert "yaml" in importes  # contrôle positif : l'analyse statique voit bien quelque chose
+
+    source = Path(rr.__file__).read_text(encoding="utf-8")
+    for module in ("public_https", "runtime_variants"):
+        assert f"import {module}" not in source, f"{module} importé par le résolveur"
+    # Contrôle positif de CETTE recherche : elle voit bien un import qui existe.
+    assert "from . import schema" in source
 
 
 def test_le_chargeur_ne_reecrit_pas_une_seconde_politique_d_url():
