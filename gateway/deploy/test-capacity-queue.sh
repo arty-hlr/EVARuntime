@@ -40,14 +40,14 @@ STATUS_INTERVAL_SECONDS="${STATUS_INTERVAL_SECONDS:-2}"
 CONNECT_TIMEOUT_SECONDS="${CONNECT_TIMEOUT_SECONDS:-10}"
 MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-900}"
 
-API_KEY="${API_KEY:-${UPPA_LLM_KEY:-}}"
+API_KEY="${API_KEY:-${EVA_API_KEY:-}}"
 ADMIN_SECRET="${ADMIN_SECRET:-}"
 if [[ -z "$ADMIN_SECRET" && -r /etc/llm-gateway/env ]]; then
   ADMIN_SECRET="$(awk -F= '/^ADMIN_SECRET=/{print $2}' /etc/llm-gateway/env || true)"
 fi
 
 if [[ -z "$API_KEY" ]]; then
-  echo "[ERROR] API_KEY ou UPPA_LLM_KEY requis pour appeler /v1/chat/completions." >&2
+  echo "[ERROR] API_KEY ou EVA_API_KEY requis pour appeler /v1/chat/completions." >&2
   exit 2
 fi
 if [[ -z "$MODEL_BUSY" || -z "$MODEL_TARGET" ]]; then

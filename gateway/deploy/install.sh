@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Installation du LLM Gateway UPPA
+# install.sh — Installation d'EVARuntime
 # Testé sur : Ubuntu 22.04 / 24.04
 #
 # Usage :
@@ -522,8 +522,8 @@ echo ""
 echo "  Mode installé : $EFFECTIVE_MODE"
 echo ""
 if [[ "$EFFECTIVE_MODE" == "local" ]]; then
-    echo "  1. Premier token local (Lenovo PGX compris) :"
-    echo "     Guide : docs/deployment.md, §0 « Parcours direct Lenovo PGX »"
+    echo "  1. Premier token local :"
+    echo "     Guide : docs/deployment.md, §0 « Déploiement local — premier token »"
     echo ""
     echo "  2. Production épinglée : préparer une matrice runtime :"
     echo "     sudo install -d -m 0755 /etc/evaruntime"
@@ -549,7 +549,7 @@ if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
 fi
 echo ""
 echo "  3. Configurer le certificat TLS :"
-echo "     sudo certbot certonly --nginx -d llm.eva.univ-pau.fr"
+echo "     sudo certbot certonly --nginx -d gateway.example.com"
 echo "     sudo nano /etc/nginx/sites-available/llm-gateway  # adapter le domaine"
 echo ""
 echo "  4. Démarrer le service :"
@@ -559,11 +559,11 @@ echo "     sudo journalctl -u llm-gateway -f"
 echo ""
 echo "  5. Créer le premier utilisateur :"
 echo "     cd $INSTALL_DIR"
-echo "     sudo -u $SERVICE_USER ./venv/bin/python cli.py add-user alice --email alice@univ-pau.fr"
+echo "     sudo -u $SERVICE_USER ./venv/bin/python cli.py add-user alice --email alice@example.com"
 echo "     sudo -u $SERVICE_USER ./venv/bin/python cli.py create-key alice --name 'these-2025'"
 echo ""
 echo "  6. Tester :"
-echo '     curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \'
+echo '     curl -s https://gateway.example.com/v1/chat/completions \'
 echo '       -H "Authorization: Bearer <VOTRE_CLE>" \'
 echo '       -H "Content-Type: application/json" \'
 echo '       -d '"'"'{"model":"llama-3.3-70b-instruct","messages":[{"role":"user","content":"Bonjour !"}]}'"'"

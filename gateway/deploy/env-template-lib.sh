@@ -83,7 +83,7 @@ deploy_render_env_file() {
     allowed_dirs="$(deploy_allowed_model_dirs "$models_dir" "$registry")"
 
     cat > "$target" <<EOF
-# LLM Gateway UPPA — Configuration
+# EVARuntime — Configuration
 # Généré le $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Modifier selon votre environnement.
 # Les modèles (chemins, paramètres llama-server) sont dans ${data_dir}/models.yaml
@@ -101,7 +101,7 @@ LOG_DIR=${log_dir}
 BASE_LLAMA_PORT=8081
 MAX_LOADED_MODELS=5
 
-# ── Budget VRAM (L40S 48 GB — adapter selon GPU) ─────────────────────────────
+# ── Budget VRAM (adapter à la machine) ───────────────────────────────────────
 TOTAL_VRAM_GB=48.0
 VRAM_OVERHEAD_GB=2.0
 VRAM_SAFETY_MARGIN=0.05
@@ -141,7 +141,7 @@ ALLOWED_MODEL_DIRS=${allowed_dirs}
 # (curl, SDK OpenAI) que CORS ne concerne pas, et le dashboard admin est servi
 # depuis la MÊME origine que la gateway.
 # Ne l'ouvrir que pour une application navigateur tierce, domaine par domaine :
-#   CORS_ALLOW_ORIGINS=https://app.univ-pau.fr,https://chat.univ-pau.fr
+#   CORS_ALLOW_ORIGINS=https://app.example.com,https://chat.example.com
 # « * » autoriserait n'importe quelle page web à parler à la gateway avec les
 # en-têtes du client : à proscrire en production.
 CORS_ALLOW_ORIGINS=
