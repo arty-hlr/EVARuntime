@@ -785,10 +785,34 @@ def test_nvidia_smi_csv_parsing_is_defensive():
         "ligne, incomplete\n"
         "x, GPU-bbb, NVIDIA A100, pas-un-nombre, 550.54.15, 8.0\n"
         "1, GPU-ccc, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
+        "2, GPU-ddd, NVIDIA GB10, [N/A], 580.159.03, 12.1\n"
     )
-    assert [g.index for g in parsed] == [0, 1]
+    assert [g.index for g in parsed] == [0, 1, 2]
     assert parsed[0].name == "NVIDIA L40S"
     assert parsed[0].memory_total_mib == 46068.0
+    assert parsed[2].memory_total_mib is None
+
+
+def test_unreported_vram_is_skipped_without_hiding_the_gpu(tmp_path, monkeypatch):
+    host = healthy_host(tmp_path, monkeypatch, TOTAL_VRAM_GB=120.0)
+    gb10 = doctor.GpuInfo(
+        index=0,
+        uuid="GPU-gb10",
+        name="NVIDIA GB10",
+        memory_total_mib=None,
+        driver_version="580.159.03",
+        compute_capability="12.1",
+    )
+    fake_gpus(monkeypatch, [gb10])
+
+    report = run(host.options())
+
+    inventory = check(report, "gpu_inventory")
+    assert inventory.status == "pass"
+    assert "mémoire non rapportée" in inventory.message
+    vram = check(report, "vram_detected")
+    assert vram.status == "skip"
+    assert vram.code == "vram_not_reported"
 
 
 def test_only_vram_of_exposed_devices_is_counted(tmp_path, monkeypatch):
