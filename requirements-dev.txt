@@ -1,0 +1,5 @@
+# Outils de développement communs. Les installations et la CI consomment
+# requirements-dev.lock, généré pour Python 3.11 avec empreintes.
+pytest>=9.0,<10.0
+ruff>=0.16,<1.0
+pip-audit>=2.9,<3.0

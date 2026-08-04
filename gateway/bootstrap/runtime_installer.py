@@ -95,11 +95,10 @@ ici, et refuse explicitement :
 
 Fail-closed sur la version, sans exception — et pourquoi
 ---------------------------------------------------------
-SEC-009 (§0.12) a constaté que la politique `LLAMA_SERVER_MIN_BUILD` existe en
-trois endroits avec deux sémantiques : `doctor` est fail-closed,
-`main._validate_inference_runtime` et `llama_version.enforce_llama_min_build` ne
-le sont pas (version illisible → `log.warning` et démarrage autorisé). Cet
-exécuteur tranche pour lui-même, et dans le sens que §6 exige :
+SEC-009 (§0.12) avait constaté que la politique `LLAMA_SERVER_MIN_BUILD`
+existait en trois endroits avec deux sémantiques. Les chemins de démarrage sont
+désormais unifiés et fail-closed dès qu'un plancher est exigé. Cet exécuteur va
+plus loin pour un artefact qu'il vient lui-même de publier :
 
 - version **illisible** → refus, quel que soit le plancher, y compris à 0. Le
   binaire vient d'être téléchargé et posé par nous : s'il ne sait pas dire ce

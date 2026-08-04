@@ -48,6 +48,7 @@ from background import fire_and_forget
 from config import settings
 from model_manager import CapacityQueueFull, CapacityQueueTimeout, ModelManager
 from server_manager import ServerManager
+from telemetry import TTFT_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +176,8 @@ async def proxy_request(
     - Proxy la requête vers le bon llama-server
     - Log l'usage
     """
+    request_start_time = time.monotonic()
+
     # ── Lire le body ──────────────────────────────────────────────────────────
     try:
         body_bytes = await request.body()
@@ -252,6 +255,7 @@ async def proxy_request(
             _stream_proxy(
                 path, body, user, request_id, start_time, manager,
                 on_start=_release_stream_guard,
+                telemetry_start_time=request_start_time,
             ),
             media_type="text/event-stream",
             headers={
@@ -350,6 +354,7 @@ async def _stream_proxy(
     start_time: float,
     manager: ServerManager,
     on_start: Callable[[], None] | None = None,
+    telemetry_start_time: float | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Générateur async qui pipe les chunks SSE de llama-server vers le client.
@@ -374,6 +379,26 @@ async def _stream_proxy(
     completion_tokens = 0
     status_code = 200
     has_tools = bool(body.get("tools"))
+    ttft_recorded = False
+    ttft_start = start_time if telemetry_start_time is None else telemetry_start_time
+
+    def _record_ttft(chunk: dict) -> None:
+        nonlocal ttft_recorded
+        if ttft_recorded:
+            return
+        meaningful = any(
+            bool(choice.get("delta", {}).get("content"))
+            or bool(choice.get("delta", {}).get("tool_calls"))
+            for choice in chunk.get("choices", [])
+        )
+        if not meaningful:
+            return
+        TTFT_SECONDS.observe(
+            max(0.0, time.monotonic() - ttft_start),
+            model=manager.model.id,
+            node=getattr(manager, "telemetry_node", "local"),
+        )
+        ttft_recorded = True
 
     body_with_usage = {**body, "stream_options": {"include_usage": True}}
 
@@ -422,6 +447,8 @@ async def _stream_proxy(
                             if delta.get("content") and not delta.get("tool_calls"):
                                 delta.pop("content", None)
 
+                    _record_ttft(chunk)
+
                     choices = chunk.get("choices", [])
                     all_empty = all(
                         not choice.get("delta") and choice.get("finish_reason") is None
@@ -452,6 +479,7 @@ async def _stream_proxy(
                             if usage := chunk.get("usage"):
                                 prompt_tokens = usage.get("prompt_tokens", 0)
                                 completion_tokens = usage.get("completion_tokens", 0)
+                            _record_ttft(chunk)
                             line = "data: " + json.dumps(chunk, ensure_ascii=False)
                         except json.JSONDecodeError:
                             pass

@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import telemetry
 
 from cluster.cluster_manager import ClusterManager, ClusterModelHandle
 from cluster.node_client import (
@@ -204,6 +205,7 @@ def make_manager(
 class TestPlacement:
     @pytest.mark.anyio
     async def test_loads_on_single_node(self):
+        telemetry.reset_all()
         backend = FakeNodeBackend("a", total_vram=48.0)
         mgr = make_manager([backend])
         await mgr.start_health_monitor()
@@ -216,6 +218,14 @@ class TestPlacement:
         assert handle.model.id == "m1"
         assert len(backend.load_calls) == 1
         assert backend.load_calls[0]["id"] == "m1"
+        assert handle.telemetry_node == "a"
+        series = telemetry.MODEL_LOAD_SECONDS.snapshot().series
+        assert len(series) == 1
+        assert (series[0].model, series[0].node, series[0].outcome) == (
+            "m1",
+            "a",
+            "success",
+        )
 
     @pytest.mark.anyio
     async def test_best_fit_picks_tighter_node(self):

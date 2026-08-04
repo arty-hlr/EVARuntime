@@ -33,16 +33,9 @@
 # --admin-url : plan de CONTRÔLE (création/retrait de l'identité éphémère,
 #               chargement du modèle, lecture du log d'usage, `/ready`).
 #               Il vise la gateway EN DIRECT par défaut, volontairement :
-#                 * `/ready` n'est pas proxifiée par `deploy/nginx.conf`
-#                   (`location /` renvoie 404) — elle n'est joignable qu'en
-#                   direct ;
-#                 * `location /admin/` impose `proxy_read_timeout 30s` alors que
-#                   `POST /admin/models/{id}/load` peut légitimement attendre
-#                   `MODEL_LOAD_TIMEOUT_SECONDS + 10` (jusqu'à ~310 s mesurées par
-#                   AUT-012). À travers nginx, le chargement renverrait 504 alors
-#                   qu'il RÉUSSIT côté serveur, et le smoke test conclurait à tort
-#                   à une régression. Ce défaut est suivi par COR-009 et n'est PAS
-#                   corrigé ici : on le contourne en appelant l'admin en direct.
+#                 * le secret admin n'a aucune raison de traverser la façade ;
+#                   l'appel direct reste valable même avec un nginx ancien ou
+#                   personnalisé dont le timeout de chargement serait trop court.
 #
 # ── Sécurité ─────────────────────────────────────────────────────────────────
 #
@@ -245,7 +238,7 @@ CLUSTER_MODE="$(env_value CLUSTER_MODE)"; CLUSTER_MODE="${CLUSTER_MODE:-local}"
 
 case "$ADMIN_URL" in
     http://127.0.0.1:*|http://localhost:*|http://[::1]:*) : ;;
-    *) warn "URL de contrôle non-loopback ($ADMIN_URL) : si elle traverse nginx, le chargement du modèle se heurtera à proxy_read_timeout 30s sur /admin/ (COR-009)." ;;
+    *) warn "URL de contrôle non-loopback ($ADMIN_URL) : préférez la gateway locale pour ne pas exposer ADMIN_SECRET et éviter un timeout de proxy ancien/personnalisé." ;;
 esac
 
 # ── Répertoire temporaire (700) et nettoyage garanti ──────────────────────────
@@ -814,7 +807,7 @@ fi
 info "Liveness confirmée."
 
 # ── 2. Readiness structurelle ─────────────────────────────────────────────────
-# `/ready` n'est pas proxifiée par nginx : elle est interrogée en direct.
+# Le plan de contrôle direct évite de transmettre ADMIN_SECRET à la façade.
 
 section "2/8  Readiness structurelle (GET /ready sur le plan de contrôle)"
 CODE="$(admin_call GET /ready "$TMP_DIR/ready.json" "$READY_TIMEOUT")"
@@ -909,7 +902,7 @@ CODE="$(admin_call POST "/admin/models/$MODEL_ID/load" "$TMP_DIR/load.json" "$LO
 if [[ "$CODE" != "200" ]]; then
     put reason "model_load_failed:${CODE:-000}"
     fail "POST /admin/models/$MODEL_ID/load a répondu ${CODE:-<aucune réponse>}."
-    [[ "$CODE" != "504" ]] || fail "504 : l'appel a probablement traversé nginx (proxy_read_timeout 30s sur /admin/, COR-009). Visez --admin-url en direct."
+    [[ "$CODE" != "504" ]] || fail "504 : l'appel de contrôle a probablement traversé un proxy dont le timeout est trop court. Visez --admin-url en direct."
     finish "$EXIT_GENERATION"
 fi
 info "Modèle chargé et prêt."

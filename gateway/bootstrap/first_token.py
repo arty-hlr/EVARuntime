@@ -203,10 +203,9 @@ class FirstTokenSettings:
 
     `base_url` est le chemin PUBLIC : le viser sur nginx (`https://…`) est la
     seule façon de couvrir TLS, `limit_req` et surtout `proxy_buffering off`.
-    `admin_url` est le plan de CONTRÔLE et vise la gateway en direct, pour deux
-    raisons documentées : `/ready` n'est pas proxifiée par `deploy/nginx.conf`,
-    et `location /admin/` impose `proxy_read_timeout 30s` alors qu'un chargement
-    de modèle peut légitimement durer ~310 s (COR-009, encore ouvert).
+    `admin_url` est le plan de CONTRÔLE et vise la gateway en direct : le secret
+    admin ne doit pas traverser inutilement la façade et un proxy
+    ancien/personnalisé peut encore porter un timeout de chargement insuffisant.
 
     `model_id` à `None` fait dériver le modèle du plus petit modèle ACTIVÉ
     annoncé par `GET /admin/models` : une recette ne doit pas mobiliser 42 Go de
@@ -1032,8 +1031,8 @@ async def _run_stages(
     if charge.status != 200:
         detail = ""
         if charge.status == 504:
-            detail = (" Un 504 signale un appel passé à travers nginx (proxy_read_timeout 30s "
-                      "sur /admin/, COR-009) : visez le plan de contrôle en direct.")
+            detail = (" Un 504 signale probablement un proxy dont le timeout de "
+                      "chargement est trop court : visez le plan de contrôle en direct.")
         state.add("model_load", STAGE_FAIL, REASON_MODEL_LOAD,
                   f"POST /admin/models/{state.model}/load a répondu {charge.status}.{detail}")
         return REASON_MODEL_LOAD

@@ -61,10 +61,14 @@ cmake -S . -B build -G Ninja \
   -DLLAMA_CURL=ON
 
 cmake --build build -j$(nproc)
-sudo install -m 0755 build/bin/llama-server /usr/local/bin/llama-server
+RELEASE="manual-sm121-$(date +%Y%m%d)"
+sudo install -d -m 0755 "/opt/llama.cpp/releases/$RELEASE"
+sudo install -m 0755 build/bin/llama-server \
+  "/opt/llama.cpp/releases/$RELEASE/llama-server"
+sudo ln -sfn "/opt/llama.cpp/releases/$RELEASE" /opt/llama.cpp/current
 
 # Vérification — doit afficher "compute capability 12.1"
-llama-server --version
+/opt/llama.cpp/current/llama-server --version
 ```
 
 **Explications des flags clés :**
@@ -95,11 +99,21 @@ cmake -S . -B build -G Ninja \
   -DLLAMA_CURL=ON
 
 cmake --build build -j$(nproc)
-sudo install -m 0755 build/bin/llama-server /usr/local/bin/llama-server
+RELEASE="manual-sm121a-$(date +%Y%m%d)"
+sudo install -d -m 0755 "/opt/llama.cpp/releases/$RELEASE"
+sudo install -m 0755 build/bin/llama-server \
+  "/opt/llama.cpp/releases/$RELEASE/llama-server"
+sudo ln -sfn "/opt/llama.cpp/releases/$RELEASE" /opt/llama.cpp/current
 ```
 
 À utiliser uniquement si les deux DGX Spark exécutent exactement le même
 binaire et que vous ne redistribuez pas le build.
+
+Pour une installation de production, préférez malgré tout le workflow
+`evaruntime bootstrap-plan` puis `bootstrap-apply` décrit dans
+[`deployment.md`](deployment.md) : il vérifie le commit, le build minimal et le
+SHA-256 avant de publier ce même lien `current`, puis aligne atomiquement le
+fichier d'environnement du service.
 
 ---
 

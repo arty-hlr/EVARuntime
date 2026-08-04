@@ -24,11 +24,13 @@ après inactivité. En mode cluster, chaque nœud GPU exécute cet agent de cont
 ## Installation
 
 Pré-requis : Ubuntu/systemd, Python 3.11+, `rsync`, OpenSSL, pilotes GPU et un
-`/usr/local/bin/llama-server` exécutable.
+`/opt/llama.cpp/current/llama-server` exécutable et attesté.
 
 ```bash
 sudo bash node_agent/deploy/install-agent.sh \
   --node-id dgx-a \
+  --llama-min-build <premier_build_corrige> \
+  --agent-secret-file /root/agent-secret \
   --orchestrator-cidr 10.42.0.10/32
 ```
 
@@ -40,15 +42,17 @@ Le script :
 - ajoute `llmservice` aux groupes GPU `render` et `video` lorsqu'ils existent;
 - applique les règles UFW control + data-plane si UFW est actif et qu'un CIDR
   orchestrateur est fourni;
-- valide secrets, binaire, TLS, répertoires, ports et budget VRAM avant d'activer
-  le service. Il ne le démarre pas avant la vérification opérateur du firewall.
+- valide secrets, binaire, **version minimale attestée**, TLS, répertoires, ports
+  et budget VRAM avant d'activer le service. Il ne le démarre pas avant la
+  vérification opérateur du firewall.
 
-Pour fournir le même secret que celui déjà préparé côté orchestrateur, utilisez
-un fichier root-only; ne placez pas le secret dans la ligne de commande :
+Le secret doit être celui préparé côté orchestrateur. Transférez-le dans un
+fichier root-only; ne placez jamais sa valeur dans la ligne de commande :
 
 ```bash
 sudo bash node_agent/deploy/install-agent.sh \
   --node-id dgx-a \
+  --llama-min-build <premier_build_corrige> \
   --agent-secret-file /root/agent-secret \
   --orchestrator-cidr 10.42.0.10/32
 ```

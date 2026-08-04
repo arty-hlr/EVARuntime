@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from model_registry import ModelDefinition, ModelRegistry
+from telemetry import MODEL_LOAD_SECONDS
 
 from .node_client import NodeClient, NodeUnreachableError, NodeProtocolError
 from .node_protocol import ModelStateOnNode, NodeHealth
@@ -172,6 +173,10 @@ class ClusterModelHandle:
     @property
     def active_requests(self) -> int:
         return self._info.active_requests
+
+    @property
+    def telemetry_node(self) -> str:
+        return self._info.node_id
 
     async def report_backend_failure(self) -> None:
         """
@@ -673,6 +678,8 @@ class ClusterManager:
                     )
                     continue
 
+                load_started_at = time.monotonic()
+                load_outcome = "success"
                 try:
                     resp = await chosen_state.client.load_model(model.to_dict())
                     if resp.model_id != model.id:
@@ -681,8 +688,10 @@ class ClusterManager:
                             f"reçu '{resp.model_id}'"
                         )
                 except asyncio.CancelledError:
+                    load_outcome = "cancelled"
                     raise
                 except Exception as exc:
+                    load_outcome = "error"
                     async with self._lock:
                         self._record_failure_locked(chosen_state, exc)
                     failed_nodes.add(chosen_state.node_id)
@@ -694,6 +703,13 @@ class ClusterManager:
                         exc,
                     )
                     continue
+                finally:
+                    MODEL_LOAD_SECONDS.observe(
+                        max(0.0, time.monotonic() - load_started_at),
+                        model=model.id,
+                        node=chosen_state.node_id,
+                        outcome=load_outcome,
+                    )
 
                 info = _LoadedInfo(
                     node_id=chosen_state.node_id,

@@ -179,14 +179,15 @@ curl -s -H "Authorization: Bearer $ADMIN_SECRET" http://127.0.0.1:8000/ready | j
 ```json
 [{"name": "llama_server_binary", "status": "fail",
   "code": "llama_server_missing",
-  "message": "Binaire llama-server introuvable : /usr/local/bin/llama-server. Compilez/installez llama.cpp ou corrigez LLAMA_SERVER_BIN.",
+  "message": "Binaire llama-server introuvable : /opt/llama.cpp/current/llama-server. Compilez/installez llama.cpp ou corrigez LLAMA_SERVER_BIN.",
   "critical": true}]
 ```
 
 Un `ADMIN_SECRET` laissé à sa valeur d'exemple ne privilégie personne
-(fail-closed). `nginx.conf` ne proxifie que `/health`, `/v1/` et `/admin/` :
-`/ready` n'est donc atteignable qu'en local (`127.0.0.1:8000`), ce qui la rend
-inutilisable depuis Internet même dans sa forme publique.
+(fail-closed). `nginx.conf` proxifie explicitement la forme publique de
+`/ready`, sans chemin ni détail d'infrastructure, afin qu'un load balancer
+puisse décider du routage. Les détails actionnables restent conditionnés au
+bearer admin et le plan de contrôle direct est recommandé pour leur lecture.
 
 #### Coût et chemin chaud
 
@@ -251,6 +252,9 @@ Métriques exposées (noms exacts) :
 | `eva_vram_total_gb` | gauge | — | VRAM totale du budget |
 | `eva_vram_available_gb` | gauge | — | VRAM disponible estimée |
 | `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
+| `eva_inference_ttft_seconds` | histogram | `model`, `node`, `outcome` | Temps entre la réception de la requête et le premier contenu SSE visible (queue et chargement inclus) |
+| `eva_model_load_seconds` | histogram | `model`, `node`, `outcome` | Durée d'un appel réel de chargement local ou distant |
+| `eva_capacity_queue_wait_seconds` | histogram | `model`, `node`, `outcome` | Attente dans la queue locale de capacité VRAM/ports |
 | `eva_llama_kv_cache_usage_ratio` | gauge | `model` (+ `node` en cluster) | Occupation du KV cache (0–1) |
 | `eva_llama_tokens_per_second` | gauge | `model` (+ `node`) | Débit de génération |
 | `eva_llama_requests_processing` | gauge | `model` (+ `node`) | Requêtes en cours d'inférence |
@@ -263,6 +267,15 @@ Propriétés importantes :
   omise ou émise à `0` — jamais de `500`.
 - **Aucune fuite de prompt** : uniquement des compteurs agrégés. Aucun contenu de
   requête ou de réponse n'est exposé.
+- **Cardinalité bornée** : les trois histogrammes runtime n'acceptent que les
+  labels techniques `model`, `node` et `outcome`, tronquent les valeurs, limitent
+  chaque métrique à 512 séries et agrègent tout dépassement dans
+  `__overflow__`. Aucun identifiant utilisateur, email ou texte libre n'entre
+  dans ces séries.
+- **État en mémoire** : les histogrammes runtime repartent de zéro à chaque
+  redémarrage du processus. Leurs buckets, `_sum` et `_count` suivent le format
+  Prometheus standard ; utiliser `rate(..._count[5m])` et
+  `histogram_quantile()` sur les buckets pour les alertes de tendance.
 - **Fenêtres temporelles** : les compteurs `eva_requests_total` /
   `eva_tokens_total` sont calculés sur une fenêtre glissante de 24h dans
   `usage_log` ; les percentiles de latence sur 7j. Ce ne sont donc pas des

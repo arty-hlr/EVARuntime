@@ -102,8 +102,9 @@ cd EVARuntime
 sudo bash gateway/deploy/install.sh --mode local
 ```
 
-Installation is the privileged layer. A separate, unprivileged layer answers the
-question that comes before it — what would be installed on this host, and why:
+Production bootstrap has three explicit stages: review a non-mutating plan,
+install the service base, then apply the reviewed plan to publish the pinned
+runtime and models and prove the first token:
 
 ```bash
 cd gateway && python cli.py bootstrap-plan
@@ -112,8 +113,9 @@ cd gateway && python cli.py bootstrap-plan
 `bootstrap-plan` produces a versioned, secret-free document meant to be reviewed
 or pasted into a ticket. It writes nothing and installs nothing; without a pinned
 `llama.cpp` version and commit it deliberately reports a blocked plan rather than
-inventing a build number. See the
-[admin guide](docs/admin.md#9-planificateur-damorçage--bootstrap-plan).
+inventing a build number. The complete production sequence, including
+`bootstrap-apply`, systemd environment hardening, `doctor` and the public smoke
+test, is in the [deployment guide](docs/deployment.md#parcours-production-complet--mode-local).
 
 Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
 multi-node orchestrator, inspect the plan first, then install explicitly:
@@ -191,7 +193,7 @@ Start with [gateway/.env.example](gateway/.env.example). The important settings 
 | Setting | Purpose |
 | --- | --- |
 | `MODELS_CONFIG_PATH` | YAML model registry |
-| `LLAMA_SERVER_BIN` | Path to the CUDA-enabled `llama-server` binary |
+| `LLAMA_SERVER_BIN` | Published CUDA runtime (supported default: `/opt/llama.cpp/current/llama-server`) |
 | `INTERNAL_API_KEY` | Internal gateway-to-backend key |
 | `ADMIN_SECRET` | Secret for admin endpoints |
 | `IDLE_TIMEOUT_SECONDS` | Idle delay before unloading a model |
@@ -203,6 +205,7 @@ Never publish real `.env` files, generated secrets, TLS private keys, databases 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Dependency and CVE policy](docs/dependency-policy.md)
 - [API guide](docs/api.md)
 - [Admin guide](docs/admin.md)
 - [Deployment guide](docs/deployment.md)

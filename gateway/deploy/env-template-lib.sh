@@ -90,7 +90,10 @@ deploy_render_env_file() {
 
 # ── Chemins ───────────────────────────────────────────────────────────────────
 MODELS_CONFIG_PATH=${data_dir}/models.yaml
-LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+# Chemin stable publié atomiquement par bootstrap-apply. Le lien peut être
+# absent au premier démarrage ; /health reste disponible et /ready explique
+# alors que le runtime doit encore être appliqué.
+LLAMA_SERVER_BIN=${LLAMA_BIN:-/opt/llama.cpp/current/llama-server}
 DB_PATH=${data_dir}/gateway.db
 LOG_DIR=${log_dir}
 

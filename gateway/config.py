@@ -61,7 +61,7 @@ class Settings(BaseSettings):
 
     # ── Chemins ────────────────────────────────────────────────────────────────
     models_config_path: Path = Path("/var/lib/llm-gateway/models.yaml")
-    llama_server_bin: Path = Path("/usr/local/bin/llama-server")
+    llama_server_bin: Path = Path("/opt/llama.cpp/current/llama-server")
     db_path: Path = Path("/var/lib/llm-gateway/gateway.db")
     log_dir: Path = Path("/var/log/llm-gateway")
 
@@ -73,8 +73,8 @@ class Settings(BaseSettings):
     # Build minimal accepté du binaire llama-server. 0 = pas d'enforcement (défaut).
     # Recommandé : fixer au premier build patché contre GHSA-8947-pfff-2f3c
     # (écriture OOB via n_discard/context-shift) et les overflows de parsing GGUF.
-    # Si > 0 et que le binaire lu est plus ancien, le démarrage est REFUSÉ ; si la
-    # version est illisible, on se contente d'un avertissement (non fatal).
+    # Si > 0 et que le binaire lu est plus ancien OU illisible, le démarrage est
+    # REFUSÉ : un plancher qu'on ne peut pas attester reste fail-closed.
     llama_server_min_build: int = 0
 
     # ── Pool de ports multi-modèles ────────────────────────────────────────────

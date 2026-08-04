@@ -532,7 +532,7 @@ def test_chargement_de_modele_en_echec():
     passerelle.load_status = 504
     rapport = run_recipe(passerelle, make_settings(), horloge)
     assert rapport.reason == ft.REASON_MODEL_LOAD
-    assert any("COR-009" in s.message for s in rapport.stages)
+    assert any("plan de contrôle en direct" in s.message for s in rapport.stages)
 
 
 def test_flux_sans_contenu_fait_echouer_la_recette_entiere():
@@ -1217,12 +1217,12 @@ def test_chargement_en_echec_conserve_l_ancienne_version():
     assert decision.retain_previous_version is True
 
 
-def test_un_504_sur_le_chargement_designe_cor_009():
+def test_un_504_sur_le_chargement_recommande_le_plan_direct():
     horloge = FakeClock()
     passerelle = FakeGateway(horloge)
     passerelle.load_status = 504
     resultat = run_warmup(passerelle, horloge, probe=_sonde_servie)
-    assert any("COR-009" in s.message for s in resultat.stages)
+    assert any("plan de contrôle en direct" in s.message for s in resultat.stages)
 
 
 def test_health_jamais_atteinte_expire_sur_la_borne_derivee():

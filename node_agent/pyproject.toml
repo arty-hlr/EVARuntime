@@ -3,7 +3,7 @@
 # Même approche conservatrice que gateway/ : E + F
 # seulement, avec des `per-file-ignores` ciblés.
 #
-# main.py fait volontairement des `sys.path.insert(...)` suivis d'imports
+# main.py et preflight.py font volontairement des `sys.path.insert(...)` suivis d'imports
 # modules situés après (cf. docstring en tête du fichier) pour garantir que
 # `from config import settings` résout vers node_agent/config.py et non
 # gateway/config.py (collision de nom de module top-level). Cela déclenche
@@ -19,3 +19,4 @@ select = ["E", "F"]
 
 [tool.ruff.lint.per-file-ignores]
 "main.py" = ["E402"]
+"preflight.py" = ["E402"]

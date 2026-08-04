@@ -8,6 +8,7 @@ import pytest
 
 import model_manager as model_manager_module
 import proxy
+import telemetry
 from config import settings
 from model_manager import (
     CapacityQueueFull,
@@ -257,6 +258,7 @@ async def test_queue_full_raises(capacity_settings, monkeypatch):
 
 @pytest.mark.anyio
 async def test_queue_timeout_raises(capacity_settings, monkeypatch):
+    telemetry.reset_all()
     monkeypatch.setattr(settings, "capacity_queue_timeout_seconds", 0.05)
     old = FakeModelDef("old", 10.0)
     new = FakeModelDef("new", 10.0)
@@ -267,6 +269,13 @@ async def test_queue_timeout_raises(capacity_settings, monkeypatch):
         await manager.ensure_model_loaded("new")
 
     assert manager.status()["capacity_queue"]["waiters"] == 0
+    series = telemetry.CAPACITY_QUEUE_SECONDS.snapshot().series
+    assert len(series) == 1
+    assert (series[0].model, series[0].outcome, series[0].count) == (
+        "new",
+        "timeout",
+        1,
+    )
 
 
 @pytest.mark.anyio

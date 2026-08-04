@@ -28,6 +28,7 @@ from collections import deque
 from config import settings
 from model_registry import ModelDefinition, ModelRegistry
 from server_manager import ModelState, ServerManager
+from telemetry import CAPACITY_QUEUE_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -319,6 +320,8 @@ class LocalModelManager:
             )
 
         ticket: object | None = None
+        queue_started_at: float | None = None
+        queue_outcome = "success"
         extra_eviction_done = not force_extra_eviction
         deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
         try:
@@ -357,12 +360,19 @@ class LocalModelManager:
 
                 if ticket is None:
                     if len(self._capacity_waiters) >= settings.capacity_queue_max_waiters:
+                        CAPACITY_QUEUE_SECONDS.observe(
+                            0.0,
+                            model=model.id,
+                            node="local",
+                            outcome="full",
+                        )
                         raise CapacityQueueFull(
                             f"Impossible de charger '{model.id}' : queue VRAM pleine "
                             f"({settings.capacity_queue_max_waiters} requêtes en attente). "
                             f"Réessayez dans quelques secondes."
                         )
                     ticket = object()
+                    queue_started_at = time.monotonic()
                     self._capacity_waiters.append(ticket)
                     log.info(
                         "Requête pour '%s' mise en attente de capacité VRAM "
@@ -375,6 +385,7 @@ class LocalModelManager:
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    queue_outcome = "timeout"
                     raise CapacityQueueTimeout(
                         f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
                         f"après {settings.capacity_queue_timeout_seconds}s d'attente. "
@@ -384,12 +395,27 @@ class LocalModelManager:
                 try:
                     await asyncio.wait_for(self._capacity_cond.wait(), timeout=remaining)
                 except asyncio.TimeoutError as exc:
+                    queue_outcome = "timeout"
                     raise CapacityQueueTimeout(
                         f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
                         f"après {settings.capacity_queue_timeout_seconds}s d'attente. "
                         f"Réessayez dans quelques secondes."
                     ) from exc
+        except asyncio.CancelledError:
+            queue_outcome = "cancelled"
+            raise
+        except Exception:
+            if queue_started_at is not None and queue_outcome == "success":
+                queue_outcome = "error"
+            raise
         finally:
+            if queue_started_at is not None:
+                CAPACITY_QUEUE_SECONDS.observe(
+                    max(0.0, time.monotonic() - queue_started_at),
+                    model=model.id,
+                    node="local",
+                    outcome=queue_outcome,
+                )
             if ticket is not None:
                 try:
                     self._capacity_waiters.remove(ticket)

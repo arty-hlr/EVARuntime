@@ -296,7 +296,7 @@ if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité orchestrateur introuvable"
 else
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
-    [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
+    [[ -x "${LLAMA_BIN:-/opt/llama.cpp/current/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/opt/llama.cpp/current/llama-server})"
 fi
 # ── Durcissements absents d'un environnement antérieur à SEC-002 ──────────────
 # `update.sh` ne régénère JAMAIS /etc/llm-gateway/env : un hôte installé avant
@@ -368,7 +368,8 @@ restore_code_snapshot() {
     deploy_restore_gateway_code "$snapshot" "$INSTALL_DIR"
     rm -rf "$INSTALL_DIR/static"
     [[ ! -d "$snapshot/static" ]] || cp -a "$snapshot/static" "$INSTALL_DIR/static"
-    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
+    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py \
+        "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
     [[ ! -d "$INSTALL_DIR/cluster" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
     [[ ! -d "$INSTALL_DIR/bootstrap" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/bootstrap"
     [[ ! -d "$INSTALL_DIR/static" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/static"
@@ -378,7 +379,7 @@ restore_code_snapshot() {
     [[ ! -d "$INSTALL_DIR/bootstrap" ]] || chmod 750 "$INSTALL_DIR/bootstrap"
     [[ ! -d "$INSTALL_DIR/bootstrap" ]] || \
         chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
-    chmod 644 "$INSTALL_DIR/requirements.txt"
+    chmod 644 "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 }
 
 VENV_SWITCHED=false
@@ -586,8 +587,8 @@ trap 'rollback_failed_transaction $?' ERR
 section "Préparation transactionnelle des dépendances Python"
 STAGED_VENV="$INSTALL_DIR/venv-release-${AFTER:0:12}-$(date +%Y%m%d%H%M%S)"
 "$INSTALL_DIR/venv/bin/python" -m venv "$STAGED_VENV"
-"$STAGED_VENV/bin/pip" install --upgrade pip --quiet
-"$STAGED_VENV/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" --quiet
+"$STAGED_VENV/bin/pip" install --require-hashes \
+    -r "$SCRIPT_DIR/requirements.lock" --quiet
 "$STAGED_VENV/bin/pip" check
 info "Venv neuf validé : $STAGED_VENV (l'ancien reste actif jusqu'au redémarrage)."
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
@@ -615,13 +616,14 @@ section "2/5  Synchronisation du code source"
 CODE_MUTATED=true
 deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"
 
-chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
+chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py \
+    "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/bootstrap"
 chmod 640 "$INSTALL_DIR"/*.py "$INSTALL_DIR/cluster"/*.py
 chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
 chmod 750 "$INSTALL_DIR/cluster" "$INSTALL_DIR/bootstrap"
-chmod 644 "$INSTALL_DIR/requirements.txt"
+chmod 644 "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 
 info "Fichiers Python copiés (gateway + cluster/ + bootstrap/)."
 
@@ -717,19 +719,15 @@ section "4d. Timer de sauvegarde + rotation journald"
 # État AVANT copie : distingue « jamais installé » de « désactivé volontairement ».
 BACKUP_TIMER_STATE="$(systemctl is-enabled llm-gateway-backup.timer 2>/dev/null || true)"
 
-mkdir -p "$INSTALL_DIR/deploy"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
-# La recette du premier token est installée à côté du service pour qu'un
-# opérateur puisse la relancer en incident sans disposer du checkout Git.
-# `deploy-mode-lib.sh` l'accompagne : smoke_test.sh la source depuis son propre
-# répertoire pour lire l'EnvironmentFile sans jamais le sourcer.
-cp "$SCRIPT_DIR/deploy/smoke_test.sh"       "$INSTALL_DIR/deploy/"
-cp "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"  "$INSTALL_DIR/deploy/"
-cp "$SCRIPT_DIR/deploy/nginx-lib.sh"        "$INSTALL_DIR/deploy/"
+# Même jeu que sur une installation neuve : recette du premier token,
+# bibliothèques qu'elle source et modèle de matrice runtime compris.
+deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
 chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh" \
           "$INSTALL_DIR/deploy/smoke_test.sh"
-chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh" "$INSTALL_DIR/deploy/nginx-lib.sh"
+chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh" \
+          "$INSTALL_DIR/deploy/nginx-lib.sh" \
+          "$INSTALL_DIR/deploy/runtime-variants.yaml.example"
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
 systemctl daemon-reload

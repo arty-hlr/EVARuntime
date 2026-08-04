@@ -1622,8 +1622,8 @@ privilège**.
 | `smoke_test.sh` | La chaîne publique sert-elle réellement un token ? | oui, et démarré |
 
 L'installation elle-même reste le domaine de `install.sh` : la séparation entre
-la couche privilégiée qui écrit et la couche non privilégiée qui explique est
-détaillée dans l'[architecture](architecture.md#deux-couches-et-pourquoi-elles-sont-séparées).
+les trois étapes — plan, installation du socle et application relue — sont
+détaillées dans l'[architecture](architecture.md#trois-étapes-et-pourquoi-elles-sont-séparées).
 
 ### Usage
 
@@ -1645,7 +1645,8 @@ cd /opt/llm-gateway
     --models-dir /models
 
 # Évaluer un llama-server déjà en place (`--version` sera exécuté sur ce binaire)
-./venv/bin/python cli.py bootstrap-plan --llama-bin /usr/local/bin/llama-server
+./venv/bin/python cli.py bootstrap-plan \
+    --llama-bin /opt/llama.cpp/current/llama-server
 
 # Restreindre le plan à une entrée du catalogue
 ./venv/bin/python cli.py bootstrap-plan --model qwen2.5-0.5b-instruct-q4_k_m
@@ -2173,7 +2174,7 @@ ce plan** : installation du runtime, téléchargement des modèles, écriture du
 registre, calibration, activation, pré-chauffage, recette du premier token, puis
 rapport d'installation.
 
-> **État au 2026-08-01 — lisez ceci avant d'essayer.** Les neuf actions ont un
+> **État au 2026-08-03 — lisez ceci avant d'essayer.** Les neuf actions ont un
 > câblage de production depuis la CLI : décision runtime reconstruite depuis le
 > plan relu, téléchargement, acceptation explicite de licence, sondes réelles
 > RAM/VRAM et `llama-server` isolé sur loopback, client HTTP asynchrone pour la
@@ -2214,9 +2215,10 @@ protègent deux risques distincts.
 ./venv/bin/python cli.py bootstrap-apply /tmp/plan.json \
     --allowed-root /models --allowed-root /opt/llama.cpp \
     --allowed-root /var/lib/llm-gateway --allowed-root /etc/llm-gateway \
-    --models-dir /models --registry /etc/llm-gateway/models.yaml \
+    --models-dir /models --registry /var/lib/llm-gateway/models.yaml \
     --runtime-root /opt/llama.cpp \
     --calibration-report-dir /var/lib/llm-gateway/calibration \
+    --env-file /etc/llm-gateway/env \
     --base-url https://eva.example.edu --admin-url http://127.0.0.1:8000 \
     --vram-budget-gb 43.6 \
     --accept-license qwen2.5-0.5b-instruct-q4_k_m \
@@ -2226,21 +2228,30 @@ protègent deux risques distincts.
 ./venv/bin/python cli.py bootstrap-apply /tmp/plan.json --apply \
     --allowed-root /models --allowed-root /opt/llama.cpp \
     --allowed-root /var/lib/llm-gateway --allowed-root /etc/llm-gateway \
-    --models-dir /models --registry /etc/llm-gateway/models.yaml \
+    --models-dir /models --registry /var/lib/llm-gateway/models.yaml \
     --runtime-root /opt/llama.cpp \
     --calibration-report-dir /var/lib/llm-gateway/calibration \
+    --env-file /etc/llm-gateway/env \
     --base-url https://eva.example.edu --admin-url http://127.0.0.1:8000 \
-    --admin-secret-file /etc/llm-gateway/admin.secret \
     --vram-budget-gb 43.6 \
     --accept-license qwen2.5-0.5b-instruct-q4_k_m \
     --license-reference CHG-2026-081
 ```
 
 La simulation n'exige aucun secret : ses raccords HTTP sont décrits mais jamais
-appelés. En application, préférez `--admin-secret-file` ; le fichier doit être
-régulier, non symlink, appartenir à root ou à l'utilisateur courant et être en
-mode 0600. La variable d'environnement `ADMIN_SECRET` reste le repli, jamais un
-argument de CLI.
+appelés. Sur le parcours de production, `--env-file /etc/llm-gateway/env` charge
+la configuration exacte du service et fournit son `ADMIN_SECRET` sans créer un
+second fichier secret. `--admin-secret-file` reste une surcharge possible pour
+un déploiement autonome ; il doit être régulier, non symlink, appartenir à root
+ou à l'utilisateur courant et être en mode 0600. Un secret n'est jamais accepté
+en argument de CLI.
+
+Une installation réelle de runtime exige `--env-file` et un `--min-build`
+strictement positif dans le plan. La commande vérifie que `--registry` correspond
+à `MODELS_CONFIG_PATH` et que le binaire publié correspond à
+`LLAMA_SERVER_BIN`. Après succès complet, elle met atomiquement à jour ce binaire
+et `LLAMA_SERVER_MIN_BUILD` dans l'EnvironmentFile ; un échec ou un résultat
+partiel ne durcit jamais prématurément le service.
 
 Un mode d'exécution ne s'obtient **jamais** par omission d'argument. Une
 simulation complète sort en **3**, jamais en 0 : rien n'a été appliqué, et un
@@ -2259,12 +2270,13 @@ problème » et « la machine est installée ».
 | `--registry` | `models.yaml` à écrire. |
 | `--runtime-root` | Racine versionnée où installer les releases de `llama-server`. |
 | `--llama-server-bin` | Binaire à employer pour la calibration ; sinon release installée ou configuration de la gateway. |
+| `--env-file` | EnvironmentFile systemd à relire et durcir. Obligatoire pour poser réellement un runtime ; en production : `/etc/llm-gateway/env`. |
 | `--calibration-report-dir` | Répertoire des preuves JSON de calibration. |
 | `--calibration-port` | Port loopback du `llama-server` isolé de calibration (défaut : `19091`). |
 | `--calibration-load-timeout` | Borne de chargement ; sinon `MODEL_LOAD_TIMEOUT_SECONDS`. |
 | `--base-url` | **Origin** publique de recette, nginx compris (sans chemin, query ni fragment). HTTPS est exigé hors loopback. |
 | `--admin-url` | Origin directe de la gateway pour `/ready` et `/admin`, sans chemin/query/fragment et limitée à loopback afin que `ADMIN_SECRET` ne quitte pas l'hôte. |
-| `--admin-secret-file` | Fichier régulier privé, non symlink, mode 0600 et propriétaire attendu ; sinon `ADMIN_SECRET` vient de l'environnement. La valeur n'est jamais acceptée en argv. |
+| `--admin-secret-file` | Surcharge par fichier régulier privé, non symlink, mode 0600 et propriétaire attendu ; sinon `ADMIN_SECRET` vient de l'EnvironmentFile relu ou de l'environnement. La valeur n'est jamais acceptée en argv. |
 | `--accept-license` | ID dont l'opérateur accepte explicitement la licence. Répétable. |
 | `--license-reference` | Référence technique de changement/ticket associée aux acceptations ; n'y placez ni nom ni email. |
 | `--ttft-threshold-ms` | Seuil de TTFT en millisecondes ; `0` mesure sans seuil. |

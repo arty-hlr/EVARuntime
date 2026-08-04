@@ -158,6 +158,12 @@ def test_min_build_is_present_and_typed(tmp_path: Path) -> None:
     assert isinstance(config.llama_server_min_build, int)
 
 
+def test_generated_environment_targets_the_bootstrap_runtime_link(tmp_path: Path) -> None:
+    """La calibration et le service public doivent employer le même runtime."""
+    config = load_settings_from_env_file(render_env(tmp_path))
+    assert config.llama_server_bin == Path("/opt/llama.cpp/current/llama-server")
+
+
 def test_min_build_comment_tells_how_to_pin_it(tmp_path: Path) -> None:
     """
     À 0 le garde-fou est inerte : le fichier doit dire comment le lever.
@@ -192,6 +198,12 @@ def test_generated_allowlist_accepts_the_shipped_registry(tmp_path: Path) -> Non
         allowed_model_dirs=list(config.allowed_model_dirs),
     )
     assert registry.list_all(), "Le registre livré est vide : contrôle inerte."
+
+
+def test_shipped_registry_never_enables_missing_artifacts_by_default() -> None:
+    """Une machine neuve doit rester honnêtement non-ready, sans faux modèle actif."""
+    registry = ModelRegistry(config_path=SHIPPED_REGISTRY)
+    assert registry.list_enabled() == []
 
 
 def test_a_naive_allowlist_would_have_broken_the_install() -> None:
@@ -246,6 +258,14 @@ def test_install_script_uses_the_shared_renderer() -> None:
         "Un second rendu en ligne subsiste dans install.sh : deux sources de "
         "vérité pour le même fichier, dont une non testée."
     )
+
+
+def test_fresh_install_defers_a_missing_runtime_to_bootstrap_apply() -> None:
+    """Le socle doit pouvoir être posé avant le runtime qu'il va amorcer."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "Runtime llama-server encore absent" in text
+    assert "jusqu'à bootstrap-apply" in text
+    assert '[[ -x "$LLAMA_BIN" ]] || error' not in text
 
 
 def test_update_script_reports_missing_hardening() -> None:

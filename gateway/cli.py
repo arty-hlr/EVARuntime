@@ -828,6 +828,10 @@ def bootstrap_apply(
         None, "--admin-secret-file",
         help="Fichier privé contenant ADMIN_SECRET (sinon variable ADMIN_SECRET ; jamais argv)",
     ),
+    env_file: Optional[str] = typer.Option(
+        None, "--env-file",
+        help="EnvironmentFile du service à recouper et durcir (production : /etc/llm-gateway/env)",
+    ),
     accept_license: Optional[list[str]] = typer.Option(
         None, "--accept-license", help="ID de modèle dont la licence est acceptée (répétable)"
     ),
@@ -861,6 +865,10 @@ def bootstrap_apply(
     lance son propre llama-server sur loopback : elle ne rend pas publiquement
     servable une entrée encore désactivée.
 
+    Une pose réelle du runtime exige l'EnvironmentFile du service et un plancher
+    de build positif. Après succès complet uniquement, les deux réglages runtime
+    de ce fichier sont remplacés atomiquement sans changer ni afficher ses secrets.
+
     Exit codes : 0 installation complète, 1 échec ou plan inapplicable,
     2 erreur d'usage / câblage incomplet, 3 partiel (dont toute simulation),
     4 erreur interne de l'applicateur.
@@ -875,6 +883,24 @@ def bootstrap_apply(
     from bootstrap import production as _production
     from bootstrap import registry_writer as _writer
     from bootstrap import schema as _schema
+    from bootstrap import service_env as _service_env
+    from doctor import check_env_file as _check_env_file
+    from doctor import collect_secret_values as _collect_secret_values
+    from doctor import load_settings_from_env_file as _load_settings_from_env_file
+    from doctor import parse_env_file as _parse_env_file
+    from doctor import redact as _redact_known_secrets
+
+    service_env_path = _Path(env_file) if env_file else None
+    service_secret_values = (
+        _collect_secret_values(None, _parse_env_file(service_env_path))
+        if service_env_path is not None
+        else ()
+    )
+
+    def _safe_message(message: str) -> str:
+        return _execution.redact_for_log(
+            _redact_known_secrets(message, service_secret_values)
+        )
 
     roots = [r for r in (allowed_root or []) if r.strip()]
     if not roots:
@@ -900,13 +926,33 @@ def bootstrap_apply(
         # depuis CE document validé, jamais depuis une seconde décision.
         loaded_plan = _execution.load_plan_file(_Path(plan))
     except _execution.PlanRefused as exc:
-        console.print("[red]Plan refusé :[/red] " + _execution.redact_for_log(str(exc)))
+        console.print("[red]Plan refusé :[/red] " + _safe_message(str(exc)))
         raise typer.Exit(_schema.EXIT_BLOCKED)
 
     mode = (
         _execution.ExecutionMode.APPLY if apply_for_real
         else _execution.ExecutionMode.DRY_RUN
     )
+
+    service_settings = settings
+    admin_secret_environ = None
+    if service_env_path is not None:
+        env_check = _check_env_file(service_env_path, explicit=True)
+        if env_check.is_blocking:
+            console.print(
+                "[red]EnvironmentFile refusé :[/red] "
+                + _safe_message(env_check.message)
+            )
+            raise typer.Exit(_schema.EXIT_USAGE)
+        try:
+            service_settings = _load_settings_from_env_file(service_env_path)
+        except Exception as exc:
+            console.print(
+                "[red]EnvironmentFile invalide :[/red] "
+                + _safe_message(str(exc))
+            )
+            raise typer.Exit(_schema.EXIT_USAGE)
+        admin_secret_environ = {"ADMIN_SECRET": service_settings.admin_secret}
 
     try:
         config = _build_applier_config(
@@ -932,6 +978,9 @@ def bootstrap_apply(
             base_url=base_url,
             admin_url=admin_url,
             admin_secret_file=_Path(admin_secret_file) if admin_secret_file else None,
+            service_env_path=service_env_path,
+            service_settings=service_settings,
+            admin_secret_environ=admin_secret_environ,
             accepted_license_ids=tuple(accept_license or ()),
             license_reference=license_reference,
             ttft_threshold_ms=ttft_threshold_ms,
@@ -940,7 +989,7 @@ def bootstrap_apply(
         )
     except (_schema.PlanError, OSError, ValueError) as exc:
         console.print(
-            "[red]Câblage refusé :[/red] " + _execution.redact_for_log(str(exc))
+            "[red]Câblage refusé :[/red] " + _safe_message(str(exc))
         )
         raise typer.Exit(_schema.EXIT_USAGE)
 
@@ -948,6 +997,20 @@ def bootstrap_apply(
         outcome = _run(applier_module.apply_loaded_plan(
             loaded_plan, config, mode=mode, allowed_roots=[_Path(r) for r in roots],
         ))
+        if (
+            mode is _execution.ExecutionMode.APPLY
+            and outcome.exit_code() == _schema.EXIT_OK
+            and service_env_path is not None
+            and config.runtime is not None
+        ):
+            runtime_resolution = _production.runtime_resolution_from_plan(
+                loaded_plan.document
+            )
+            _service_env.harden_runtime_environment(
+                service_env_path,
+                binary=config.runtime.published_binary,
+                min_build=runtime_resolution.min_build,
+            )
         rendered = (
             _install_report.render_install_json(outcome.install) if json_output
             else _install_report.render_install_human(outcome.install)
@@ -955,7 +1018,7 @@ def bootstrap_apply(
     except applier_module.ApplierUsageError as exc:
         console.print(
             "[red]Demande impossible à honorer :[/red] "
-            + _execution.redact_for_log(str(exc))
+            + _safe_message(str(exc))
         )
         raise typer.Exit(_schema.EXIT_USAGE)
     except _execution.PlanRefused as exc:
@@ -963,7 +1026,7 @@ def bootstrap_apply(
         # porte l'ORIGINE du plan, c'est-à-dire un chemin de fichier fourni par
         # l'opérateur. Un plan déposé sous un nom qui contient un jeton faisait
         # ressortir ce jeton dans le message de refus.
-        console.print("[red]Plan refusé :[/red] " + _execution.redact_for_log(str(exc)))
+        console.print("[red]Plan refusé :[/red] " + _safe_message(str(exc)))
         raise typer.Exit(_schema.EXIT_BLOCKED)
     except Exception as exc:
         # Ni le message ni le type ne sont recopiés d'un objet susceptible de
@@ -971,7 +1034,7 @@ def bootstrap_apply(
         # n'atteigne la sortie ou le journal.
         console.print(
             "[red]bootstrap-apply a échoué :[/red] "
-            + _execution.redact_for_log(f"{type(exc).__name__}: {exc}")
+            + _safe_message(f"{type(exc).__name__}: {exc}")
         )
         raise typer.Exit(_schema.EXIT_ERROR)
 
@@ -1011,6 +1074,9 @@ def _build_applier_config(
     base_url,
     admin_url,
     admin_secret_file,
+    service_env_path,
+    service_settings,
+    admin_secret_environ,
     accepted_license_ids,
     license_reference,
     ttft_threshold_ms,
@@ -1024,10 +1090,14 @@ def _build_applier_config(
     qui ferait croire au câblage. C'est le contrôle de pré-vol de l'applicateur
     qui refusera, en nommant les actions concernées.
     """
+    from pathlib import Path
+
     from bootstrap import calibration as _calibration
     from bootstrap import first_token as _first_token
     from bootstrap import schema as _schema
     from bootstrap import warmup as _warmup
+
+    effective_settings = service_settings or settings
 
     actions = {step.action for step in loaded_plan.steps}
     section_names = {
@@ -1161,7 +1231,7 @@ def _build_applier_config(
         if binary is None and runtime is not None:
             binary = runtime.published_binary
         if binary is None:
-            binary = settings.llama_server_bin
+            binary = effective_settings.llama_server_bin
         targets = production_module.calibration_targets(
             catalogue, models_dir, model_ids
         )
@@ -1178,7 +1248,7 @@ def _build_applier_config(
             load_timeout_seconds=(
                 calibration_load_timeout
                 if calibration_load_timeout is not None
-                else settings.model_load_timeout_seconds
+                else effective_settings.model_load_timeout_seconds
             ),
         )
         calibration_options = _calibration.CalibrationOptions(
@@ -1192,6 +1262,38 @@ def _build_applier_config(
     needs_http = bool(actions & {
         _schema.ACTION_SMOKE_TEST, _schema.ACTION_WARMUP_MODEL,
     })
+    if runtime is not None and not dry_run:
+        if service_env_path is None:
+            raise production_module.ProductionWiringError(
+                "--env-file est obligatoire pour une installation runtime réelle : "
+                "le binaire publié et LLAMA_SERVER_MIN_BUILD doivent être raccordés "
+                "à l'unité systemd"
+            )
+        if runtime_resolution is None or runtime_resolution.min_build <= 0:
+            raise production_module.ProductionWiringError(
+                "--min-build doit être strictement positif avant --apply : un runtime "
+                "sans plancher de sécurité ne peut pas être publié en production"
+            )
+
+    if needs_http and service_env_path is not None and registry_path is not None:
+        configured_registry = Path(effective_settings.models_config_path).absolute()
+        requested_registry = Path(registry_path).absolute()
+        if configured_registry != requested_registry:
+            raise production_module.ProductionWiringError(
+                "--registry diverge de MODELS_CONFIG_PATH dans --env-file : "
+                f"{requested_registry} contre {configured_registry}. La gateway vivante "
+                "ne relirait pas le snapshot écrit par bootstrap-apply"
+            )
+    if needs_http and service_env_path is not None and runtime is not None:
+        configured_binary = Path(effective_settings.llama_server_bin).absolute()
+        published_binary = runtime.published_binary.absolute()
+        if configured_binary != published_binary:
+            raise production_module.ProductionWiringError(
+                "LLAMA_SERVER_BIN dans --env-file diverge du runtime publié : "
+                f"{configured_binary} contre {published_binary}. Corrigez le fichier et "
+                "redémarrez la gateway avant --apply"
+            )
+
     first_token_wiring = None
     warmup_wiring = None
     registry_sync_wiring = None
@@ -1202,7 +1304,10 @@ def _build_applier_config(
         secret = (
             "dry-run-secret-not-used"
             if dry_run
-            else production_module.read_admin_secret(path=admin_secret_file)
+            else production_module.read_admin_secret(
+                path=admin_secret_file,
+                environ=admin_secret_environ,
+            )
         )
         smoke_settings = _first_token.FirstTokenSettings(
             base_url=base_url,
@@ -1210,11 +1315,11 @@ def _build_applier_config(
             model_id=None,
             ttft_threshold_ms=ttft_threshold_ms,
             fail_on_ttft=ttft_gate,
-            load_timeout_s=float(settings.model_load_timeout_seconds + 10),
+            load_timeout_s=float(effective_settings.model_load_timeout_seconds + 10),
         )
         client = production_module.AsyncHttpClient()
         sync_timeout_seconds = float(
-            settings.admin_unload_drain_timeout_seconds + 10
+            effective_settings.admin_unload_drain_timeout_seconds + 10
         )
         live_registry = production_module.LiveRegistrySyncClient(
             admin_url=admin_url,
@@ -1244,7 +1349,7 @@ def _build_applier_config(
                 model_id=model_ids[0],
                 timeout_seconds=_warmup.derive_warmup_timeout_seconds(
                     model_load_timeout_seconds=None,
-                    default_load_timeout_seconds=settings.model_load_timeout_seconds,
+                    default_load_timeout_seconds=effective_settings.model_load_timeout_seconds,
                 ),
             )
             warmup_wiring = applier_module.WarmupWiring(

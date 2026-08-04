@@ -850,11 +850,11 @@ async def check_llama_server_version(config: Any) -> CheckResult:
     Exécute `llama-server --version` et confronte le build à la politique.
 
     `/ready` ne peut pas se le permettre (sous-processus sur un chemin sondé en
-    boucle), et `main._validate_inference_runtime` applique une politique NON
-    fatale quand la version est illisible. doctor est le lieu de la politique
-    FAIL-CLOSED exigée par la spécification §6 : si un build minimal est exigé
-    (`LLAMA_SERVER_MIN_BUILD > 0`) mais que la version est illisible, la
-    validation production échoue.
+    boucle). `main._validate_inference_runtime`, le préflight node-agent et ce
+    contrôle appliquent la même politique FAIL-CLOSED exigée par §6 : si un
+    build minimal est demandé (`LLAMA_SERVER_MIN_BUILD > 0`) mais que la version
+    est illisible, la validation échoue. Doctor rend en plus ce verdict dans un
+    rapport opératoire stable.
 
     Aucun secret ne transite par `argv` : seul `--version` est passé.
     """

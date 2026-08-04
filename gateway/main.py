@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import database as db
 from admin import router as admin_router
@@ -358,6 +358,20 @@ def install_access_log_redaction() -> None:
 install_access_log_redaction()
 
 
+_DASHBOARD_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; base-uri 'none'; connect-src 'self'; "
+        "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "img-src 'self' data:; object-src 'none'; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+    ),
+    "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
@@ -382,7 +396,24 @@ async def log_requests(request: Request, call_next):
 async def dashboard_ui():
     """Sert le dashboard d'administration (SPA HTML)."""
     html_path = Path(__file__).parent / "static" / "dashboard.html"
-    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        content=html_path.read_text(encoding="utf-8"),
+        headers=_DASHBOARD_SECURITY_HEADERS,
+    )
+
+
+@app.get("/admin/assets/chart.umd.js", include_in_schema=False)
+async def dashboard_chart_asset():
+    """Sert la copie vérifiée de Chart.js sans dépendance réseau tierce."""
+    asset_path = Path(__file__).parent / "static" / "chart.umd.js"
+    return FileResponse(
+        asset_path,
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/health", include_in_schema=False)

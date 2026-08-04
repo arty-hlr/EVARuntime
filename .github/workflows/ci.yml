@@ -21,10 +21,12 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: gateway/requirements.txt
+          cache-dependency-path: |
+            gateway/requirements.lock
+            requirements-dev.lock
 
       - name: Install dependencies
-        run: python -m pip install -r gateway/requirements.txt pytest ruff
+        run: python -m pip install --require-hashes -r gateway/requirements.lock -r requirements-dev.lock
 
       - name: Lint (ruff)
         run: cd gateway && ruff check .
@@ -42,10 +44,12 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
-          cache-dependency-path: node_agent/requirements.txt
+          cache-dependency-path: |
+            node_agent/requirements.lock
+            requirements-dev.lock
 
       - name: Install dependencies
-        run: python -m pip install -r node_agent/requirements.txt pytest ruff
+        run: python -m pip install --require-hashes -r node_agent/requirements.lock -r requirements-dev.lock
 
       - name: Lint (ruff)
         run: cd node_agent && ruff check .
@@ -77,14 +81,10 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: requirements-dev.lock
 
-      - name: Install pip-audit
-        run: python -m pip install pip-audit
+      - name: Install pinned audit toolchain
+        run: python -m pip install --require-hashes -r requirements-dev.lock
 
-      - name: Audit gateway dependencies
-        continue-on-error: true
-        run: pip-audit -r gateway/requirements.txt
-
-      - name: Audit node_agent dependencies
-        continue-on-error: true
-        run: pip-audit -r node_agent/requirements.txt
+      - name: Audit runtime dependencies (blocking)
+        run: python scripts/dependency_audit.py
