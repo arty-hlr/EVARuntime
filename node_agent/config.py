@@ -47,7 +47,7 @@ class AgentSettings(BaseSettings):
     agent_secret: str = "CHANGE_ME_AGENT_SECRET"
 
     # ── llama-server ──────────────────────────────────────────────────────────
-    llama_server_bin: Path = Path("/usr/local/bin/llama-server")
+    llama_server_bin: Path = Path("/opt/llama.cpp/current/llama-server")
     # Bind data-plane : doit être joignable depuis l'orchestrateur. Les sondes
     # locales utilisent loopback pour ne pas dépendre du routage vers 0.0.0.0.
     llama_server_host: str = "0.0.0.0"
@@ -59,8 +59,8 @@ class AgentSettings(BaseSettings):
     # Build minimal accepté du binaire llama-server. 0 = pas d'enforcement (défaut).
     # Recommandé : fixer au premier build patché contre GHSA-8947-pfff-2f3c
     # (écriture OOB via n_discard/context-shift) et les overflows de parsing GGUF.
-    # Si > 0 et que le binaire lu est plus ancien, le démarrage de l'agent est
-    # REFUSÉ ; si la version est illisible, on se contente d'un avertissement.
+    # Si > 0 et que le binaire lu est plus ancien ou illisible, le démarrage de
+    # l'agent est REFUSÉ (fail-closed).
     llama_server_min_build: int = Field(default=0, ge=0)
 
     # ── Mémoire GPU (unifiée sur GB10) ────────────────────────────────────────

@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 import main
 import metrics as metrics_mod
 import readiness
+import telemetry
 from config import settings
 
 
@@ -62,6 +63,9 @@ def test_prometheus_ok_content_type_and_types(client, admin_headers):
         ("eva_vram_total_gb", "gauge"),
         ("eva_vram_available_gb", "gauge"),
         ("eva_models_loaded", "gauge"),
+        ("eva_inference_ttft_seconds", "histogram"),
+        ("eva_model_load_seconds", "histogram"),
+        ("eva_capacity_queue_wait_seconds", "histogram"),
     ]:
         assert f"# TYPE {name} {mtype}" in body, f"# TYPE manquant pour {name}"
 
@@ -85,16 +89,40 @@ def test_prometheus_declared_types_appear_before_samples(client, admin_headers):
     resp = client.get("/admin/metrics/prometheus", headers=admin_headers)
     lines = resp.text.splitlines()
 
-    declared: set[str] = set()
+    declared: dict[str, str] = {}
     for line in lines:
         if line.startswith("# TYPE "):
-            declared.add(line.split()[2])
+            _, _, name, mtype = line.split()
+            declared[name] = mtype
     for line in lines:
         if not line or line.startswith("#"):
             continue
         m = _SAMPLE_RE.match(line)
         assert m is not None
-        assert m.group("name") in declared
+        name = m.group("name")
+        if name in declared:
+            continue
+        base = next(
+            (
+                name.removesuffix(suffix)
+                for suffix in ("_bucket", "_sum", "_count")
+                if name.endswith(suffix)
+            ),
+            None,
+        )
+        assert base is not None and declared.get(base) == "histogram"
+
+
+def test_prometheus_exports_runtime_histogram(client, admin_headers):
+    telemetry.TTFT_SECONDS.observe(0.2, model="m1", node="node-a")
+
+    resp = client.get("/admin/metrics/prometheus", headers=admin_headers)
+
+    assert resp.status_code == 200
+    labels = 'model="m1",node="node-a",outcome="success"'
+    assert f'eva_inference_ttft_seconds_bucket{{{labels},le="0.25"}} 1' in resp.text
+    assert f'eva_inference_ttft_seconds_bucket{{{labels},le="+Inf"}} 1' in resp.text
+    assert f"eva_inference_ttft_seconds_count{{{labels}}} 1" in resp.text
 
 
 def test_prometheus_no_crash_when_no_data(client, admin_headers):
@@ -172,8 +200,10 @@ from tests.test_readiness import (  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _clean_readiness_cache():
+    telemetry.reset_all()
     readiness.clear_cache()
     yield
+    telemetry.reset_all()
     readiness.clear_cache()
 
 

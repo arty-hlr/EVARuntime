@@ -196,7 +196,7 @@ Le registre décrit ce que **cette** installation sert. Le paquet
 faudrait-il installer pour atteindre le premier token, et pourquoi ? Il produit
 un **plan** — un document — et n'applique rien.
 
-### Deux couches, et pourquoi elles sont séparées
+### Trois étapes, et pourquoi elles sont séparées
 
 | Couche | Artefact | Privilèges | Écrit sur l'hôte |
 |---|---|---|---|
@@ -206,9 +206,14 @@ un **plan** — un document — et n'applique rien.
 
 `install.sh` reste la voie supportée pour poser le **service** : utilisateur,
 venv, systemd, nginx et secrets. Il ne remplace ni `env` ni `models.yaml` (cf.
-[guide de déploiement](deployment.md#4-installation-du-gateway)). Une fois cette
-gateway mono-worker joignable sur loopback, `bootstrap-apply` exécute le plan
-relu pour poser le runtime et les modèles puis prouver le premier token.
+[guide de déploiement](deployment.md#4-installation-du-gateway)). Une
+installation locale neuve pointe déjà `LLAMA_SERVER_BIN` sur le lien canonique
+`/opt/llama.cpp/current/llama-server`, mais tolère que ce lien n'existe pas
+encore : `/health` et l'administration restent disponibles, tandis que `/ready`
+reste rouge. Le registre livré ne contient aucun modèle actif dont le GGUF est
+absent. Une fois cette gateway mono-worker joignable sur loopback,
+`bootstrap-apply` exécute le plan relu pour poser le runtime et les modèles puis
+prouver le premier token.
 Le caractère mono-worker est un invariant du protocole : le snapshot
 provisoire, son verrou et son bail vivent dans la mémoire du processus. L'unité
 systemd officielle respecte cet invariant (`--workers 1`) ; un lancement manuel
@@ -219,11 +224,20 @@ avec plusieurs workers n'est pas supporté.
 registre, aucun `systemctl`. Le seul sous-processus que la chaîne puisse lancer
 est `llama-server --version`, et seulement si l'opérateur fournit `--llama-bin`.
 
-La séparation existe parce que les deux couches n'ont ni le même risque ni le
+La séparation existe parce que ces trois étapes n'ont ni le même risque ni le
 même public. Un plan se lit, se discute, se colle dans un ticket et se rejoue à
-l'identique sans conséquence ; une installation modifie un hôte. Les confondre
-reviendrait à demander `root` pour obtenir un avis, et à faire d'une lecture de
-diagnostic une modification du système.
+l'identique sans conséquence ; l'installation du socle et l'application relue
+modifient l'hôte, mais pas les mêmes artefacts. Les confondre reviendrait à
+demander `root` pour obtenir un avis, et à faire d'une lecture de diagnostic une
+modification du système.
+
+L'application de production reçoit explicitement l'`EnvironmentFile` systemd.
+Elle refuse un registre différent de `MODELS_CONFIG_PATH`, un binaire publié
+différent de `LLAMA_SERVER_BIN` et un plancher de sécurité nul. Après — et
+seulement après — un parcours runtime entièrement réussi, elle remplace
+atomiquement `LLAMA_SERVER_BIN` et `LLAMA_SERVER_MIN_BUILD` dans ce fichier sans
+réécrire les secrets ni les autres réglages. Le service redémarré charge donc
+exactement le runtime dont l'installation vient d'être prouvée.
 
 ### Pipeline
 
@@ -1326,12 +1340,24 @@ samples.sort()
 p95 = samples[int(0.95 * len(samples))]
 ```
 
+Le chemin chaud ajoute aussi trois histogrammes en mémoire exposés par
+`/admin/metrics/prometheus` : TTFT du premier contenu SSE, durée de chargement
+du modèle et attente de capacité locale. Le TTFT démarre avant la lecture du
+body et inclut donc l'attente VRAM ainsi que le chargement à la demande ; un
+chunk de rôle ou d'usage sans contenu ne le clôt pas. En cluster, le chargement
+et le TTFT portent le `node_id` du placement. Les labels sont volontairement
+limités à `model`, `node` et un résultat technique, avec une borne stricte de
+512 séries par histogramme.
+
 ### Sécurité du dashboard
 
 - Pas de contenu de prompt ou de réponse
 - Pas de clé API (ni hash ni préfixe)
 - Token admin dans `sessionStorage` (jamais `localStorage`)
-- La page HTML est servie sans auth — les données JSON exigent le bearer token
+- Chart.js est vendored et servi par la gateway : le dashboard d'incident ne
+  dépend d'aucun CDN, font provider ou accès Internet.
+- Une CSP et des headers anti-framing/nosniff protègent la page. Le HTML est
+  servi sans auth — les données JSON exigent toujours le bearer token.
 
 ---
 

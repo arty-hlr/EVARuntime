@@ -186,14 +186,20 @@ for command_name in "${required[@]}"; do
     command -v "$command_name" &>/dev/null || \
         error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
-[[ -f "$SCRIPT_DIR/requirements.txt" ]] || error "Préflight : requirements.txt introuvable"
+[[ -f "$SCRIPT_DIR/requirements.txt" && -f "$SCRIPT_DIR/requirements.lock" ]] || \
+    error "Préflight : requirements.txt/requirements.lock introuvable"
 [[ -f "$SCRIPT_DIR/deploy/llm-gateway.service" ]] || error "Préflight : unité systemd locale introuvable"
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité systemd orchestrateur introuvable"
     [[ -f "$SCRIPT_DIR/deploy/nodes.yaml.example" ]] || error "Préflight : template nodes.yaml introuvable"
 else
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
-    [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
+    LLAMA_BIN="${LLAMA_BIN:-/opt/llama.cpp/current/llama-server}"
+    if [[ ! -x "$LLAMA_BIN" ]]; then
+        warn "Runtime llama-server encore absent ($LLAMA_BIN)."
+        warn "→ Le socle sera installé, mais /ready restera rouge jusqu'à bootstrap-apply."
+        warn "→ /health et les routes d'administration resteront disponibles pour l'amorçage."
+    fi
 fi
 
 # Verdict GPU (OPS-012). Sans --allow-no-gpu, le refus historique est conservé;
@@ -286,7 +292,7 @@ if [[ -d "$INSTALL_DIR/static" ]]; then
     find "$INSTALL_DIR/static" -type d -exec chmod 755 {} \;
     find "$INSTALL_DIR/static" -type f -exec chmod 644 {} \;
 fi
-chmod 644 "$INSTALL_DIR/requirements.txt"
+chmod 644 "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 
 # ── 5. Environnement virtuel Python ──────────────────────────────────────────
 
@@ -295,8 +301,8 @@ if [[ ! -d "$INSTALL_DIR/venv" ]]; then
     "$PYTHON" -m venv "$INSTALL_DIR/venv"
 fi
 
-"$INSTALL_DIR/venv/bin/pip" install --upgrade pip --quiet
-"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
+"$INSTALL_DIR/venv/bin/pip" install --require-hashes \
+    -r "$INSTALL_DIR/requirements.lock" --quiet
 info "Dépendances installées."
 
 # ── 6. Fichier de configuration ───────────────────────────────────────────────
@@ -477,10 +483,13 @@ chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR/gateway.db" 2>/dev/null || true
 # déclenchée aussitôt trouve une base déjà initialisée.
 
 info "Installation du timer de sauvegarde SQLite…"
-mkdir -p "$INSTALL_DIR/deploy"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
-chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh" \
+          "$INSTALL_DIR/deploy/smoke_test.sh"
+chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh" \
+          "$INSTALL_DIR/deploy/nginx-lib.sh" \
+          "$INSTALL_DIR/deploy/runtime-variants.yaml.example"
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
 systemctl daemon-reload
@@ -513,22 +522,28 @@ echo ""
 echo "  Mode installé : $EFFECTIVE_MODE"
 echo ""
 if [[ "$EFFECTIVE_MODE" == "local" ]]; then
-    echo "  1. Télécharger les GGUF sur CET hôte dans /models :"
-    echo "     huggingface-cli download bartowski/Llama-3.3-70B-Instruct-GGUF \\"
-    echo "       --include '*Q4_K_M*' --local-dir /models/"
+    echo "  1. Préparer une matrice runtime épinglée depuis le modèle installé :"
+    echo "     sudo install -d -m 0755 /etc/evaruntime"
+    echo "     sudo install -m 0644 $INSTALL_DIR/deploy/runtime-variants.yaml.example \\"
+    echo "       /etc/evaruntime/runtime-variants.yaml"
+    echo "     sudoedit /etc/evaruntime/runtime-variants.yaml"
     echo ""
-    echo "  2. Adapter $MODELS_FILE et le budget VRAM local."
+    echo "  2. Produire, relire puis appliquer un plan strict bootstrap-plan/bootstrap-apply."
+    echo "     Parcours complet : docs/deployment.md, « Parcours production complet » ."
 else
     echo "  1. Éditer la topologie et installer chaque node-agent séparément :"
     echo "     sudo nano $(deploy_env_value "$CONFIG_FILE" CLUSTER_NODES_PATH)"
     echo "     sudo bash node_agent/deploy/install-agent.sh --node-id <id> \\"
+    echo "       --llama-min-build <premier_build_corrige> \\"
     echo "       --agent-secret-file /root/evaruntime-agent-secret --orchestrator-cidr <IP>/32"
     echo ""
     echo "  2. Copier les mêmes GGUF, aux mêmes chemins, sur CHAQUE nœud éligible;"
     echo "     adapter $MODELS_FILE sur l'orchestrateur; configurer AGENT_SECRET et TLS."
 fi
-echo "     sudo nano $CONFIG_FILE"
-echo "     sudo nano $MODELS_FILE"
+echo "     sudoedit $CONFIG_FILE"
+if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
+    echo "     sudoedit $MODELS_FILE"
+fi
 echo ""
 echo "  3. Configurer le certificat TLS :"
 echo "     sudo certbot certonly --nginx -d llm.eva.univ-pau.fr"

@@ -39,6 +39,7 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 import cli as cli_module
+import doctor
 import model_registry
 from bootstrap import applier as ap
 from bootstrap import calibration as cal
@@ -1024,7 +1025,7 @@ def test_la_commande_declare_les_options_attendues():
         "--registry", "--runtime-version", "--hardware-fingerprint", "--vram-budget-gb",
         "--runtime-root", "--llama-server-bin", "--calibration-report-dir",
         "--calibration-port", "--calibration-load-timeout", "--base-url",
-        "--admin-url", "--admin-secret-file", "--accept-license",
+        "--admin-url", "--admin-secret-file", "--env-file", "--accept-license",
         "--license-reference", "--ttft-threshold-ms", "--ttft-gate",
     }
     assert attendues <= _options()
@@ -1116,6 +1117,32 @@ def test_aucun_secret_ne_sort_de_la_commande(tmp_path):
     assert sortie.strip()                                          # contrôle positif
     assert sc.find_secret_leaks({"m": FAUX_TOKEN}) != ()           # contrôle positif
     assert FAUX_TOKEN not in sortie
+
+
+def test_une_erreur_environmentfile_expurge_la_valeur_reelle_du_secret(
+    tmp_path, monkeypatch
+):
+    """La rédaction doit connaître les secrets du fichier, même sans motif reconnaissable."""
+    secret = "secret-ordinaire-avec-une-entropie-faible-1234"
+    env_file = tmp_path / "service.env"
+    env_file.write_text(f"ADMIN_SECRET={secret}\n", encoding="utf-8")
+    env_file.chmod(0o640)
+
+    def refuse_settings(_path):
+        raise ValueError(f"diagnostic synthétique contenant {secret}")
+
+    monkeypatch.setattr(doctor, "load_settings_from_env_file", refuse_settings)
+    resultat = CliRunner().invoke(cli_module.app, [
+        "bootstrap-apply", str(_plan_file(tmp_path, ETAPES_CHAINE)),
+        "--allowed-root", str(tmp_path),
+        "--env-file", str(env_file),
+    ])
+
+    sortie = _propre(resultat.output)
+    assert resultat.exit_code == sc.EXIT_USAGE
+    assert "EnvironmentFile invalide" in sortie  # contrôle positif
+    assert "***" in sortie                       # contrôle positif de rédaction
+    assert secret not in sortie
 
 
 def test_le_rendu_json_est_du_json_pur(tmp_path, hote):

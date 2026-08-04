@@ -93,7 +93,9 @@ SOURCE_GATEWAY="$REPO_ROOT/gateway"
 # shellcheck source=agent-venv-lib.sh
 source "$SCRIPT_DIR/agent-venv-lib.sh"
 
-[[ -f "$SOURCE_AGENT/main.py" && -f "$SOURCE_GATEWAY/server_manager.py" ]] || \
+[[ -f "$SOURCE_AGENT/main.py" && -f "$SOURCE_AGENT/requirements.lock" && \
+   -f "$SOURCE_GATEWAY/server_manager.py" && \
+   -f "$SOURCE_GATEWAY/llama_version.py" ]] || \
     die "Checkout EVARuntime incomplet : $REPO_ROOT"
 [[ -x "$VENV_DIR/bin/python" ]] || die "Installation absente : $VENV_DIR"
 [[ -f "$ENV_FILE" ]] || die "Configuration absente : $ENV_FILE"
@@ -238,9 +240,8 @@ STAGED_VENV="$(agent_venv_new_release_path "$INSTALL_DIR")"
 info "Construction du venv neuf sur place : $STAGED_VENV"
 python3 -m venv "$STAGED_VENV"
 chmod 0755 "$STAGED_VENV"
-"$STAGED_VENV/bin/python" -m pip install --quiet --upgrade pip
-"$STAGED_VENV/bin/python" -m pip install --quiet \
-    -r "$WORK_DIR/node_agent/requirements.txt"
+"$STAGED_VENV/bin/python" -m pip install --quiet --require-hashes \
+    -r "$WORK_DIR/node_agent/requirements.lock"
 "$STAGED_VENV/bin/python" -m pip check
 "$STAGED_VENV/bin/python" "$WORK_DIR/node_agent/preflight.py" --env "$ENV_FILE"
 

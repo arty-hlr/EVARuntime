@@ -198,9 +198,9 @@ class WarmupSettings:
     """
     Ce qui paramètre le pré-chauffage. **Aucun secret.**
 
-    `admin_url` vise la gateway EN DIRECT : `location /admin/` impose
-    `proxy_read_timeout 30s` alors qu'un chargement peut durer ~310 s (COR-009,
-    encore ouvert). À travers nginx, un pré-chauffage sain renverrait 504.
+    `admin_url` vise la gateway EN DIRECT : le secret admin ne doit pas
+    traverser inutilement la façade et un proxy ancien/personnalisé peut porter
+    un timeout de chargement insuffisant.
 
     `timeout_seconds` n'a pas de défaut : il vient de
     `derive_warmup_timeout_seconds()`, donc du registre.
@@ -451,8 +451,8 @@ async def run_warmup(
     if charge.status != 200:
         detail = ""
         if charge.status == 504:
-            detail = (" Un 504 signale un appel passé à travers nginx (proxy_read_timeout 30s "
-                      "sur /admin/, COR-009) : visez le plan de contrôle en direct.")
+            detail = (" Un 504 signale probablement un proxy dont le timeout de "
+                      "chargement est trop court : visez le plan de contrôle en direct.")
         state.add("model_load", STAGE_FAIL, REASON_LOAD_FAILED,
                   f"POST /admin/models/{settings.model_id}/load a répondu {charge.status} "
                   f"après {state.load_wait_ms} ms.{detail}")

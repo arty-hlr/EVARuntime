@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 import cli as cli_module
+from config import Settings
 from bootstrap import applier as ap
 from bootstrap import calibration as cal
 from bootstrap import catalog as cat
@@ -932,6 +933,13 @@ def test_cablage_production_enregistre_les_neuf_actions(monkeypatch, tmp_path):
         base_url="https://eva.example",
         admin_url="http://127.0.0.1:8000",
         admin_secret_file=None,
+        service_env_path=tmp_path / "env",
+        service_settings=Settings(
+            _env_file=None,
+            models_config_path=tmp_path / "models.yaml",
+            llama_server_bin=tmp_path / "runtime" / "current" / "llama-server",
+        ),
+        admin_secret_environ=None,
         accepted_license_ids=(entry.id,),
         license_reference="CHG-2026-081",
         ttft_threshold_ms=0,
@@ -947,3 +955,31 @@ def test_cablage_production_enregistre_les_neuf_actions(monkeypatch, tmp_path):
     assert dry_config.warmup is not None
     with pytest.raises(prod.ProductionWiringError, match="ADMIN_SECRET"):
         cli_module._build_applier_config(**common, dry_run=False)
+
+    secret_from_env_file = dict(common)
+    secret_from_env_file["admin_secret_environ"] = {
+        "ADMIN_SECRET": "secret-lu-depuis-environment-file"
+    }
+    from_env = cli_module._build_applier_config(
+        **secret_from_env_file, dry_run=False
+    )
+    assert from_env.first_token is not None
+    assert from_env.first_token.admin_secret == "secret-lu-depuis-environment-file"
+
+    wrong_registry = dict(common)
+    wrong_registry["service_settings"] = Settings(
+        _env_file=None,
+        models_config_path=tmp_path / "other-models.yaml",
+        llama_server_bin=tmp_path / "runtime" / "current" / "llama-server",
+    )
+    with pytest.raises(prod.ProductionWiringError, match="MODELS_CONFIG_PATH"):
+        cli_module._build_applier_config(**wrong_registry, dry_run=True)
+
+    wrong_binary = dict(common)
+    wrong_binary["service_settings"] = Settings(
+        _env_file=None,
+        models_config_path=tmp_path / "models.yaml",
+        llama_server_bin=tmp_path / "other-runtime" / "llama-server",
+    )
+    with pytest.raises(prod.ProductionWiringError, match="LLAMA_SERVER_BIN"):
+        cli_module._build_applier_config(**wrong_binary, dry_run=True)

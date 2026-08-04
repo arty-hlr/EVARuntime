@@ -17,11 +17,13 @@ Technique :
 from __future__ import annotations
 
 import asyncio
+import time
 
 import httpx
 import pytest
 
 import proxy
+import telemetry
 
 
 @pytest.fixture
@@ -74,6 +76,9 @@ def _no_db_logging(monkeypatch):
         return None
 
     monkeypatch.setattr(proxy, "fire_and_forget", _swallow)
+    telemetry.reset_all()
+    yield
+    telemetry.reset_all()
 
 
 @pytest.fixture
@@ -98,6 +103,38 @@ def _sse_stream(*events: str) -> bytes:
     redécoupe comme le ferait un vrai llama-server.
     """
     return ("".join(f"{ev}\n\n" for ev in events)).encode()
+
+
+@pytest.mark.anyio
+async def test_stream_records_ttft_on_first_meaningful_chunk(restore_http_client):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_stream(
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":1}}',
+            'data: {"choices":[{"delta":{"content":"bonjour"}}]}',
+            "data: [DONE]",
+        ))
+
+    _inject_client(httpx.MockTransport(handler))
+    manager = FakeManager()
+    gen = proxy._stream_proxy(
+        "/v1/chat/completions",
+        {"stream": True},
+        USER,
+        "req-ttft",
+        time.monotonic(),
+        manager,
+    )
+
+    _ = b"".join([chunk async for chunk in gen])
+
+    series = telemetry.TTFT_SECONDS.snapshot().series
+    assert len(series) == 1
+    assert (series[0].model, series[0].node, series[0].count) == (
+        "test-model",
+        "local",
+        1,
+    )
 
 
 # ── 1. Déconnexion client → unpin équilibré ───────────────────────────────────

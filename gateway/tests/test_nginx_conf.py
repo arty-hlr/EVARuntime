@@ -14,6 +14,7 @@ inerte le jour où le parsing casse, sans jamais échouer.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -180,6 +181,15 @@ def _required_timeout_seconds():
     return doctor.required_load_timeout_seconds(settings, models), models
 
 
+def _doctor_enabled_models():
+    """Scénario explicite : l'opérateur a activé les entrées livrées."""
+    import model_registry  # noqa: PLC0415
+
+    models = model_registry.ModelRegistry(SHIPPED_MODELS_YAML).list_all()
+    assert models, "contrôle positif : le registre livré serait vide"
+    return [replace(model, enabled=True) for model in models]
+
+
 def test_le_registre_livre_est_lisible_et_dimensionnant():
     """Contrôle positif du test suivant : sans registre lu, l'exigence est vide."""
     required, models = _required_timeout_seconds()
@@ -249,8 +259,7 @@ def test_le_defaut_dorigine_du_timeout_admin_serait_detecte(conf_text):
 
     # Et doctor doit continuer à le signaler : son diagnostic reste juste.
     from config import settings  # noqa: PLC0415
-    import model_registry  # noqa: PLC0415
-    models = model_registry.ModelRegistry(SHIPPED_MODELS_YAML).list_enabled()
+    models = _doctor_enabled_models()
     result = doctor.check_nginx_timeouts(
         doctor.parse_nginx_servers(regressed), settings, models
     )
@@ -261,11 +270,9 @@ def test_le_defaut_dorigine_du_timeout_admin_serait_detecte(conf_text):
 def test_doctor_ne_signale_rien_sur_la_conf_livree(conf_text):
     """Le correctif doit rendre le contrôle `nginx_timeouts` de doctor vert."""
     import doctor  # noqa: PLC0415
-    import model_registry  # noqa: PLC0415
     from config import settings  # noqa: PLC0415
 
-    models = model_registry.ModelRegistry(SHIPPED_MODELS_YAML).list_enabled()
-    assert models, "contrôle positif : aucun modèle activé, le contrôle serait vide"
+    models = _doctor_enabled_models()
     result = doctor.check_nginx_timeouts(
         doctor.parse_nginx_servers(conf_text), settings, models
     )

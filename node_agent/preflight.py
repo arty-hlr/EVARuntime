@@ -5,12 +5,24 @@ import argparse
 import asyncio
 import os
 import stat
+import sys
 from pathlib import Path
 
 import httpx
 from pydantic_settings import DotEnvSettingsSource
 
+# Le préflight est exécuté directement depuis node_agent/ par les scripts de
+# déploiement. Garder node_agent en premier évite de charger gateway/config.py,
+# puis exposer les modules partagés de la gateway (dont llama_version).
+_AGENT_DIR = Path(__file__).resolve().parent
+_GATEWAY_DIR = _AGENT_DIR.parent / "gateway"
+if str(_AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_DIR))
+if str(_GATEWAY_DIR) not in sys.path:
+    sys.path.insert(1, str(_GATEWAY_DIR))
+
 from config import AgentSettings
+from llama_version import enforce_llama_min_build
 
 
 def load_settings_file(env_file: Path) -> AgentSettings:
@@ -81,6 +93,30 @@ def validate_runtime_files(configured: AgentSettings) -> list[str]:
     return errors
 
 
+async def validate_runtime_version(configured: AgentSettings) -> list[str]:
+    """Atteste le plancher de build avant toute activation du service."""
+    minimum = configured.llama_server_min_build
+    if minimum <= 0:
+        return [
+            "LLAMA_SERVER_MIN_BUILD doit être un entier strictement positif en "
+            "production; fournissez le build minimal patché validé par votre "
+            "procédure de qualification"
+        ]
+
+    binary = configured.llama_server_bin
+    # Les erreurs de présence/permissions sont déjà précises dans
+    # validate_runtime_files ; ne pas ajouter un second diagnostic trompeur.
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        return []
+
+    if await enforce_llama_min_build(binary, minimum):
+        return []
+    return [
+        f"version de llama-server non attestable ou inférieure au build minimal "
+        f"{minimum} : {binary}"
+    ]
+
+
 async def check_local_health(configured: AgentSettings, timeout: float) -> None:
     """Vérifie l'agent local après restart sans exposer AGENT_SECRET à `ps`."""
     url = local_health_url(configured)
@@ -120,6 +156,7 @@ def main() -> int:
     try:
         configured = load_settings_file(args.env)
         errors = validate_runtime_files(configured)
+        errors.extend(asyncio.run(validate_runtime_version(configured)))
         errors.extend(validate_sensitive_file(args.env, "EnvironmentFile"))
     except Exception as exc:
         print(f"[ERREUR] Configuration invalide : {exc}")

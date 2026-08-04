@@ -110,29 +110,36 @@ sudo apt install python3.11 python3.11-venv python3.11-dev
 
 ### Planifier avant d'installer
 
-Deux couches, volontairement séparées, et une seule écrit sur l'hôte :
+Trois couches, volontairement séparées. Deux écrivent, mais pas au même moment
+ni avec la même autorité :
 
 | Couche | Commande | Privilèges | Effet sur l'hôte |
 |---|---|---|---|
 | Planification | `python cli.py bootstrap-plan` | aucun | **aucun** — produit un document |
-| Installation | `bash gateway/deploy/install.sh` | `root` | utilisateur système, venv, systemd, nginx, secrets |
+| Installation du socle | `bash gateway/deploy/install.sh` | `root` | utilisateur système, venv, systemd, nginx, secrets |
+| Application relue | `python cli.py bootstrap-apply … --apply` | `root` sur le parcours supporté | runtime, modèles, registre, preuves et raccord de l'EnvironmentFile |
 
-`install.sh` reste la couche privilégiée et la seule voie d'installation
-supportée. `bootstrap-plan` inventorie l'hôte, résout quel `llama-server`
-conviendrait, filtre le catalogue de modèles approuvés et rend la séquence
-d'étapes qu'une installation exécuterait — **sans rien télécharger, compiler ni
-écrire**. Le seul sous-processus qu'il puisse lancer est `llama-server --version`,
-et seulement si on lui fournit `--llama-bin`.
+`install.sh` reste la seule voie supportée pour poser le **service**. Sur une
+machine neuve il accepte que `llama-server` soit encore absent : `/health` et
+les routes d'administration démarrent, tandis que `/ready` reste honnêtement
+rouge jusqu'à l'application du plan. `bootstrap-apply` pose ensuite le runtime
+sous `/opt/llama.cpp/current/llama-server`, télécharge le modèle, le calibre et
+prouve le premier token à travers le chemin public.
+
+`bootstrap-plan` inventorie l'hôte, résout quel `llama-server` conviendrait,
+filtre le catalogue de modèles approuvés et rend cette séquence — **sans rien
+télécharger, compiler ni écrire**. Le seul sous-processus qu'il puisse lancer
+est `llama-server --version`, et seulement si on lui fournit `--llama-bin`.
 
 L'intérêt pratique : le plan se lit, se discute et se colle dans un ticket avant
 qu'une machine ne soit touchée, et il dit *pourquoi* chaque choix a été fait —
 là où un installeur ne dit que ce qu'il a fait.
 
 ```bash
-# Sur l'hôte cible, sans privilège, depuis un clone du dépôt
-cd EVARuntime/gateway
-python3 -m venv .venv && ./.venv/bin/python -m pip install -r requirements.txt
-./.venv/bin/python cli.py bootstrap-plan --models-dir /models
+# Sur l'hôte cible, après installation du socle (§4). Le compte de service peut
+# lire le venv et le catalogue sans recevoir de privilège système supplémentaire.
+cd /opt/llm-gateway
+sudo -u llmservice ./venv/bin/python cli.py bootstrap-plan --models-dir /models
 ```
 
 Sans `--pin-version`/`--pin-commit`, le plan sort **bloqué** et ne propose aucune
@@ -144,14 +151,17 @@ des options et des exit codes :
 d'artefacts livrée avec EVARuntime ne porte aucune empreinte et aucune URL
 d'archive, de sorte que seule la voie du build local y est éligible. Pour que
 `bootstrap-apply` installe réellement un runtime, fournissez votre propre matrice
-avec `--runtime-variants`, à partir du modèle commenté
-`gateway/deploy/runtime-variants.yaml.example` :
+avec `--runtime-variants`, à partir du modèle commenté installé avec le service :
 
 ```bash
-cp gateway/deploy/runtime-variants.yaml.example /etc/evaruntime/runtime-variants.yaml
+sudo install -d -m 0755 /etc/evaruntime
+sudo install -m 0644 \
+  /opt/llm-gateway/deploy/runtime-variants.yaml.example \
+  /etc/evaruntime/runtime-variants.yaml
+sudoedit /etc/evaruntime/runtime-variants.yaml
 # relever les vraies empreintes — le fichier refuse de se charger tant que les
 # marqueurs REMPLACER y figurent
-./.venv/bin/python cli.py bootstrap-plan --json \
+sudo -u llmservice ./venv/bin/python cli.py bootstrap-plan --json --strict \
     --pin-version b6210 --pin-commit <sha_git> --min-build 6120 \
     --runtime-variants /etc/evaruntime/runtime-variants.yaml \
     --models-dir /models > /tmp/plan.json
@@ -169,9 +179,9 @@ de celle épinglée bloque le plan au lieu d'être écrasé. Le détail des troi
 et pourquoi le plan n'a jamais à hacher les fichiers pour conclure — est dans le
 [guide administrateur, section 9](admin.md#artefacts-déjà-présents-sur-lhôte).
 
-Les sections 2 et 3 qui suivent décrivent la procédure manuelle éprouvée
-(compilation de llama.cpp, téléchargement des GGUF). Le plan de bootstrap ne la
-remplace pas : il la documente pour un hôte donné.
+Les sections 2 et 3 qui suivent décrivent la procédure manuelle de secours
+(compilation de llama.cpp, téléchargement des GGUF). Le parcours de production
+automatisé et copiable se trouve en [§4](#parcours-production-complet--mode-local).
 
 ---
 
@@ -184,32 +194,40 @@ avec support CUDA optimisé pour l'Ada Lovelace (L40S, compute capability 8.9).
 # Dépendances de compilation
 sudo apt install -y build-essential cmake git libcurl4-openssl-dev
 
-# Cloner le dépôt
-git clone https://github.com/ggerganov/llama.cpp /opt/llama.cpp
-cd /opt/llama.cpp
+# Cloner les sources HORS de la racine de releases atomiques
+sudo git clone https://github.com/ggml-org/llama.cpp /opt/llama.cpp-src
+cd /opt/llama.cpp-src
 
 # Compiler avec support CUDA
 # GGML_CUDA=ON : active le backend CUDA
 # CMAKE_CUDA_ARCHITECTURES=89 : Ada Lovelace (L40S compute cap 8.9)
-cmake -B build \
+sudo cmake -B build \
   -DGGML_CUDA=ON \
   -DCMAKE_CUDA_ARCHITECTURES="89" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_CURL=ON
 
-cmake --build build --config Release -j$(nproc)
+sudo cmake --build build --config Release -j$(nproc)
 
-# Installer le binaire
-sudo cp build/bin/llama-server /usr/local/bin/
-sudo chmod +x /usr/local/bin/llama-server
+# Publier une release immuable derrière le même lien que bootstrap-apply.
+# Remplacer <bNNNNN> par le build réellement rendu par --version.
+sudo install -d -m 0755 /opt/llama.cpp/releases/<bNNNNN>
+sudo install -m 0755 build/bin/llama-server \
+  /opt/llama.cpp/releases/<bNNNNN>/llama-server
+sudo ln -sfn releases/<bNNNNN> /opt/llama.cpp/.current-new
+sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
 
 # Vérifier l'installation
-llama-server --version
+/opt/llama.cpp/current/llama-server --version
 ```
 
 > **Note :** La compilation prend 5 à 15 minutes selon la machine.
 > Si `nvidia-smi` indique une version CUDA différente, adapter `CMAKE_CUDA_ARCHITECTURES` :
 > - A100 → `80`, V100 → `70`, RTX 4090 → `89`, L40S → `89`
+>
+> La voie manuelle ne fabrique pas le manifeste de provenance de
+> `bootstrap-apply`. Elle exige donc une attestation et une mise à jour manuelles
+> de `LLAMA_SERVER_MIN_BUILD` avant production.
 
 ---
 
@@ -473,6 +491,118 @@ jamais un secret déjà configuré. Une ancienne installation dont le registre
 est sous `/etc/llm-gateway/models.yaml` est copiée sans suppression vers
 `/var/lib/llm-gateway/models.yaml`; le reste de `env` demeure inchangé.
 
+### Parcours production complet — mode local
+
+Ce parcours est la référence « machine neuve → premier token ». Il n'emploie
+aucun fichier secret intermédiaire et ne demande aucune édition manuelle de
+`models.yaml`. Remplacez les valeurs entre chevrons ; ne recopiez jamais une
+empreinte d'exemple.
+
+1. Poser le socle, sans exiger un runtime déjà présent :
+
+   ```bash
+   git clone https://github.com/Tutanka01/EVARuntime.git /tmp/evaruntime-src
+   sudo bash /tmp/evaruntime-src/gateway/deploy/install.sh --mode local
+   ```
+
+   Une installation neuve livre un registre dont tous les modèles sont
+   désactivés. `/health` peut donc démarrer avant les artefacts ; `/ready` reste
+   non prêt tant que le runtime et un modèle n'ont pas été prouvés.
+
+2. Épingler l'archive runtime et produire un plan strict :
+
+   ```bash
+   sudo install -d -m 0755 /etc/evaruntime
+   sudo install -m 0644 \
+     /opt/llm-gateway/deploy/runtime-variants.yaml.example \
+     /etc/evaruntime/runtime-variants.yaml
+   sudoedit /etc/evaruntime/runtime-variants.yaml
+
+   cd /opt/llm-gateway
+   sudo -u llmservice ./venv/bin/python cli.py bootstrap-plan --json --strict \
+     --pin-version <bNNNNN> \
+     --pin-commit <sha_git_du_tag> \
+     --min-build <premier_build_corrige> \
+     --runtime-variants /etc/evaruntime/runtime-variants.yaml \
+     --models-dir /models \
+     --model qwen2.5-0.5b-instruct-q4_k_m \
+     > /tmp/evaruntime-plan.json
+   ```
+
+   Le code attendu est `0`. Un code `1`, `2`, `3` ou `4` doit être traité avant
+   l'application ; avec `--strict`, un avertissement n'est pas accepté comme
+   dette implicite de production.
+
+3. Configurer TLS et nginx ([§7](#7-certificat-tls),
+   [§8](#8-configuration-nginx)), puis démarrer le mono-worker :
+
+   ```bash
+   sudo systemctl start llm-gateway
+   curl -fsS http://127.0.0.1:8000/health
+   ```
+
+   À ce stade, un `/ready` non-200 est normal : le lien runtime et les GGUF ne
+   sont pas encore publiés.
+
+4. Déclarer une seule fois les arguments relus, simuler, puis appliquer :
+
+   ```bash
+   BOOTSTRAP_ARGS=(
+     --allowed-root /opt/llama.cpp
+     --allowed-root /models
+     --allowed-root /var/lib/llm-gateway
+     --allowed-root /etc/llm-gateway
+     --models-dir /models
+     --registry /var/lib/llm-gateway/models.yaml
+     --runtime-root /opt/llama.cpp
+     --calibration-report-dir /var/lib/llm-gateway/calibration
+     --base-url https://<fqdn-production>
+     --admin-url http://127.0.0.1:8000
+     --env-file /etc/llm-gateway/env
+     --vram-budget-gb <budget_vram_net>
+     --accept-license qwen2.5-0.5b-instruct-q4_k_m
+     --license-reference <ticket-technique>
+     --ttft-threshold-ms <seuil_valide>
+     --ttft-gate
+   )
+
+   # Simulation : aucune mutation ; le code 3 est attendu par contrat.
+   sudo ./venv/bin/python cli.py bootstrap-apply \
+     /tmp/evaruntime-plan.json "${BOOTSTRAP_ARGS[@]}"
+
+   # Application réelle et rapport archivable, sans secret sur argv/stdout.
+   sudo ./venv/bin/python cli.py bootstrap-apply \
+     /tmp/evaruntime-plan.json --apply --json "${BOOTSTRAP_ARGS[@]}" \
+     > /tmp/evaruntime-install-report.json
+   ```
+
+   Avant toute mutation, la CLI recoupe trois chemins : `--registry` doit être
+   le `MODELS_CONFIG_PATH` du service, le runtime publié doit être son
+   `LLAMA_SERVER_BIN`, et `--min-build` doit être strictement positif. Le secret
+   admin est lu depuis `--env-file`; `/etc/llm-gateway/admin.secret` n'existe pas
+   et n'est pas nécessaire. Après succès complet, la CLI publie atomiquement
+   `LLAMA_SERVER_BIN` et `LLAMA_SERVER_MIN_BUILD` dans le même EnvironmentFile,
+   sans changer ni afficher les secrets. Une mutation observée avant la bascule
+   fait échouer l'écriture au lieu d'être écrasée.
+
+5. Archiver, redémarrer sous le plancher désormais persistant et revalider :
+
+   ```bash
+   sudo install -o root -g llmservice -m 0640 \
+     /tmp/evaruntime-install-report.json \
+     /var/lib/llm-gateway/evaruntime-install-report.json
+   sudo systemctl restart llm-gateway
+
+   sudo /opt/llm-gateway/venv/bin/python /opt/llm-gateway/cli.py doctor \
+     --env-file /etc/llm-gateway/env --strict
+   sudo bash /opt/llm-gateway/deploy/smoke_test.sh \
+     --base-url https://<fqdn-production> --json
+   ```
+
+Le rapport JSON, le fichier `runtime-variants.yaml`, la révision Git déployée et
+les sorties `doctor`/smoke constituent ensemble la preuve de déploiement. Ne
+prononcez pas la production sur le seul code de sortie de `install.sh`.
+
 ---
 
 ## 5. Configuration
@@ -516,6 +646,10 @@ Deux pièges d'exploitation :
 # ── Registre des modèles ──────────────────────────────────────────────────────
 # Chemin vers le fichier YAML listant tous les modèles disponibles
 MODELS_CONFIG_PATH=/var/lib/llm-gateway/models.yaml
+
+# Lien atomique publié par bootstrap-apply. Ne pointez pas le service vers une
+# release horodatée : `current` est le contrat de bascule et de rollback.
+LLAMA_SERVER_BIN=/opt/llama.cpp/current/llama-server
 
 # ── Budget VRAM (L40S 48 GB) ──────────────────────────────────────────────────
 # Ajuster si vous utilisez un GPU différent
@@ -1063,11 +1197,13 @@ comme garde-fou contre une révision arrivée entre la vérification et l'exécu
 Ce que fait le script :
 
 1. Refuse un checkout sale puis exécute `git pull --ff-only`
-2. Synchronise les modules racine, `cluster/`, `bootstrap/` avec son catalogue et
-   `requirements.txt` vers `/opt/llm-gateway/`
+2. Synchronise les modules racine, `cluster/`, `bootstrap/` avec son catalogue,
+   les contraintes `requirements.txt` et le `requirements.lock` vérifié vers
+   `/opt/llm-gateway/`
 3. Synchronise le répertoire `static/` (dashboard HTML…)
-4. Construit un **nouveau venv**, installe les dépendances et exige `pip check`;
-   l'ancien venv reste intact jusqu'au redémarrage
+4. Construit un **nouveau venv**, installe uniquement les versions et empreintes
+   de `requirements.lock`, puis exige `pip check`; l'ancien venv reste intact
+   jusqu'au redémarrage
 5. **Sauvegarde la base SQLite** avant redémarrage (voir ci-dessous)
 6. Installe la recette du premier token dans `/opt/llm-gateway/deploy/`
 7. Exécute **`evaruntime doctor` avant la bascule**, avec le venv neuf et le code
@@ -1186,9 +1322,30 @@ sudo bash /opt/llm-gateway/deploy/smoke_test.sh \
 sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
 ```
 
-> Le script est copié dans `/opt/llm-gateway/deploy/` par `update.sh`. Sur une
-> machine qui n'a pas encore été mise à jour depuis cette version, le lancer
-> depuis le checkout : `sudo bash gateway/deploy/smoke_test.sh`.
+> Le script est copié dans `/opt/llm-gateway/deploy/` par `install.sh` et
+> `update.sh`. Sur une machine issue d'une ancienne version, le lancer depuis le
+> checkout : `sudo bash gateway/deploy/smoke_test.sh`.
+
+##### Recette opt-in avec un vrai petit GGUF
+
+La suite ordinaire reste hors ligne et n'embarque pas de poids de modèle. Une
+recette dédiée permet néanmoins d'attester séparément un vrai binaire
+`llama-server` et un petit GGUF déjà téléchargé, avec empreinte obligatoire :
+
+```bash
+cd /chemin/vers/EVARuntime/gateway
+EVARUNTIME_REAL_LLAMA_BIN=/opt/llama.cpp/current/llama-server \
+EVARUNTIME_REAL_GGUF=/models/approved-small-model.gguf \
+EVARUNTIME_REAL_GGUF_SHA256=<64-caracteres-hexadecimaux> \
+.venv/bin/python -m pytest tests/test_real_small_gguf.py -v
+```
+
+Le test vérifie le SHA-256 avant exécution, démarre le runtime sur loopback avec
+offload CPU par défaut, attend `/health`, exige un delta SSE avec contenu puis
+`[DONE]`, et termine toujours le processus. Pour exercer le GPU, ajouter
+`EVARUNTIME_REAL_N_GPU_LAYERS=99`. Cette recette runtime/GGUF complète mais ne
+remplace pas `smoke_test.sh`, qui traverse la gateway, nginx, l'authentification
+et la comptabilisation.
 
 ##### Options
 
@@ -1386,14 +1543,21 @@ restauration manuelle (voir [Sauvegardes SQLite](#14-sauvegardes-sqlite-et-resta
 ### Mettre à jour llama.cpp
 
 ```bash
-cd /opt/llama.cpp
-git pull
+cd /opt/llama.cpp-src
+sudo git pull --ff-only
 
-cmake --build build --config Release -j$(nproc)
-sudo cp build/bin/llama-server /usr/local/bin/
+sudo cmake --build build --config Release -j$(nproc)
+sudo install -d -m 0755 /opt/llama.cpp/releases/<nouveau-bNNNNN>
+sudo install -m 0755 build/bin/llama-server \
+  /opt/llama.cpp/releases/<nouveau-bNNNNN>/llama-server
+sudo ln -sfn releases/<nouveau-bNNNNN> /opt/llama.cpp/.current-new
+sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
 
-# Redémarrer la gateway pour prendre en compte le nouveau binaire
+# Mettre LLAMA_SERVER_MIN_BUILD au premier build corrigé connu, puis valider.
+sudoedit /etc/llm-gateway/env
 sudo systemctl restart llm-gateway
+sudo /opt/llm-gateway/venv/bin/python /opt/llm-gateway/cli.py doctor \
+  --env-file /etc/llm-gateway/env --strict
 ```
 
 #### Politique de version (mitigation supply-chain)
@@ -1405,7 +1569,7 @@ installé un build patché, épinglez-le :
 
 ```bash
 # Vérifier le build installé
-llama-server --version   # → version: <build> (<hash>)
+/opt/llama.cpp/current/llama-server --version   # → version: <build> (<hash>)
 
 # Fixer le minimum accepté dans /etc/llm-gateway/env (et sur chaque node-agent)
 LLAMA_SERVER_MIN_BUILD=<build_patché>
@@ -1649,6 +1813,7 @@ cd /opt/llm-gateway-src
 
 sudo bash node_agent/deploy/install-agent.sh \
   --node-id dgx-spark-a \
+  --llama-min-build <premier_build_corrige> \
   --agent-secret-file /root/evaruntime-agent-secret \
   --orchestrator-cidr <IP_orchestrateur>/32
 # → crée /etc/llm-gateway-agent/env, génère le certificat TLS, installe le service
@@ -1662,6 +1827,10 @@ sudo journalctl -fu llm-gateway-agent
 Le plan de données doit être joignable depuis l'orchestrateur : chaque agent
 doit lancer `llama-server` sur son adresse réseau interne (pas `127.0.0.1`) et
 le firewall doit limiter `8081-8085` à l'IP orchestrateur.
+L'installateur exige un build minimal positif et sonde le binaire canonique
+`/opt/llama.cpp/current/llama-server` avant d'activer l'unité. Un autre chemin
+doit être déclaré explicitement avec `--llama-server-bin` ; un build illisible
+ou inférieur au plancher fait échouer le préflight.
 
 ### Registre et fichiers de modèles partagés
 
@@ -1728,6 +1897,19 @@ curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
 - **Tous les nœuds offline** : les requêtes d'inférence reçoivent une 503 explicite.
 
 ### Mise à jour orchestrateur et agents
+
+Avant la première mise à jour d'un agent installé avec l'ancien défaut
+`LLAMA_SERVER_MIN_BUILD=0`, attestez le runtime puis relevez explicitement son
+plancher dans `/etc/llm-gateway-agent/env`. Le préflight de la nouvelle release
+refuse une valeur nulle, un binaire illisible ou un build trop ancien **avant**
+de toucher au service :
+
+```bash
+/opt/llama.cpp/current/llama-server --version
+sudoedit /etc/llm-gateway-agent/env
+# LLAMA_SERVER_BIN=/opt/llama.cpp/current/llama-server
+# LLAMA_SERVER_MIN_BUILD=<premier_build_corrige>
+```
 
 ```bash
 # 1. Orchestrateur uniquement
@@ -2374,6 +2556,12 @@ consolide les réglages **récemment ajoutés** ; les paramètres historiques
 | Variable | Défaut | Rôle |
 |----------|--------|------|
 | `LLAMA_SERVER_MIN_BUILD` | `0` | Build minimal accepté du binaire `llama-server`. `0` = aucun enforcement. Si `> 0` et build lu strictement inférieur → **démarrage refusé** ; si `> 0` et version illisible → **démarrage refusé** aussi (fail-closed, SEC-009). Version illisible avec `0` → simple avertissement. À fixer sur le premier build patché (cf. [section 11](#11-mise-à-jour)). |
+
+Le défaut de la classe de configuration reste `0` pour le développement et les
+tests. Les chemins de production sont plus stricts : `install-agent.sh` exige
+`--llama-min-build > 0`, son préflight et `ExecStartPre` refusent `0`, et
+`bootstrap-apply --apply` exige également un plancher positif avant de publier
+le runtime de la gateway locale.
 
 > Le champ `sha256` par modèle (intégrité GGUF) se configure dans `models.yaml`,
 > pas ici — voir [section 6](#6-registre-des-modèles-modelsyaml).

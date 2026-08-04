@@ -878,5 +878,5 @@ def test_les_champs_consommes_par_la_recette_existent():
 def test_update_installe_la_recette_a_cote_du_service():
     """Un opérateur en incident doit pouvoir la relancer sans le checkout Git."""
     source = UPDATE_SCRIPT.read_text(encoding="utf-8")
-    assert 'cp "$SCRIPT_DIR/deploy/smoke_test.sh"       "$INSTALL_DIR/deploy/"' in source
-    assert 'cp "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"  "$INSTALL_DIR/deploy/"' in source
+    assert 'source "$SCRIPT_DIR/deploy/code-layout-lib.sh"' in source
+    assert 'deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"' in source

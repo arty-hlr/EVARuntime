@@ -25,6 +25,7 @@ import database as db
 from auth import require_admin
 from model_manager import model_manager
 from server_manager import ModelState
+from telemetry import snapshots as telemetry_snapshots
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +128,35 @@ class _PromWriter:
     def render(self) -> str:
         # Une ligne vide finale est recommandée par le format d'exposition.
         return "\n".join(self._lines) + "\n"
+
+
+def _write_runtime_histograms(writer: _PromWriter) -> None:
+    """Expose les histogrammes en mémoire au format Prometheus canonique."""
+    for snapshot in telemetry_snapshots():
+        writer.declare(snapshot.name, "histogram", snapshot.help_text)
+        for series in snapshot.series:
+            labels = {
+                "model": series.model,
+                "node": series.node,
+                "outcome": series.outcome,
+            }
+            cumulative = 0
+            for boundary, bucket_count in zip(
+                snapshot.boundaries, series.buckets, strict=True
+            ):
+                cumulative += bucket_count
+                writer.sample(
+                    f"{snapshot.name}_bucket",
+                    cumulative,
+                    {**labels, "le": _fmt_value(boundary)},
+                )
+            writer.sample(
+                f"{snapshot.name}_bucket",
+                series.count,
+                {**labels, "le": "+Inf"},
+            )
+            writer.sample(f"{snapshot.name}_sum", series.total, labels)
+            writer.sample(f"{snapshot.name}_count", series.count, labels)
 
 
 async def _usage_by_model() -> list[dict]:
@@ -432,6 +462,9 @@ async def metrics_prometheus(
     ready = sum(1 for m in models if m.get("state") == "ready")
     w.declare("eva_models_loaded", "gauge", "Nombre de modèles à l'état ready.")
     w.sample("eva_models_loaded", ready)
+
+    # ── TTFT, chargement modèle et attente de capacité ────────────────────────
+    _write_runtime_histograms(w)
 
     # ── Métriques llama.cpp par modèle (local ou cluster) ─────────────────────
     llama = await _collect_llama_metrics()

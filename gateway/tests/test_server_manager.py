@@ -20,6 +20,7 @@ import pytest
 
 from config import settings
 from server_manager import ModelState, ServerManager
+import telemetry
 
 
 # ── Doubles de test ───────────────────────────────────────────────────────────
@@ -93,6 +94,9 @@ def fast_idle(monkeypatch):
     """Rend le moniteur d'inactivité rapide pour les tests temporels."""
     monkeypatch.setattr(settings, "idle_check_interval_seconds", 0.01)
     monkeypatch.setattr(settings, "idle_timeout_seconds", 0.02)
+    telemetry.reset_all()
+    yield
+    telemetry.reset_all()
 
 
 # ── Test 1 — ensure_loaded concurrent ─────────────────────────────────────────
@@ -116,6 +120,14 @@ async def test_ensure_loaded_concurrent_starts_process_once(monkeypatch):
 
     assert calls["start"] == 1
     assert mgr.state == ModelState.READY
+    series = telemetry.MODEL_LOAD_SECONDS.snapshot().series
+    assert len(series) == 1
+    assert (series[0].model, series[0].node, series[0].outcome, series[0].count) == (
+        "m1",
+        "local",
+        "success",
+        1,
+    )
     await mgr.unload()
 
 

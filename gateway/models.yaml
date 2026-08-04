@@ -64,7 +64,10 @@ models:
     path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
     description: "Llama 3.3 70B Instruct, quantisé Q4_K_M — modèle principal UPPA (L40S 48 GB)"
     vram_gb: 42.0
-    enabled: true
+    # Une installation neuve ne doit jamais annoncer prêt un GGUF absent.
+    # Activer après téléchargement manuel ou laisser bootstrap-apply le faire
+    # provisoirement, puis définitivement après la preuve du premier token.
+    enabled: false
     capabilities:
       - text_generation
       - tool_calls
@@ -118,7 +121,7 @@ models:
     path: "/models/gemma-4-26b-it-a4b-Q4_K_M.gguf"    # À ajuster selon le chemin réel
     description: "Gemma4 with MoE architecture"
     vram_gb: 26.9
-    enabled: true
+    enabled: false
     load_timeout_seconds: 300    # MoE — chargement plus lent, surtout en parallèle
     capabilities:
       - text_generation
@@ -139,7 +142,7 @@ models:
     path: "/data/models/qwen3.5-27B-Claude/Qwen3.5-27B.Q5_K_M.gguf"
     description: "Qwen3.5 27B MoE (9B active params), Q5_K_M — experts FFN sur CPU, attention sur GPU"
     vram_gb: 7.0                 # Correct AVEC --cpu-moe : seules les couches attention + embeddings sont en GPU
-    enabled: true
+    enabled: false
     capabilities:
       - text_generation
       - streaming

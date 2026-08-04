@@ -42,6 +42,9 @@ def test_layout_deploye_charge_bootstrap_et_la_politique_du_registre(tmp_path):
     assert (cible / "bootstrap" / "__init__.py").is_file()
     assert (cible / "bootstrap" / "catalog.yaml").is_file()
     assert (cible / "cluster" / "__init__.py").is_file()
+    assert (cible / "requirements.lock").read_bytes() == (
+        GATEWAY_ROOT / "requirements.lock"
+    ).read_bytes()
 
     imported = subprocess.run(
         [
@@ -57,6 +60,27 @@ def test_layout_deploye_charge_bootstrap_et_la_politique_du_registre(tmp_path):
     )
     assert imported.returncode == 0, imported.stderr
 
+    cli_contract = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from typer.main import get_command; "
+            "import cli; "
+            "command = get_command(cli.app).commands['bootstrap-apply']; "
+            "options = {option for parameter in command.params "
+            "for option in getattr(parameter, 'opts', ())}; "
+            "assert '--env-file' in options; "
+            "assert '--runtime-root' in options; "
+            "assert '--option-absente' not in options",
+        ],
+        cwd=cible,
+        capture_output=True,
+        text=True,
+    )
+    # Rich injecte des séquences ANSI dans l'aide sur GitHub Actions. Inspecter
+    # le contrat Click vérifie les options sans dépendre du rendu du terminal.
+    assert cli_contract.returncode == 0, cli_contract.stderr
+
 
 def test_synchronisation_retire_un_module_obsolete(tmp_path):
     cible = tmp_path / "opt" / "llm-gateway"
@@ -69,11 +93,39 @@ def test_synchronisation_retire_un_module_obsolete(tmp_path):
     assert not obsolete.exists(), "un module retiré de la release reste importable"
 
 
+def test_installation_neuve_recoit_tous_les_artefacts_operateur(tmp_path):
+    cible = tmp_path / "opt" / "llm-gateway"
+    result = _layout("deploy_sync_gateway_operational_files", GATEWAY_ROOT, cible)
+    assert result.returncode == 0, result.stderr
+
+    expected = {
+        "llm-gateway-backup.sh",
+        "smoke_test.sh",
+        "deploy-mode-lib.sh",
+        "nginx-lib.sh",
+        "runtime-variants.yaml.example",
+    }
+    assert {path.name for path in (cible / "deploy").iterdir()} == expected
+
+    help_result = subprocess.run(
+        ["bash", str(cible / "deploy" / "smoke_test.sh"), "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert "--base-url" in help_result.stdout
+
+
 def test_snapshot_et_rollback_restaurent_bootstrap(tmp_path):
     installe = tmp_path / "opt" / "llm-gateway"
     snapshot = tmp_path / "snapshot"
     assert _layout("deploy_sync_gateway_code", GATEWAY_ROOT, installe).returncode == 0
+    assert _layout(
+        "deploy_sync_gateway_operational_files", GATEWAY_ROOT, installe
+    ).returncode == 0
     original = (installe / "bootstrap" / "registry_writer.py").read_text(encoding="utf-8")
+    lock_original = (installe / "requirements.lock").read_bytes()
+    smoke_original = (installe / "deploy" / "smoke_test.sh").read_text(encoding="utf-8")
 
     snap = _layout("deploy_snapshot_gateway_code", installe, snapshot)
     assert snap.returncode == 0, snap.stderr
@@ -81,11 +133,17 @@ def test_snapshot_et_rollback_restaurent_bootstrap(tmp_path):
         "raise RuntimeError('release cassée')\n", encoding="utf-8"
     )
     (installe / "bootstrap" / "module_nouveau.py").write_text("", encoding="utf-8")
+    (installe / "requirements.lock").write_text("release cassée\n", encoding="utf-8")
+    (installe / "deploy" / "smoke_test.sh").write_text(
+        "exit 99\n", encoding="utf-8"
+    )
 
     restore = _layout("deploy_restore_gateway_code", snapshot, installe)
     assert restore.returncode == 0, restore.stderr
     assert (installe / "bootstrap" / "registry_writer.py").read_text(encoding="utf-8") == original
     assert not (installe / "bootstrap" / "module_nouveau.py").exists()
+    assert (installe / "requirements.lock").read_bytes() == lock_original
+    assert (installe / "deploy" / "smoke_test.sh").read_text(encoding="utf-8") == smoke_original
 
 
 def test_install_et_update_utilisent_le_layout_partage():
@@ -94,8 +152,10 @@ def test_install_et_update_utilisent_le_layout_partage():
 
     assert 'source "$SCRIPT_DIR/deploy/code-layout-lib.sh"' in install
     assert 'deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"' in install
+    assert 'deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"' in install
     assert 'source "$SCRIPT_DIR/deploy/code-layout-lib.sh"' in update
     assert 'deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"' in update
+    assert 'deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"' in update
     assert 'deploy_snapshot_gateway_code "$INSTALL_DIR" "$CODE_SNAPSHOT"' in update
     assert 'deploy_restore_gateway_code "$snapshot" "$INSTALL_DIR"' in update
 

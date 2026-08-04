@@ -1,0 +1,5 @@
+# vulnerability-id|expires-on|tracking-reference|justification
+#
+# Aucune exception active. Chaque future ligne doit avoir une date ISO, une
+# référence technique et une justification. Le job CI refuse une ligne expirée,
+# mal formée ou dupliquée avant d'exécuter pip-audit.
