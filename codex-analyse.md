@@ -29,7 +29,7 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 | **Où en est-on** | Jalons **M0 et M1 atteints**. Après fusion de la PR #13 dans `dev`, l'audit post-merge (§0.16) a réparé le contrat de l'installation réelle : runtime/service/registre alignés, artefacts d'exploitation installés, dépendances hashées, dashboard hors ligne, métriques runtime et runbook complet. M2 reste volontairement non prononcé |
 | **Ce qui bloque** | **Deux preuves P0 terrain**, pas un correctif local : exécuter la recette vrai petit GGUF (TST-004) et observer profils systemd/nginx sur le matériel de staging (OPS-001). Le `bootstrap-apply --apply` GPU/nginx et son rapport restent la preuve de sortie M2 |
 | **Ce qui vient ensuite** | Fournir une matrice `--runtime-variants` épinglée réelle, exécuter le runbook de `docs/deployment.md` sur l'hôte cible, lancer `doctor`, la recette petit GGUF puis le premier token via nginx, et archiver le rapport. Ensuite seulement : restore drill, endurance et SLO de M4/M5 |
-| **Santé des tests** | Branche post-merge rejouée sur Python 3.11 frais avec locks hashés : **2407 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
+| **Santé des tests** | Branche post-merge : **2408 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
 | **Reste à faire** | 25 items sur 96 (§0.3). Tous les P0 de code/supply-chain identifiés sont fermés ; TST-004 et OPS-001 restent ouverts parce que leur acceptation exige un runtime/GGUF et un staging réels |
 | **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
 | **Ce que l'audit post-merge a appris** | Une procédure peut être juste module par module et rester inexécutable une fois installée : chemins runtime divergents, EnvironmentFile jamais promu, modèles absents activés, artefacts seulement copiés par update et documentation pointant vers un secret inexistant. Voir §0.16 |
@@ -79,9 +79,9 @@ le verdict post-merge et les preuves encore requises.
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && python -m pytest tests -q` | 309 | **2409** 🔬 (2407 réussis + 2 `skip` locaux) |
+| `gateway` | `cd gateway && python -m pytest tests -q` | 309 | **2410** 🔬 (2408 réussis + 2 `skip` locaux) |
 | `node_agent` | `cd node_agent && python -m pytest tests -q` | 45 | **67** 🔬 |
-| **Total** | — | **354** | **2476** 🔬 (2474 réussis + 2 `skip`) |
+| **Total** | — | **354** | **2477** 🔬 (2475 réussis + 2 `skip`) |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
@@ -96,6 +96,15 @@ trois variables qui épinglent un vrai `llama-server`, un petit GGUF et son
 SHA-256. La machine macOS n'a pas nginx ; **les runners CI GitHub, si** — SEC-016
 y est donc exécuté. TST-004 reste opt-in tant qu'aucun artefact approuvé n'est
 fourni, précisément pour ne jamais télécharger ou exécuter un modèle implicite.
+
+Le run `push` post-merge de la PR #14 a trouvé une non-détermination que les deux
+runs de PR n'avaient pas déclenchée : la fixture `.tar.gz` de l'installateur
+runtime héritait du timestamp courant de gzip. Deux archives au contenu identique
+créées de part et d'autre d'une seconde portaient donc deux SHA-256 différents,
+et le test d'idempotence répondait aléatoirement `would_apply`. La fixture fixe
+désormais `mtime=0`; une régression déplace explicitement l'horloge de cent
+millions de secondes et exige les mêmes octets et un timestamp gzip nul. Le
+correctif ne touche aucun chemin de production.
 
 Ce détail a coûté un aller-retour de CI, et il valait la peine : la première
 passe a échoué **après** que nginx eut répondu `syntax is ok`, sur

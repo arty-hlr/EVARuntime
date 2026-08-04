@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import gzip
 import hashlib
 import io
 import json
@@ -36,6 +37,7 @@ import os
 import socket
 import stat
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -92,10 +94,17 @@ def _repertoire(tar: tarfile.TarFile, nom: str) -> None:
 
 def _tar_bytes(remplir) -> bytes:
     """Rend les octets d'un `.tar.gz` construit par le rappel `remplir(tar)`."""
-    tampon = io.BytesIO()
-    with tarfile.open(fileobj=tampon, mode="w:gz") as tar:
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w") as tar:
         remplir(tar)
-    return tampon.getvalue()
+
+    # `tarfile` délègue sinon à gzip avec l'heure courante dans l'en-tête. Deux
+    # fixtures identiques créées de part et d'autre d'une seconde auraient alors
+    # des SHA-256 différents et rendraient les tests d'idempotence aléatoires.
+    archive = io.BytesIO()
+    with gzip.GzipFile(fileobj=archive, mode="wb", mtime=0) as compresseur:
+        compresseur.write(tar_bytes.getvalue())
+    return archive.getvalue()
 
 
 def _archive_nominale(
@@ -334,6 +343,17 @@ def _installateur(
 
 def _appliquer(installateur: ri.RuntimeInstaller, contexte: ex.ExecutionContext, etape=None):
     return asyncio.run(installateur(etape or _etape(), contexte))
+
+
+def test_archive_nominale_est_reproductible_quand_l_horloge_change(monkeypatch):
+    """Le SHA de la fixture décrit son contenu, jamais sa seconde de création."""
+    monkeypatch.setattr(time, "time", lambda: 1_700_000_000.0)
+    premiere = _archive_nominale()
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    seconde = _archive_nominale()
+
+    assert premiere == seconde
+    assert int.from_bytes(premiere[4:8], "little") == 0
 
 
 # ══ 1. URL d'artefact ═════════════════════════════════════════════════════════
