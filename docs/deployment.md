@@ -5,10 +5,155 @@ sûr et choisi par défaut, et l'**orchestrateur cluster**, explicitement opt-in
 Le premier lance `llama-server` sur l'hôte gateway; le second ne requiert aucun
 GPU local et pilote des node-agents installés séparément.
 
+## Parcours direct Lenovo PGX — premier token
+
+Ce parcours est celui d'un **seul** Lenovo PGX : le GPU, `llama-server` et la
+gateway sont sur la même machine. Il donne un premier token local sans exiger
+de plan d'amorçage ni de certificat TLS. Le parcours production épinglé de
+[§4](#parcours-production-complet--mode-local) reste utile ensuite ; ne le
+confondrez pas avec cette première installation.
+
+Les chemins ne changent pas d'une étape à l'autre :
+
+| Élément | Chemin |
+|---|---|
+| Checkout EVARuntime | `/opt/src/EVARuntime` |
+| Sources llama.cpp | `/opt/src/llama.cpp` |
+| Binaire lu par la gateway | `/opt/llama.cpp/current/llama-server` |
+| GGUF | `/models/` |
+| Configuration | `/etc/llm-gateway/env` |
+| Registre actif | `/var/lib/llm-gateway/models.yaml` |
+
+1. Vérifiez le PGX et sélectionnez explicitement CUDA 13 :
+
+   ```bash
+   uname -m
+   nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
+
+   export CUDA_HOME=/usr/local/cuda-13.0
+   export PATH="$CUDA_HOME/bin:$PATH"
+   export CUDACXX="$CUDA_HOME/bin/nvcc"
+   nvcc --version
+   ```
+
+   On attend `aarch64`, `NVIDIA GB10`, compute capability `12.1` et CUDA
+   13.x. N'utilisez pas l'architecture `89`, réservée aux GPU Ada.
+
+2. Préparez un checkout permanent et compilez llama.cpp. Si la machine utilise
+   le proxy UPPA, exportez-le avant les téléchargements :
+
+   ```bash
+   sudo apt update
+   sudo apt install -y \
+     build-essential cmake ninja-build git libcurl4-openssl-dev \
+     python3 python3-venv python3-pip nginx sqlite3
+
+   sudo install -d -m 0755 /opt/src
+   sudo chown "$USER":"$(id -gn)" /opt/src
+
+   export http_proxy=http://cache.univ-pau.fr:3128
+   export https_proxy=http://cache.univ-pau.fr:3128
+
+   git clone https://github.com/Tutanka01/EVARuntime.git /opt/src/EVARuntime
+   ```
+
+   Suivez ensuite exactement
+   [la compilation PGX/GB10](build-llama-cpp-dgx-spark.md). Elle publie le
+   binaire sur `/opt/llama.cpp/current/llama-server`.
+
+3. Installez le socle gateway. L'installateur crée le service et ses secrets,
+   mais ne démarre pas encore la gateway :
+
+   ```bash
+   export EVA_SRC=/opt/src/EVARuntime
+   bash "$EVA_SRC/gateway/deploy/install.sh" --mode local --dry-run
+   sudo bash "$EVA_SRC/gateway/deploy/install.sh" --mode local
+
+   sudo systemctl is-enabled llm-gateway
+   sudo test -x /opt/llama.cpp/current/llama-server
+   sudo test -f /etc/llm-gateway/env
+   sudo test -f /var/lib/llm-gateway/models.yaml
+   ```
+
+4. Téléchargez le petit GGUF de recette, puis déclarez **uniquement** ce modèle
+   comme activé :
+
+   ```bash
+   sudo python3 -m venv /opt/src/hf-venv
+   sudo -E /opt/src/hf-venv/bin/python -m pip install --upgrade pip huggingface-hub
+
+   sudo install -d -m 0750 -o llmservice -g llmservice \
+     /var/lib/llm-gateway/huggingface /models/qwen2.5-0.5b
+
+   sudo -u llmservice env HF_HOME=/var/lib/llm-gateway/huggingface \
+     http_proxy="${http_proxy:-}" https_proxy="${https_proxy:-}" \
+     /opt/src/hf-venv/bin/hf download \
+     Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+     --include '*q4_k_m*' \
+     --local-dir /models/qwen2.5-0.5b
+
+   sudo find /models/qwen2.5-0.5b -maxdepth 1 -type f -name '*.gguf' -print
+   ```
+
+   Ouvrez `/etc/llm-gateway/env` avec `sudoedit` et vérifiez :
+
+   ```ini
+   LLAMA_SERVER_BIN=/opt/llama.cpp/current/llama-server
+   TOTAL_VRAM_GB=120.0
+   VRAM_OVERHEAD_GB=4.0
+   VRAM_SAFETY_MARGIN=0.03
+   ALLOWED_MODEL_DIRS=/models
+   DEFAULT_MODEL_ID=qwen2.5-0.5b-instruct-q4_k_m
+   CUDA_VISIBLE_DEVICES=0
+   ```
+
+   Remplacez le contenu de `/var/lib/llm-gateway/models.yaml` par le registre
+   minimal suivant. Le nom dans `path` doit être exactement celui affiché par
+   `find` :
+
+   ```yaml
+   models:
+     - id: "qwen2.5-0.5b-instruct-q4_k_m"
+       path: "/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+       description: "Modèle de recette PGX"
+       vram_gb: 1.0
+       enabled: true
+       capabilities: [text_generation, streaming]
+       llama_params:
+         n_gpu_layers: 999
+         ctx_size: 4096
+         parallel: 1
+         batch_size: 512
+         ubatch_size: 256
+         cache_type_k: "q8_0"
+         cache_type_v: "q8_0"
+         flash_attn: true
+         threads: 8
+         threads_http: 2
+   ```
+
+5. Démarrez et exécutez la recette complète :
+
+   ```bash
+   sudo systemctl start llm-gateway
+   curl -fsS http://127.0.0.1:8000/health
+   curl -i http://127.0.0.1:8000/ready
+
+   sudo bash /opt/llm-gateway/deploy/smoke_test.sh \
+     --admin-url http://127.0.0.1:8000 \
+     --base-url http://127.0.0.1:8000 \
+     --model qwen2.5-0.5b-instruct-q4_k_m
+   ```
+
+   `/ready` contrôle la structure ; seul `smoke_test.sh` charge le GGUF et
+   prouve le premier token SSE. Ajoutez TLS/nginx uniquement après ce succès
+   local.
+
 ---
 
 ## Table des matières
 
+0. [Parcours direct Lenovo PGX](#parcours-direct-lenovo-pgx--premier-token)
 1. [Prérequis](#1-prérequis)
 2. [Installation de llama.cpp](#2-installation-de-llamacpp)
 3. [Téléchargement des modèles](#3-téléchargement-des-modèles)
@@ -43,6 +188,10 @@ GPU local et pilote des node-agents installés séparément.
 | nginx | 1.18+ | `apt install nginx`. La conf livrée est valide de 1.18 à 1.29 ; **HTTP/2 est activé automatiquement** par `install.sh`/`update.sh` dans la forme qu'accepte la version installée — [§8](#8-configuration-nginx) |
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
+
+> **Lenovo PGX / GB10 :** les valeurs CUDA 12.x, driver 535+ et les exemples
+> L40S de cette table ne sont pas votre profil. Utilisez le parcours direct
+> ci-dessus : CUDA 13.x et `CMAKE_CUDA_ARCHITECTURES=121`.
 
 ### Commandes exigées par les scripts de déploiement
 
@@ -189,6 +338,11 @@ automatisé et copiable se trouve en [§4](#parcours-production-complet--mode-lo
 
 On compile llama.cpp depuis les sources pour avoir la version la plus récente
 avec support CUDA optimisé pour l'Ada Lovelace (L40S, compute capability 8.9).
+
+Cette sous-section manuelle concerne le profil L40S. Sur Lenovo PGX / GB10,
+utilisez [la note de compilation dédiée](build-llama-cpp-dgx-spark.md), qui
+utilise CUDA 13, l'architecture `121` et le chemin
+`/opt/llama.cpp/current/llama-server`.
 
 ```bash
 # Dépendances de compilation
@@ -501,8 +655,10 @@ empreinte d'exemple.
 1. Poser le socle, sans exiger un runtime déjà présent :
 
    ```bash
-   git clone https://github.com/Tutanka01/EVARuntime.git /tmp/evaruntime-src
-   sudo bash /tmp/evaruntime-src/gateway/deploy/install.sh --mode local
+   sudo install -d -m 0755 /opt/src
+   sudo chown "$USER":"$(id -gn)" /opt/src
+   git clone https://github.com/Tutanka01/EVARuntime.git /opt/src/EVARuntime
+   sudo bash /opt/src/EVARuntime/gateway/deploy/install.sh --mode local
    ```
 
    Une installation neuve livre un registre dont tous les modèles sont

@@ -1,224 +1,175 @@
-# Compiler llama.cpp pour DGX Spark (GB10, sm_121, ARM64)
+# Compiler llama.cpp sur un Lenovo PGX / NVIDIA GB10
 
-> Ce guide s'adresse aux DGX Spark équipés du SoC **NVIDIA Grace-Blackwell GB10**.
-> Ne pas confondre avec les GPU Blackwell discrets (RTX 5090, H200 NVL) qui utilisent
-> `sm_100` — les binaires ne sont **pas interchangeables**.
+Ce document couvre uniquement la compilation et l'installation du binaire
+`llama-server`. Le déploiement EVARuntime est décrit dans
+[`deployment.md`](deployment.md).
 
----
+Le checkout utilisé partout ici est `/opt/src/llama.cpp`. Le binaire est publié
+dans `/opt/llama.cpp/releases/<release>/llama-server`, puis exposé par le lien
+atomique `/opt/llama.cpp/current/llama-server`. Ne lancez pas un serveur
+permanent à la main : EVARuntime gère le cycle de vie de ses processus.
 
-## Caractéristiques pertinentes du GB10
-
-| Aspect | Détail |
-|--------|--------|
-| Compute capability | **sm_121** (Grace-Blackwell SoC, différent de sm_100 Blackwell discret) |
-| Mémoire | 128 GB LPDDR5X **unifiée CPU+GPU** via NVLink-C2C (600 GB/s) |
-| CPU | 72 cœurs ARM Neoverse-V2 (Cortex-X925/A725) |
-| OS | DGX OS basé sur Ubuntu 24.04 **aarch64** |
-| CUDA requis | **13.0+** (CUDA 12.x ne connaît pas sm_121) |
-| Driver requis | **≥ 580.x** |
-
-La mémoire unifiée signifie que CPU et GPU partagent le même pool physique —
-aucune copie PCIe, débit natif 600 GB/s. Du point de vue du budget VRAM dans
-EVARuntime, configurer `TOTAL_VRAM_GB=120` (sur 128 GB physiques, l'OS et CUDA
-réservent ~6-8 GB).
-
----
-
-## Pré-requis
+## Vérifier le bon GPU et le bon compilateur
 
 ```bash
-# Vérifier CUDA 13+
-nvcc --version        # doit afficher "release 13.x"
-nvidia-smi            # doit afficher Driver >= 580.x
+uname -m
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
 
-# Vérifier l'architecture
-uname -m              # → aarch64
+# Sur certains PGX, /usr/bin/nvcc vient encore du paquet CUDA 12.
+# Sélectionner explicitement le toolkit CUDA 13 installé pour le GB10.
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
 
-# Outils de build
-sudo apt install -y cmake ninja-build gcc g++ git libcurl4-openssl-dev
-# GCC ≥ 12.4 est présent par défaut sur Ubuntu 24.04
-gcc --version
+nvcc --version
 ```
 
----
+Le résultat attendu est `aarch64`, `NVIDIA GB10` et CUDA 13.x. Le pilote
+NVIDIA peut afficher une version CUDA 13 même lorsque la commande `nvcc` par
+défaut pointe encore vers CUDA 12 : c'est le chemin du compilateur qui compte
+pour la compilation.
 
-## Build recommandé — sm_121 portable
+Le GB10 utilise la compute capability 12.1. Dans CMake, sa cible est donc
+`121`. `89` est la cible des GPU Ada (par exemple L40S/RTX 4090) et ne convient
+pas au PGX.
 
-Compile pour GB10 tout en conservant un PTX virtuel de repli. Binaire portable
-si jamais les drivers évoluent.
+## Dépendances
 
 ```bash
-git clone https://github.com/ggml-org/llama.cpp.git
-cd llama.cpp
+sudo apt update
+sudo apt install -y build-essential cmake ninja-build git libcurl4-openssl-dev
+```
 
+## Récupérer les sources
+
+Utilisez un checkout permanent, avec votre utilisateur normal :
+
+```bash
+sudo install -d -m 0755 /opt/src
+sudo chown "$USER":"$(id -gn)" /opt/src
+
+# Si la sortie Internet passe par le proxy UPPA :
+export http_proxy=http://cache.univ-pau.fr:3128
+export https_proxy=http://cache.univ-pau.fr:3128
+
+git clone https://github.com/ggml-org/llama.cpp.git /opt/src/llama.cpp
+export LLAMA_SRC=/opt/src/llama.cpp
+```
+
+Si le checkout existe déjà :
+
+```bash
+export LLAMA_SRC=/opt/src/llama.cpp
+git -C "$LLAMA_SRC" status --short
+```
+
+Avant une mise à jour, le checkout doit être propre. Le dépôt ne doit pas être
+cloné dans `/tmp` : le chemin est réutilisé pour les builds suivants.
+
+## Build CUDA du serveur
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+export LLAMA_SRC=/opt/src/llama.cpp
+
+cd "$LLAMA_SRC"
 cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
   -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="121" \
-  -DGGML_CUDA_F16=ON \
-  -DGGML_CUDA_GRAPHS=ON \
-  -DGGML_NATIVE=ON \
-  -DLLAMA_CURL=ON
+  -DCMAKE_CUDA_ARCHITECTURES=121 \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF \
+  -DCMAKE_BUILD_TYPE=Release
 
-cmake --build build -j$(nproc)
-RELEASE="manual-sm121-$(date +%Y%m%d)"
+cmake --build build --target llama-server --parallel 8
+./build/bin/llama-server --version
+
+RELEASE="manual-gb10-$(git rev-parse --short HEAD)"
 sudo install -d -m 0755 "/opt/llama.cpp/releases/$RELEASE"
 sudo install -m 0755 build/bin/llama-server \
   "/opt/llama.cpp/releases/$RELEASE/llama-server"
-sudo ln -sfn "/opt/llama.cpp/releases/$RELEASE" /opt/llama.cpp/current
+sudo ln -sfn "releases/$RELEASE" /opt/llama.cpp/.current-new
+sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
 
-# Vérification — doit afficher "compute capability 12.1"
 /opt/llama.cpp/current/llama-server --version
 ```
 
-**Explications des flags clés :**
+La commande CMake officielle construit `llama-server` depuis la racine du
+dépôt ; la sortie attendue est `build/bin/llama-server`. Le target explicite
+réduit le temps de compilation par rapport à la construction de tous les
+outils. `LLAMA_BUILD_UI=OFF` évite de construire les assets Web de l'interface
+llama.cpp ; `LLAMA_USE_PREBUILT_UI=OFF` désactive aussi le repli vers le bucket
+Hugging Face. `BUILD_SHARED_LIBS=OFF` produit un binaire qui ne dépend pas des
+bibliothèques générées dans le répertoire `build/` lorsqu'il est publié. Le
+lien `current` est le seul chemin lu par EVARuntime et permet un retour
+arrière vers une release précédente. EVARuntime possède déjà son propre
+dashboard et n'en dépend pas.
 
-| Flag | Rôle |
-|------|------|
-| `-DCMAKE_CUDA_ARCHITECTURES="121"` | Cible exclusivement GB10 — génère SASS sm_121 + PTX de repli |
-| `-DGGML_CUDA_F16=ON` | Calculs FP16 natifs sur Tensor Cores Blackwell |
-| `-DGGML_CUDA_GRAPHS=ON` | CUDA Graphs — réduit la latence CPU sur les tokens répétés |
-| `-DGGML_NATIVE=ON` | Active NEON/SVE2 sur les cœurs ARM (tokenizer, sampling) |
-| `-DLLAMA_CURL=ON` | Téléchargement de modèles HuggingFace depuis llama-server |
-
----
-
-## Build avancé — sm_121a-real (performance maximale)
-
-Génère uniquement du SASS sm_121a (instructions GB10 spécifiques : mxfp4,
-Tensor Memory Accelerator). Gain attendu : ~3-5 %. **Non portable** hors GB10.
+Si la compilation manque de mémoire, ne changez pas l'architecture CUDA.
+Relancez seulement le build avec moins de jobs :
 
 ```bash
-cmake -S . -B build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="121a-real" \
-  -DGGML_CUDA_F16=ON \
-  -DGGML_CUDA_GRAPHS=ON \
-  -DGGML_NATIVE=ON \
-  -DLLAMA_CURL=ON
+cd /opt/src/llama.cpp
+cmake --build build --target llama-server --parallel 4
+```
 
-cmake --build build -j$(nproc)
-RELEASE="manual-sm121a-$(date +%Y%m%d)"
+## Problèmes de compilation
+
+| Message | Cause probable | Action |
+|---|---|---|
+| `unsupported gpu architecture 'compute_121'` | CMake utilise CUDA 12 ou un autre `nvcc`. | Vérifier `command -v nvcc`, `nvcc --version` et `echo "$CUDACXX"`; réexporter CUDA 13 puis supprimer uniquement `build/CMakeCache.txt` et relancer CMake. |
+| `nvcc` affiche `release 12.0` | Le wrapper `/usr/bin/nvcc` masque CUDA 13. | Utiliser `CUDA_HOME=/usr/local/cuda-13.0`, mettre `$CUDA_HOME/bin` en tête de `PATH` et définir `CUDACXX`. |
+| `Killed` pendant la compilation | Trop de compilations CUDA simultanées. | Utiliser `--parallel 4`, puis `--parallel 2` si nécessaire. |
+| `cmake` ne trouve pas CUDA | Toolkit absent ou chemin non standard. | Vérifier `/usr/local/cuda-13.0/bin/nvcc`; installer le toolkit PGX fourni par NVIDIA avant de continuer. |
+| `libcuda.so` introuvable au link | Environnement CUDA incomplet. | Vérifier `ls /usr/local/cuda-13.0/compat /usr/local/cuda-13.0/targets/sbsa-linux/lib`; ne pas remplacer le toolkit par CUDA 12. |
+
+Si CMake a été configuré avec le mauvais compilateur, repartez d'un cache
+propre sans supprimer les sources :
+
+```bash
+cd /opt/src/llama.cpp
+rm -f build/CMakeCache.txt
+rm -rf build/CMakeFiles
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+cmake -S . -B build -G Ninja \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=121 \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server --parallel 4
+```
+
+## Mise à jour du binaire
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDACXX="$CUDA_HOME/bin/nvcc"
+cd /opt/src/llama.cpp
+git pull --ff-only
+
+cmake -S . -B build -G Ninja \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=121 \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server --parallel 8
+RELEASE="manual-gb10-$(git rev-parse --short HEAD)"
 sudo install -d -m 0755 "/opt/llama.cpp/releases/$RELEASE"
 sudo install -m 0755 build/bin/llama-server \
   "/opt/llama.cpp/releases/$RELEASE/llama-server"
-sudo ln -sfn "/opt/llama.cpp/releases/$RELEASE" /opt/llama.cpp/current
+sudo ln -sfn "releases/$RELEASE" /opt/llama.cpp/.current-new
+sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
+sudo systemctl restart llm-gateway
 ```
 
-À utiliser uniquement si les deux DGX Spark exécutent exactement le même
-binaire et que vous ne redistribuez pas le build.
-
-Pour une installation de production, préférez malgré tout le workflow
-`evaruntime bootstrap-plan` puis `bootstrap-apply` décrit dans
-[`deployment.md`](deployment.md) : il vérifie le commit, le build minimal et le
-SHA-256 avant de publier ce même lien `current`, puis aligne atomiquement le
-fichier d'environnement du service.
-
----
-
-## Erreurs de build connues
-
-| Message | Cause | Solution |
-|---------|-------|----------|
-| `unsupported gpu architecture 'compute_121'` | CUDA < 13 | Installer CUDA 13.0.1 |
-| `ptxas error: mma.m16n8k16 with block scale` | Driver < 580 | Mettre à jour driver ≥ 580.126.09 |
-| Build OOM en compilation | Chaque traduction CUDA ≈ 3 GB RAM pic | Réduire `-j` à 4 ou 2 |
-| `libcuda.so not found` à l'exécution | LD_LIBRARY_PATH manquant | `export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH` |
-
----
-
-## Configuration EVARuntime pour GB10
-
-### Sur chaque nœud (agent) — `/etc/llm-gateway-agent/env`
-
-```ini
-# Mémoire unifiée GB10 : 128 GB physiques - 8 GB OS/CUDA = 120 GB net
-TOTAL_VRAM_GB=120.0
-VRAM_OVERHEAD_GB=4.0      # CUDA 13 + Grace OS + frameworks
-VRAM_SAFETY_MARGIN=0.03   # 3% de marge supplémentaire
-
-# Pool de ports — adapter selon le nombre de modèles simultanés voulus
-MAX_LOADED_MODELS=5
-BASE_LLAMA_PORT=8081
-```
-
-### Dans `models.yaml` — profil GB10
-
-```yaml
-models:
-  - id: llama-3.3-70b-instruct
-    path: /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
-    description: "Llama 3.3 70B Instruct — Q4_K_M, optimisé GB10"
-    vram_gb: 42.0
-    enabled: true
-    capabilities: [text_generation, tool_calls, streaming]
-    llama_params:
-      n_gpu_layers: 999   # tout sur GPU (mémoire unifiée)
-      ctx_size: 65536     # 64k tokens — GB10 peut gérer
-      parallel: 8         # 8 streams simultanés (128 GB le permettent)
-      batch_size: 4096
-      ubatch_size: 512
-      cache_type_k: q8_0
-      cache_type_v: q8_0
-      flash_attn: true
-      threads: 16
-      cpu_moe: false      # inutile sur GB10 (mémoire unifiée — pas de bénéfice)
-
-  - id: deepseek-r1-70b
-    path: /models/DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf
-    description: "Modèle de raisonnement léger — Q4_K_M"
-    vram_gb: 6.0
-    enabled: true
-    capabilities: [text_generation, streaming]
-    llama_params:
-      n_gpu_layers: 999
-      ctx_size: 32768
-      parallel: 4
-      batch_size: 2048
-      ubatch_size: 512
-      cache_type_k: q8_0
-      cache_type_v: q8_0
-      flash_attn: true
-      threads: 8
-      cpu_moe: false
-```
-
----
-
-## Note sur `--cpu-moe`
-
-Sur les GPU classiques (L40S, A100…), le flag `--cpu-moe` déporte les experts
-FFN des modèles MoE (Mixtral, DeepSeek…) sur le CPU pour économiser de la VRAM.
-
-**Sur GB10, ce flag est inutile** : CPU et GPU partagent la même mémoire physique.
-Déporter sur CPU ne libère rien — pire, cela ajoute une indirection logicielle.
-Laisser `cpu_moe: false` sur tous les modèles GB10.
-
----
-
-## Performance attendue sur GB10
-
-| Modèle | Quant | Vitesse génération | Prefill |
-|--------|-------|-------------------|---------|
-| Llama 3.3 70B | Q4_K_M | ~14 t/s | ~600 t/s |
-| Llama 3.3 70B | Q8_0 | ~9 t/s | ~550 t/s |
-| Qwen 2.5 72B | Q4_K_M | ~13 t/s | ~580 t/s |
-
-Bande passante mémoire GB10 : 273 GB/s (goulot d'étranglement en génération).
-Cold start d'un modèle 70B depuis NVMe local : ~30-45 s.
-
----
-
-## Multi-GPU / dual-node llama.cpp natif — pourquoi ne pas l'utiliser
-
-llama.cpp propose `--rpc` pour répartir un modèle sur deux GPU via le réseau.
-**Ce mode n'est PAS utilisé dans EVARuntime** pour deux raisons :
-
-1. **Latence** : chaque token traverse le réseau Ethernet (~5-10× plus lent qu'un
-   modèle qui tient sur un seul GB10 — et 128 GB suffisent pour les 70B en Q8_0).
-2. **Complexité** : nécessite un serveur RPC dédié sur le second nœud.
-
-L'approche EVARuntime est préférable : chaque DGX Spark charge ses propres
-modèles indépendamment, l'orchestrateur les distribue selon la disponibilité VRAM.
-Cela donne la résilience (si un nœud tombe, l'autre continue) sans la latence RPC.
+Après toute mise à jour, redémarrez EVARuntime puis exécutez le smoke test du
+[guide de déploiement](deployment.md#recette-du-premier-token-smoke_testsh).

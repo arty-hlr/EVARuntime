@@ -930,7 +930,7 @@ class GpuInfo:
     index: int | None
     uuid: str
     name: str
-    memory_total_mib: float
+    memory_total_mib: float | None
     driver_version: str
     compute_capability: str
 
@@ -952,10 +952,17 @@ def parse_nvidia_smi_csv(text: str) -> list[GpuInfo]:
             index: int | None = int(fields[0])
         except ValueError:
             index = None
-        try:
-            memory = float(fields[3])
-        except ValueError:
-            continue
+        memory_raw = fields[3].strip().lower()
+        if memory_raw in {"[n/a]", "n/a"}:
+            # Les GB10/PGX exposent une mémoire unifiée, mais nvidia-smi peut
+            # répondre [N/A] pour memory.total. Le GPU reste visible dans doctor
+            # et la capacité est alors explicitement confiée à TOTAL_VRAM_GB.
+            memory: float | None = None
+        else:
+            try:
+                memory = float(fields[3])
+            except ValueError:
+                continue
         gpus.append(GpuInfo(
             index=index,
             uuid=fields[1],
@@ -1082,11 +1089,18 @@ def check_gpu_inventory(
             critical=False,
         )
 
-    described = "; ".join(
-        f"GPU {g.index}: {g.name}, {g.memory_total_mib / 1024:.1f} Go, "
-        f"driver {g.driver_version}, compute {g.compute_capability}"
-        for g in gpus
-    )
+    def describe(gpu: GpuInfo) -> str:
+        memory = (
+            f"{gpu.memory_total_mib / 1024:.1f} Go"
+            if gpu.memory_total_mib is not None
+            else "mémoire non rapportée"
+        )
+        return (
+            f"GPU {gpu.index}: {gpu.name}, {memory}, "
+            f"driver {gpu.driver_version}, compute {gpu.compute_capability}"
+        )
+
+    described = "; ".join(describe(gpu) for gpu in gpus)
     if waived:
         return CheckResult(
             "gpu_inventory", "warn", "gpu_waiver_stale",
@@ -1168,6 +1182,10 @@ def check_vram_detected(
         )
 
     configured = float(getattr(config, "total_vram_gb", 0.0) or 0.0)
+    try:
+        net_budget = float(config.effective_vram_budget_gb())
+    except Exception:
+        net_budget = configured
     raw = str(getattr(config, "cuda_visible_devices", "") or "")
     visible, unknown = visible_devices(config, gpus)
 
@@ -1187,11 +1205,18 @@ def check_vram_detected(
             "devices situés AVANT le premier jeton invalide.",
         )
 
+    if any(g.memory_total_mib is None for g in visible):
+        return CheckResult(
+            "vram_detected", "skip", "vram_not_reported",
+            f"nvidia-smi expose {len(visible)}/{len(gpus)} GPU(s), mais ne "
+            "rapporte pas memory.total pour ce matériel. Le budget effectif "
+            f"reste celui de la configuration (TOTAL_VRAM_GB={configured:.1f} Go, "
+            f"budget net {net_budget:.1f} Go) ; "
+            "vérifiez TOTAL_VRAM_GB avec la fiche du matériel et nvidia-smi.",
+            critical=False,
+        )
+
     detected = sum(g.memory_total_mib for g in visible) / 1024.0
-    try:
-        net_budget = float(config.effective_vram_budget_gb())
-    except Exception:
-        net_budget = configured
     described = (
         f"{len(visible)}/{len(gpus)} GPU exposé(s) par CUDA_VISIBLE_DEVICES={raw} "
         f"→ {detected:.1f} Go détectés, TOTAL_VRAM_GB={configured:.1f}, "
