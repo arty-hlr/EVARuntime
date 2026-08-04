@@ -60,15 +60,26 @@ def test_layout_deploye_charge_bootstrap_et_la_politique_du_registre(tmp_path):
     )
     assert imported.returncode == 0, imported.stderr
 
-    cli_help = subprocess.run(
-        [sys.executable, "cli.py", "bootstrap-apply", "--help"],
+    cli_contract = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from typer.main import get_command; "
+            "import cli; "
+            "command = get_command(cli.app).commands['bootstrap-apply']; "
+            "options = {option for parameter in command.params "
+            "for option in getattr(parameter, 'opts', ())}; "
+            "assert '--env-file' in options; "
+            "assert '--runtime-root' in options; "
+            "assert '--option-absente' not in options",
+        ],
         cwd=cible,
         capture_output=True,
         text=True,
     )
-    assert cli_help.returncode == 0, cli_help.stderr
-    assert "--env-file" in cli_help.stdout
-    assert "--runtime-root" in cli_help.stdout
+    # Rich injecte des séquences ANSI dans l'aide sur GitHub Actions. Inspecter
+    # le contrat Click vérifie les options sans dépendre du rendu du terminal.
+    assert cli_contract.returncode == 0, cli_contract.stderr
 
 
 def test_synchronisation_retire_un_module_obsolete(tmp_path):
