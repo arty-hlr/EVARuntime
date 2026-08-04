@@ -5,13 +5,14 @@ sûr et choisi par défaut, et l'**orchestrateur cluster**, explicitement opt-in
 Le premier lance `llama-server` sur l'hôte gateway; le second ne requiert aucun
 GPU local et pilote des node-agents installés séparément.
 
-## Parcours direct Lenovo PGX — premier token
+## Déploiement local — premier token
 
-Ce parcours est celui d'un **seul** Lenovo PGX : le GPU, `llama-server` et la
-gateway sont sur la même machine. Il donne un premier token local sans exiger
-de plan d'amorçage ni de certificat TLS. Le parcours production épinglé de
-[§4](#parcours-production-complet--mode-local) reste utile ensuite ; ne le
-confondrez pas avec cette première installation.
+Ce parcours s'applique à une machine Linux équipée d'au moins un GPU NVIDIA :
+la gateway et `llama-server` tournent sur le même hôte. Il permet de vérifier
+un premier token local avant d'ajouter un certificat TLS, un reverse proxy ou
+un déploiement multi-nœuds. Le parcours de production épinglé de
+[§4](#parcours-production-complet--mode-local) reste utile ensuite ; il ne
+remplace pas cette première installation.
 
 Les chemins ne changent pas d'une étape à l'autre :
 
@@ -24,23 +25,22 @@ Les chemins ne changent pas d'une étape à l'autre :
 | Configuration | `/etc/llm-gateway/env` |
 | Registre actif | `/var/lib/llm-gateway/models.yaml` |
 
-1. Vérifiez le PGX et sélectionnez explicitement CUDA 13 :
+### Étape 1 — vérifier le GPU et le compilateur CUDA
 
-   ```bash
-   uname -m
-   nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
+```bash
+uname -m
+nvidia-smi --query-gpu=index,name,memory.total,driver_version,compute_cap \
+  --format=csv,noheader
+command -v nvcc
+nvcc --version
+```
 
-   export CUDA_HOME=/usr/local/cuda-13.0
-   export PATH="$CUDA_HOME/bin:$PATH"
-   export CUDACXX="$CUDA_HOME/bin/nvcc"
-   nvcc --version
-   ```
+`nvidia-smi` doit lister le ou les GPU destinés à l'inférence, et `nvcc` doit
+provenir du toolkit CUDA compatible avec leur pilote. La [section 2](#2-installation-de-llamacpp)
+calcule ensuite l'architecture CUDA à transmettre à CMake : ne la fixez pas à
+une valeur propre à un autre GPU.
 
-   On attend `aarch64`, `NVIDIA GB10`, compute capability `12.1` et CUDA
-   13.x. N'utilisez pas l'architecture `89`, réservée aux GPU Ada.
-
-2. Préparez un checkout permanent et compilez llama.cpp. Si la machine utilise
-   le proxy UPPA, exportez-le avant les téléchargements :
+### Étape 2 — préparer les dépendances et le checkout
 
    ```bash
    sudo apt update
@@ -51,18 +51,20 @@ Les chemins ne changent pas d'une étape à l'autre :
    sudo install -d -m 0755 /opt/src
    sudo chown "$USER":"$(id -gn)" /opt/src
 
-   export http_proxy=http://cache.univ-pau.fr:3128
-   export https_proxy=http://cache.univ-pau.fr:3128
+   # Uniquement si votre réseau impose un proxy sortant :
+   # export http_proxy=http://proxy.example.net:3128
+   # export https_proxy=http://proxy.example.net:3128
 
    git clone https://github.com/Tutanka01/EVARuntime.git /opt/src/EVARuntime
    ```
 
-   Suivez ensuite exactement
-   [la compilation PGX/GB10](build-llama-cpp-dgx-spark.md). Elle publie le
-   binaire sur `/opt/llama.cpp/current/llama-server`.
+   Suivez ensuite [la procédure de compilation CUDA](#2-installation-de-llamacpp).
+   Elle publie le binaire sur `/opt/llama.cpp/current/llama-server`.
 
-3. Installez le socle gateway. L'installateur crée le service et ses secrets,
-   mais ne démarre pas encore la gateway :
+### Étape 3 — installer le socle gateway
+
+L'installateur crée le service et ses secrets, mais ne démarre pas encore la
+gateway :
 
    ```bash
    export EVA_SRC=/opt/src/EVARuntime
@@ -75,8 +77,9 @@ Les chemins ne changent pas d'une étape à l'autre :
    sudo test -f /var/lib/llm-gateway/models.yaml
    ```
 
-4. Téléchargez le petit GGUF de recette, puis déclarez **uniquement** ce modèle
-   comme activé :
+### Étape 4 — télécharger un petit modèle de recette
+
+Déclarez uniquement ce modèle comme activé pour le premier test :
 
    ```bash
    sudo python3 -m venv /opt/src/hf-venv
@@ -95,13 +98,16 @@ Les chemins ne changent pas d'une étape à l'autre :
    sudo find /models/qwen2.5-0.5b -maxdepth 1 -type f -name '*.gguf' -print
    ```
 
-   Ouvrez `/etc/llm-gateway/env` avec `sudoedit` et vérifiez :
+   Ouvrez `/etc/llm-gateway/env` avec `sudoedit`. Renseignez
+   `TOTAL_VRAM_GB` avec la valeur `memory.total` du GPU choisi ; si le pilote
+   affiche `N/A`, utilisez la capacité annoncée par le constructeur. Vérifiez
+   ensuite :
 
    ```ini
    LLAMA_SERVER_BIN=/opt/llama.cpp/current/llama-server
-   TOTAL_VRAM_GB=120.0
-   VRAM_OVERHEAD_GB=4.0
-   VRAM_SAFETY_MARGIN=0.03
+   TOTAL_VRAM_GB=<capacité VRAM de la machine>
+   VRAM_OVERHEAD_GB=2.0
+   VRAM_SAFETY_MARGIN=0.05
    ALLOWED_MODEL_DIRS=/models
    DEFAULT_MODEL_ID=qwen2.5-0.5b-instruct-q4_k_m
    CUDA_VISIBLE_DEVICES=0
@@ -115,7 +121,7 @@ Les chemins ne changent pas d'une étape à l'autre :
    models:
      - id: "qwen2.5-0.5b-instruct-q4_k_m"
        path: "/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-       description: "Modèle de recette PGX"
+       description: "Modèle de recette"
        vram_gb: 1.0
        enabled: true
        capabilities: [text_generation, streaming]
@@ -132,7 +138,7 @@ Les chemins ne changent pas d'une étape à l'autre :
          threads_http: 2
    ```
 
-5. Démarrez et exécutez la recette complète :
+### Étape 5 — démarrer et prouver le premier token
 
    ```bash
    sudo systemctl start llm-gateway
@@ -145,15 +151,14 @@ Les chemins ne changent pas d'une étape à l'autre :
      --model qwen2.5-0.5b-instruct-q4_k_m
    ```
 
-   `/ready` contrôle la structure ; seul `smoke_test.sh` charge le GGUF et
-   prouve le premier token SSE. Ajoutez TLS/nginx uniquement après ce succès
-   local.
+`/ready` contrôle la structure ; seul `smoke_test.sh` charge le GGUF et prouve
+le premier token SSE. Ajoutez TLS/nginx uniquement après ce succès local.
 
 ---
 
 ## Table des matières
 
-0. [Parcours direct Lenovo PGX](#parcours-direct-lenovo-pgx--premier-token)
+0. [Déploiement local — premier token](#déploiement-local--premier-token)
 1. [Prérequis](#1-prérequis)
 2. [Installation de llama.cpp](#2-installation-de-llamacpp)
 3. [Téléchargement des modèles](#3-téléchargement-des-modèles)
@@ -188,10 +193,6 @@ Les chemins ne changent pas d'une étape à l'autre :
 | nginx | 1.18+ | `apt install nginx`. La conf livrée est valide de 1.18 à 1.29 ; **HTTP/2 est activé automatiquement** par `install.sh`/`update.sh` dans la forme qu'accepte la version installée — [§8](#8-configuration-nginx) |
 | Espace disque | 100 GB+ sur nœud GPU | À dimensionner sur la somme des GGUF activés (le seul profil MiniMax pèse ~248 GB). L'orchestrateur ne stocke que code, DB et registre |
 | RAM hôte | 64 GB+ sur nœud GPU (128 GB = hôte de référence) | **Dépend des modèles activés** : un modèle `cpu_moe: true` garde ses experts FFN en RAM hôte. Table de dimensionnement en [§15](#15-durcissement-systemd-et-profils-mémoire). 4 GB suffisent sur l'orchestrateur cluster |
-
-> **Lenovo PGX / GB10 :** les valeurs CUDA 12.x, driver 535+ et les exemples
-> L40S de cette table ne sont pas votre profil. Utilisez le parcours direct
-> ci-dessus : CUDA 13.x et `CMAKE_CUDA_ARCHITECTURES=121`.
 
 ### Commandes exigées par les scripts de déploiement
 
@@ -241,14 +242,7 @@ sudo apt install -y rsync openssl
 # vérifier que le GPU est reconnu
 nvidia-smi
 
-# Résultat attendu :
-# +-----------------------------------------------------------------------------------------+
-# | NVIDIA-SMI 535.x  Driver Version: 535.x  CUDA Version: 12.x                           |
-# +-----------------------+----------------------+----------------------+
-# | GPU  Name                 Persistence-M | Bus-Id        Disp.A |
-# |   0  NVIDIA L40S                    Off |  00000000:...    Off |
-# +-----------------------+----------------------+----------------------+
-# | N/A   31C    P8    28W / 350W |    1MiB / 46068MiB |      0%      Default |
+# Résultat attendu : au moins un GPU NVIDIA apparaît sans erreur.
 
 # Vérifier Python
 python3 --version   # doit afficher 3.11 ou supérieur
@@ -336,39 +330,47 @@ automatisé et copiable se trouve en [§4](#parcours-production-complet--mode-lo
 
 ## 2. Installation de llama.cpp
 
-On compile llama.cpp depuis les sources pour avoir la version la plus récente
-avec support CUDA optimisé pour l'Ada Lovelace (L40S, compute capability 8.9).
-
-Cette sous-section manuelle concerne le profil L40S. Sur Lenovo PGX / GB10,
-utilisez [la note de compilation dédiée](build-llama-cpp-dgx-spark.md), qui
-utilise CUDA 13, l'architecture `121` et le chemin
-`/opt/llama.cpp/current/llama-server`.
+Cette procédure compile `llama-server` depuis les sources avec le toolkit CUDA
+et l'architecture détectés sur l'hôte. Elle publie ensuite le binaire sous le
+chemin atomique lu par la gateway.
 
 ```bash
 # Dépendances de compilation
-sudo apt install -y build-essential cmake git libcurl4-openssl-dev
+sudo apt install -y build-essential cmake ninja-build git libcurl4-openssl-dev
 
-# Cloner les sources HORS de la racine de releases atomiques
-sudo git clone https://github.com/ggml-org/llama.cpp /opt/llama.cpp-src
-cd /opt/llama.cpp-src
+# CUDACXX doit désigner le toolkit CUDA adapté au pilote et au GPU.
+export CUDACXX="$(command -v nvcc)"
+test -x "$CUDACXX"
 
-# Compiler avec support CUDA
-# GGML_CUDA=ON : active le backend CUDA
-# CMAKE_CUDA_ARCHITECTURES=89 : Ada Lovelace (L40S compute cap 8.9)
-sudo cmake -B build \
+# CMake accepte une liste séparée par des points-virgules pour des GPU variés.
+CUDA_ARCHITECTURES="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
+  | awk '{gsub(/\./, ""); print}' | sort -u | paste -sd ';' -)"
+test -n "$CUDA_ARCHITECTURES"
+printf 'Architectures CUDA : %s\n' "$CUDA_ARCHITECTURES"
+
+sudo install -d -m 0755 /opt/src
+sudo chown "$USER":"$(id -gn)" /opt/src
+git clone https://github.com/ggml-org/llama.cpp.git /opt/src/llama.cpp
+cd /opt/src/llama.cpp
+
+# Compiler et ne construire que le serveur.
+cmake -S . -B build -G Ninja \
   -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="89" \
+  -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_CURL=ON
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF
 
-sudo cmake --build build --config Release -j$(nproc)
+cmake --build build --target llama-server --parallel "$(nproc)"
 
 # Publier une release immuable derrière le même lien que bootstrap-apply.
-# Remplacer <bNNNNN> par le build réellement rendu par --version.
-sudo install -d -m 0755 /opt/llama.cpp/releases/<bNNNNN>
+RELEASE="manual-$(git rev-parse --short HEAD)"
+sudo install -d -m 0755 "/opt/llama.cpp/releases/$RELEASE"
 sudo install -m 0755 build/bin/llama-server \
-  /opt/llama.cpp/releases/<bNNNNN>/llama-server
-sudo ln -sfn releases/<bNNNNN> /opt/llama.cpp/.current-new
+  "/opt/llama.cpp/releases/$RELEASE/llama-server"
+sudo ln -sfn "releases/$RELEASE" /opt/llama.cpp/.current-new
 sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
 
 # Vérifier l'installation
@@ -376,8 +378,9 @@ sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
 ```
 
 > **Note :** La compilation prend 5 à 15 minutes selon la machine.
-> Si `nvidia-smi` indique une version CUDA différente, adapter `CMAKE_CUDA_ARCHITECTURES` :
-> - A100 → `80`, V100 → `70`, RTX 4090 → `89`, L40S → `89`
+> La commande déduit `CMAKE_CUDA_ARCHITECTURES` depuis `nvidia-smi`. Si le
+> toolkit choisi ne reconnaît pas l'architecture annoncée, installez un toolkit
+> CUDA plus récent, définissez `CUDACXX` vers son `nvcc`, puis reconfigurez.
 >
 > La voie manuelle ne fabrique pas le manifeste de provenance de
 > `bootstrap-apply`. Elle exige donc une attestation et une mise à jour manuelles
@@ -405,7 +408,8 @@ sudo mkdir -p /models
 
 ### Modèle principal — Llama 3.3 70B Q4_K_M (~42 GB)
 
-Qualité maximale, utilise la quasi-totalité du budget VRAM du L40S.
+Qualité élevée ; vérifier qu'environ 42 Go de VRAM sont disponibles avant de
+l'activer.
 
 ```bash
 huggingface-cli download bartowski/Llama-3.3-70B-Instruct-GGUF \
@@ -461,7 +465,7 @@ Le `mmproj_path` est déclaré dans `models.yaml` — voir section 6 pour la str
 | Llama 3.1 8B Q4_K_M | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | ~4.5 GB | ~1 GB (8 slots × 8K, Q8) | ~5.5 GB |
 | LLaVA 1.6 Mistral 7B Q4_K_M | `llava-v1.6-mistral-7b-Q4_K_M.gguf` + mmproj | ~4.4 GB + 0.6 GB mmproj | ~1 GB | ~6 GB |
 
-**L40S 48 GB :**
+**Exemple pour un GPU de 48 Go :**
 - Budget net disponible = 48 − 2 (overhead) − 2.4 (marge 5%) = **43.6 GB**
 - 70B seul : 42 GB ≤ 43.6 GB ✓
 - 70B + 8B simultanément : 42 + 5.5 = 47.5 GB > 43.6 GB → éviction LRU automatique
@@ -807,8 +811,8 @@ MODELS_CONFIG_PATH=/var/lib/llm-gateway/models.yaml
 # release horodatée : `current` est le contrat de bascule et de rollback.
 LLAMA_SERVER_BIN=/opt/llama.cpp/current/llama-server
 
-# ── Budget VRAM (L40S 48 GB) ──────────────────────────────────────────────────
-# Ajuster si vous utilisez un GPU différent
+# ── Budget VRAM ────────────────────────────────────────────────────────────────
+# Renseigner la capacité réellement disponible sur l'hôte.
 TOTAL_VRAM_GB=48.0
 VRAM_OVERHEAD_GB=2.0        # réservé pour le contexte CUDA et le framework
 VRAM_SAFETY_MARGIN=0.05     # 5% de marge de sécurité supplémentaire
@@ -855,7 +859,7 @@ ADMIN_SECRET=<généré>
 # Origines navigateur autorisées (séparées par des virgules, ou tableau JSON).
 # "*" par défaut ; en production, restreindre aux domaines clients connus.
 # Une valeur vide n'autorise aucune origine — ce n'est pas un joker implicite.
-# CORS_ALLOW_ORIGINS=https://app.univ-pau.fr
+# CORS_ALLOW_ORIGINS=https://app.example.com
 ```
 
 ---
@@ -875,7 +879,7 @@ sudoedit /var/lib/llm-gateway/models.yaml
 models:
   - id: "llama-3.3-70b-instruct"          # identifiant unique (regex: ^[a-z0-9][a-z0-9._-]{0,62}$)
     path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"   # chemin absolu vers le .gguf
-    description: "Llama 3.3 70B Instruct, Q4_K_M — modèle principal UPPA"
+    description: "Llama 3.3 70B Instruct, Q4_K_M — modèle principal"
     vram_gb: 42.0                          # estimation VRAM totale (poids + KV cache)
     enabled: true                          # false = invisible aux clients
     capabilities:
@@ -890,7 +894,7 @@ models:
       ubatch_size: 512
       cache_type_k: "q8_0"               # KV cache quantisé : -50% VRAM, qualité identique
       cache_type_v: "q8_0"
-      flash_attn: true                     # Flash Attention 2 (supporté sur L40S)
+      flash_attn: true                     # Flash Attention 2 si le build le prend en charge
       threads: 8
       threads_http: 4
 
@@ -1028,18 +1032,19 @@ Le registre est validé au démarrage :
 ## 7. Certificat TLS
 
 L'accès HTTPS est **obligatoire** — les clés API transitent dans les headers.
-
-Le domaine utilisé est **`llm.eva.univ-pau.fr`**. Le certificat est fourni par la DSI UPPA (PKI interne) — pas de certbot.
+Utilisez un nom DNS dont vous contrôlez le certificat, par une autorité de
+certification publique (ACME) ou par la PKI de votre organisation.
 
 ```bash
-# Placer les fichiers fournis par la DSI UPPA :
-sudo cp uppa-llm.crt /etc/ssl/certs/llm-gateway.crt
-sudo cp uppa-llm.key /etc/ssl/private/llm-gateway.key
+# Installer le certificat et la clé émis pour votre nom DNS.
+sudo install -m 0644 /chemin/vers/certificat.pem /etc/ssl/certs/llm-gateway.crt
+sudo install -m 0600 /chemin/vers/cle-privee.pem /etc/ssl/private/llm-gateway.key
 sudo chmod 600 /etc/ssl/private/llm-gateway.key
 sudo chmod 644 /etc/ssl/certs/llm-gateway.crt
 ```
 
-> **Note :** Le certificat est géré par la DSI UPPA. Contacter le service informatique pour le renouvellement avant expiration.
+Renouvelez le certificat avant son expiration selon la procédure de votre AC ou
+de votre PKI.
 
 ---
 
@@ -1049,8 +1054,8 @@ sudo chmod 644 /etc/ssl/certs/llm-gateway.crt
 # Adapter le nom de domaine dans la config
 sudo nano /etc/nginx/sites-available/llm-gateway
 
-# Remplacer llm.univ-pau.fr par votre domaine réel
-# Vérifier les plages IP campus dans la section /admin/ :
+# Remplacer gateway.example.com par votre domaine réel.
+# Vérifier les plages IP autorisées dans la section /admin/ :
 #   allow 10.0.0.0/8;      ← adapter si besoin
 #   allow 192.168.0.0/16;
 
@@ -1114,7 +1119,7 @@ sudo systemctl status llm-gateway
 Résultat attendu :
 
 ```
-● llm-gateway.service - LLM Inference Gateway UPPA (FastAPI)
+● llm-gateway.service - LLM Inference Gateway (FastAPI)
      Loaded: loaded (/etc/systemd/system/llm-gateway.service; enabled)
      Active: active (running) since ...
     Process: ExecStart=/opt/llm-gateway/venv/bin/uvicorn main:app ...
@@ -1128,7 +1133,7 @@ readiness structurelle. Pour prouver qu'un token sort réellement du chemin
 public, lancer la recette du premier token :
 
 ```bash
-sudo bash /opt/llm-gateway/deploy/smoke_test.sh --base-url https://llm.eva.univ-pau.fr
+sudo bash /opt/llm-gateway/deploy/smoke_test.sh --base-url https://gateway.example.com
 ```
 
 Elle crée une identité éphémère, charge le modèle, génère, vérifie le log
@@ -1184,12 +1189,12 @@ Réponse attendue (aucun modèle chargé au démarrage) :
 ```bash
 # Créer d'abord un utilisateur et une clé
 cd /opt/llm-gateway
-sudo -u llmservice ./venv/bin/python cli.py add-user test --email test@univ-pau.fr
+sudo -u llmservice ./venv/bin/python cli.py add-user test --email test@example.com
 sudo -u llmservice ./venv/bin/python cli.py create-key test --name "test"
 # → Copier la clé affichée : llmgw-XXXX...
 
 # Tester (le modèle 70B va charger, attendre ~60-90s à la première requête)
-curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
+curl -s https://gateway.example.com/v1/chat/completions \
   -H "Authorization: Bearer llmgw-VOTRE_CLE" \
   -H "Content-Type: application/json" \
   -d '{"model":"llama-3.3-70b-instruct","messages":[{"role":"user","content":"Dis bonjour"}]}' \
@@ -1237,7 +1242,7 @@ watch -n 5 'nvidia-smi --query-gpu=name,memory.used,memory.free,power.draw \
   --format=csv,noheader'
 
 # Après IDLE_TIMEOUT_SECONDS sans requête, observer :
-# L40S, 500 MiB, 47000 MiB, 28.00 W   ← GPU libéré ✓
+# NVIDIA GPU, faible mémoire utilisée, mémoire libre élevée   ← GPU libéré ✓
 ```
 
 ### Consulter les logs
@@ -1270,7 +1275,7 @@ de chaque llama-server chargé.
 Le dashboard est servi à l'URL :
 
 ```
-https://llm.eva.univ-pau.fr/admin/dashboard
+https://gateway.example.com/admin/dashboard
 ```
 
 > **Prérequis réseau :** la route `/admin/` est restreinte au réseau campus par nginx
@@ -1279,7 +1284,7 @@ https://llm.eva.univ-pau.fr/admin/dashboard
 
 ### Première connexion
 
-1. Ouvrir `https://llm.eva.univ-pau.fr/admin/dashboard` dans un navigateur
+1. Ouvrir `https://gateway.example.com/admin/dashboard` dans un navigateur
 2. Un écran de connexion s'affiche — entrer l'`ADMIN_SECRET`
 3. Le token est stocké dans `sessionStorage` (durée de vie : onglet du navigateur)
 4. À la fermeture du navigateur ou de l'onglet, la session est automatiquement détruite
@@ -1470,7 +1475,7 @@ sudo bash /opt/llm-gateway/deploy/smoke_test.sh
 
 # Exercer le vrai chemin client, TLS et non-buffering nginx compris
 sudo bash /opt/llm-gateway/deploy/smoke_test.sh \
-     --base-url https://llm.eva.univ-pau.fr \
+     --base-url https://gateway.example.com \
      --model llama-3.1-8b-instruct \
      --ttft-threshold-ms 5000
 
@@ -1777,7 +1782,7 @@ sudo systemctl restart llm-gateway
 export ADMIN_SECRET=$(sudo grep ADMIN_SECRET /etc/llm-gateway/env | cut -d= -f2)
 
 # Enregistrer un nouveau modèle
-curl -s -X POST "https://llm.eva.univ-pau.fr/admin/models" \
+curl -s -X POST "https://gateway.example.com/admin/models" \
   -H "Authorization: Bearer $ADMIN_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
@@ -1802,7 +1807,7 @@ curl -s -X POST "https://llm.eva.univ-pau.fr/admin/models" \
   }'
 
 # Activer / désactiver un modèle existant
-curl -s -X PATCH "https://llm.eva.univ-pau.fr/admin/models/llama-3.1-8b-instruct" \
+curl -s -X PATCH "https://gateway.example.com/admin/models/llama-3.1-8b-instruct" \
   -H "Authorization: Bearer $ADMIN_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
@@ -1895,9 +1900,9 @@ sudo systemctl start llm-gateway
 
 ## 13. Déploiement multi-nœuds (Optionnel — avancé)
 
-> Le multi-nœud est une **feature opt-in**. Le déploiement UPPA actuel (mono L40S)
-> n'est pas impacté — `CLUSTER_MODE=local` reste le défaut.
-> Cette section s'adresse aux opérateurs souhaitant piloter plusieurs GPU (ex : 2 DGX Spark).
+> Le multi-nœud est une fonctionnalité **opt-in**. Le mode local reste le
+> défaut. Cette section s'adresse aux opérateurs souhaitant piloter plusieurs
+> hôtes GPU.
 
 ### Architecture
 
@@ -1914,11 +1919,10 @@ Client OpenAI-compatible
     ▼                   ▼
 ┌──────────┐     ┌──────────┐
 │ Agent A  │     │ Agent B  │
-│ DGX Spark│     │ DGX Spark│
+│ Nœud GPU │     │ Nœud GPU │
 └────┬─────┘     └────┬─────┘
      ▼                ▼
  llama-server    llama-server
- (GB10 128GB)    (GB10 128GB)
 ```
 
 Deux flux séparés :
@@ -1953,22 +1957,23 @@ sudo bash gateway/deploy/install.sh --mode cluster
 sudo nano /etc/llm-gateway/nodes.yaml
 ```
 
-### Installation — chaque nœud DGX Spark
+### Installation — chaque nœud GPU
 
-Voir [build-llama-cpp-dgx-spark.md](build-llama-cpp-dgx-spark.md) pour compiler llama-server.
+Voir [la procédure de compilation CUDA](#2-installation-de-llamacpp) pour
+compiler `llama-server` sur chaque nœud.
 
 ```bash
 # Depuis l'orchestrateur, transférer le secret via stdin (jamais en argv/log) :
 sudo awk -F= '$1 == "AGENT_SECRET" {sub(/^[^=]*=/, ""); print; exit}' \
   /etc/llm-gateway/env | \
-  ssh root@dgx-spark-a 'umask 077; cat > /root/evaruntime-agent-secret'
+  ssh root@gpu-node-a 'umask 077; cat > /root/evaruntime-agent-secret'
 
-# Sur chaque DGX Spark (répéter pour dgx-spark-a et dgx-spark-b) :
+# Sur chaque nœud GPU (répéter pour gpu-node-a et gpu-node-b) :
 git clone https://github.com/Tutanka01/EVARuntime.git /opt/llm-gateway-src
 cd /opt/llm-gateway-src
 
 sudo bash node_agent/deploy/install-agent.sh \
-  --node-id dgx-spark-a \
+  --node-id gpu-node-a \
   --llama-min-build <premier_build_corrige> \
   --agent-secret-file /root/evaruntime-agent-secret \
   --orchestrator-cidr <IP_orchestrateur>/32
@@ -2008,12 +2013,12 @@ Si vous utilisez des certificats auto-signés générés par `install-agent.sh` 
 
 ```bash
 # Sur l'orchestrateur — récupérer les certificats des deux nœuds
-scp dgx-spark-a:/etc/llm-gateway-agent/tls/agent.crt /etc/ssl/certs/dgx-spark-a.crt
-scp dgx-spark-b:/etc/llm-gateway-agent/tls/agent.crt /etc/ssl/certs/dgx-spark-b.crt
+scp gpu-node-a:/etc/llm-gateway-agent/tls/agent.crt /etc/ssl/certs/gpu-node-a.crt
+scp gpu-node-b:/etc/llm-gateway-agent/tls/agent.crt /etc/ssl/certs/gpu-node-b.crt
 
 # Créer le bundle CA
-cat /etc/ssl/certs/dgx-spark-a.crt \
-    /etc/ssl/certs/dgx-spark-b.crt \
+cat /etc/ssl/certs/gpu-node-a.crt \
+    /etc/ssl/certs/gpu-node-b.crt \
   > /etc/ssl/certs/llm-gateway-nodes-ca.pem
 
 # Pointer nodes.yaml vers ce bundle :
@@ -2216,7 +2221,7 @@ La bascule ne supprime jamais `nodes.yaml`, `AGENT_SECRET` ni les services agent
 ils restent disponibles pour un retour contrôlé. Après validation locale,
 arrêter les agents devenus inutiles selon la politique d'exploitation.
 
-### Vérification de la rétrocompatibilité (déploiement UPPA existant)
+### Vérification de la rétrocompatibilité (déploiement local existant)
 
 ```bash
 # Sur une installation mono-nœud existante :
@@ -2434,7 +2439,7 @@ en relevant la limite systemd au-delà de la RAM réellement présente.
 
 #### Table de dimensionnement — modèle → RAM hôte → VRAM
 
-Hôte de référence : **L40S 48 Go / 128 Go de RAM** (mono-socket, GGUF sur NVMe).
+Hôte de référence : **GPU 48 Go / 128 Go de RAM** (mono-socket, GGUF sur NVMe).
 
 | Modèle | `cpu_moe` | GGUF | VRAM requise | RAM hôte **résidente** | RAM hôte **transitoire** (chargement) | RAM physique minimale (`MemoryHigh=80 %`) | Activé par défaut | Verdict |
 |--------|-----------|------|--------------|------------------------|----------------------------------------|-------------------------------------------|-------------------|---------|
@@ -2457,7 +2462,8 @@ Hôte de référence : **L40S 48 Go / 128 Go de RAM** (mono-socket, GGUF sur NVM
 #### Cas MiniMax M2.7 — traité explicitement
 
 `minimax-m2.7` est **désactivé par défaut** dans `gateway/models.yaml`. Ce n'est
-pas une contrainte de VRAM (32 Go déclarés, ça tient sur un L40S) mais de RAM
+pas une contrainte de VRAM (32 Go déclarés, cela tient dans le budget GPU de
+référence) mais de RAM
 hôte : avec `cpu_moe: true`, les ~248 Go d'experts FFN doivent rester résidents.
 Sur l'hôte de référence à 128 Go, aucune valeur de `MemoryMax` ne rend ce modèle
 utilisable — l'ancienne valeur `MemoryMax=64G` garantissait le thrashing, et la
@@ -2653,7 +2659,7 @@ Vérification manuelle de la rédaction, après reload :
 
 ```bash
 curl -sk -H "X-Admin-Secret: $ADMIN_SECRET" \
-     "https://llm.eva.univ-pau.fr/admin/usage?username=CANARI-Prenom-Nom" >/dev/null
+     "https://gateway.example.com/admin/usage?username=CANARI-Prenom-Nom" >/dev/null
 sudo grep -c 'CANARI' /var/log/nginx/llm-gateway-access.log   # doit afficher 0
 sudo tail -1 /var/log/nginx/llm-gateway-access.log            # doit montrer « ?<redacted> »
 ```

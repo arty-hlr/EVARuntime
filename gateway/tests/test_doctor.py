@@ -1130,7 +1130,7 @@ def test_shipped_nginx_conf_is_parsable():
         SHIPPED_NGINX_CONF.read_text(encoding="utf-8")
     )
     https = next(s for s in servers if s.directives.get("ssl_certificate"))
-    assert https.server_names == ("llm.eva.univ-pau.fr",)
+    assert https.server_names == ("gateway.example.com",)
 
     admin = doctor.match_location(https.locations, "/admin/models/m1/load")
     assert admin is not None and admin.pattern == "/admin/"

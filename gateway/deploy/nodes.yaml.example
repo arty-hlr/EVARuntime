@@ -22,23 +22,23 @@ cluster:
   #   false                     → désactivée (LAN strict, dev uniquement — DÉCONSEILLÉ en prod)
   #   /chemin/vers/ca-bundle.pem → bundle CA personnalisé (certificats auto-signés ou PKI locale)
   #
-  # Pour les DGX Spark en réseau campus UPPA, deux options :
-  #   a) Certificat PKI UPPA → tls_verify: true (si la PKI est dans le bundle système)
-  #   b) Certificat auto-signé (généré par install-agent.sh) → tls_verify: /etc/ssl/certs/nodes-ca.pem
-  #      Concaténer les .crt des deux agents dans ce fichier :
-  #        cat /etc/ssl/certs/dgx-spark-a.crt /etc/ssl/certs/dgx-spark-b.crt > /etc/ssl/certs/nodes-ca.pem
+  # Deux options :
+  #   a) Certificats signés par une AC reconnue → tls_verify: true
+  #   b) Certificats auto-signés (générés par install-agent.sh) → tls_verify: /etc/ssl/certs/nodes-ca.pem
+  #      Concaténer les .crt des agents dans ce fichier :
+  #        cat /etc/ssl/certs/gpu-node-a.crt /etc/ssl/certs/gpu-node-b.crt > /etc/ssl/certs/nodes-ca.pem
   tls_verify: /etc/ssl/certs/llm-gateway-nodes-ca.pem
 
 nodes:
-  # ── DGX Spark A ──────────────────────────────────────────────────────────────
-  - id: dgx-spark-a
-    base_url: https://dgx-a.internal.uppa.fr:9443
-    description: "DGX Spark A — GB10 128 GB unified, salle serveurs bat. B"
+  # ── Nœud GPU A ───────────────────────────────────────────────────────────────
+  - id: gpu-node-a
+    base_url: https://gpu-node-a.internal.example:9443
+    description: "Nœud GPU A"
 
-  # ── DGX Spark B ──────────────────────────────────────────────────────────────
-  - id: dgx-spark-b
-    base_url: https://dgx-b.internal.uppa.fr:9443
-    description: "DGX Spark B — GB10 128 GB unified, salle serveurs bat. B"
+  # ── Nœud GPU B ───────────────────────────────────────────────────────────────
+  - id: gpu-node-b
+    base_url: https://gpu-node-b.internal.example:9443
+    description: "Nœud GPU B"
 
 # ── Notes de configuration ────────────────────────────────────────────────────
 #
@@ -50,5 +50,5 @@ nodes:
 #   CLUSTER_HEALTH_FAILURES_TO_OFFLINE=3 # échecs → nœud offline
 #
 # La VRAM de chaque nœud est lue dynamiquement depuis l'agent au heartbeat.
-# Ne pas la configurer ici. Sur GB10 (128 GB physiques) l'agent rapporte
-# ~120 GB net après overhead (configurable via TOTAL_VRAM_GB dans son .env).
+# Ne pas la configurer ici. Le budget net est calculé avec `TOTAL_VRAM_GB`,
+# `VRAM_OVERHEAD_GB` et `VRAM_SAFETY_MARGIN` dans l'environnement de l'agent.
