@@ -117,6 +117,11 @@ inventing a build number. The complete production sequence, including
 `bootstrap-apply`, systemd environment hardening, `doctor` and the public smoke
 test, is in the [deployment guide](docs/deployment.md#parcours-production-complet--mode-local).
 
+Once a local installation runs, [« Première requête authentifiée »](docs/deployment.md#première-requête-authentifiée)
+walks you from creating a user and an API key (`llmgw-…`) to the first
+`/v1/chat/completions` on `http://127.0.0.1:8000` — and explains why the gateway
+rejects `ADMIN_SECRET` on `/v1/*` routes.
+
 Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
 multi-node orchestrator, inspect the plan first, then install explicitly:
 
@@ -141,11 +146,15 @@ for TLS, ports, shared model paths, migration and rollback.
 
 ## API Example
 
+On a fresh local install the gateway listens directly on `http://127.0.0.1:8000`;
+behind nginx, use your public URL instead. The `model` field is the `id` declared
+in `models.yaml` (not the GGUF file name).
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
+    base_url="http://127.0.0.1:8000/v1",
     api_key="llmgw-your_api_key",
 )
 
@@ -176,7 +185,7 @@ for chunk in stream:
 cd /opt/llm-gateway
 
 sudo -u llmservice ./venv/bin/python cli.py add-user alice \
-  --email alice@univ-pau.fr --rpm 30
+  --email alice@example.com --rpm 30
 
 sudo -u llmservice ./venv/bin/python cli.py create-key alice --name research
 sudo -u llmservice ./venv/bin/python cli.py list-users

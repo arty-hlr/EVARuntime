@@ -193,6 +193,73 @@ Déclarez uniquement ce modèle comme activé pour le premier test :
 `/ready` contrôle la structure ; seul `smoke_test.sh` charge le GGUF et prouve
 le premier token SSE. Ajoutez TLS/nginx uniquement après ce succès local.
 
+### Première requête authentifiée
+
+`smoke_test.sh` a prouvé un premier token avec une **identité éphémère**,
+créée puis retirée par la recette. Pour un usage réel, créez un utilisateur et
+une clé API **pérennes**, puis adressez la première requête *authentifiée* sur
+le chemin local direct `http://127.0.0.1:8000`.
+
+> **Deux secrets distincts — à ne jamais confondre.**
+> - `ADMIN_SECRET` (généré par `install.sh`, présent dans `/etc/llm-gateway/env`)
+>   est le secret **administratif** : il protège les routes `/admin/*`
+>   (utilisateurs, clés, modèles, statut). Ce n'est **pas** une clé
+>   d'inférence.
+> - Les routes `/v1/*` (lister les modèles, générer) s'authentifient avec la
+>   **clé API d'un utilisateur**, au format `llmgw-…`. C'est elle qu'un client
+>   envoie dans `Authorization: Bearer …`. Utiliser `ADMIN_SECRET` sur
+>   `/v1/chat/completions` est rejeté en `401`.
+
+La CLI s'invoque depuis le répertoire d'installation, avec le compte de
+service `llmservice` — le même chemin que celui affiché par `install.sh` :
+
+```bash
+cd /opt/llm-gateway
+
+# 1. Créer un utilisateur (remplacez <username>, ex. : alice)
+sudo -u llmservice ./venv/bin/python cli.py add-user <username>
+
+# 2. Créer une clé API pour cet utilisateur.
+#    La clé brute (llmgw-…) n'est affichée QU'UNE SEULE FOIS ; le serveur
+#    n'en conserve que l'empreinte SHA-256. Copiez-la immédiatement.
+sudo -u llmservice ./venv/bin/python cli.py create-key <username> --name local
+```
+
+```bash
+# 3. Exporter la clé pour les exemples qui suivent (remplacez <votre_cle>)
+export EVA_API_KEY="<votre_cle>"
+```
+
+```bash
+# 4. Lister les modèles accessibles avec cette clé.
+#    Chaque entrée porte un champ "id" : c'est CET identifiant (celui déclaré
+#    dans models.yaml) qu'il faut envoyer dans "model" — pas le nom du fichier
+#    .gguf, qui est le champ "path".
+curl -fsS http://127.0.0.1:8000/v1/models \
+  -H "Authorization: Bearer $EVA_API_KEY" | python3 -m json.tool
+
+# 5. Première génération authentifiée — remplacez <model_id> par l'"id" listé
+#    à l'étape 4 (pour le modèle de recette ci-dessus :
+#    qwen2.5-0.5b-instruct-q4_k_m)
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $EVA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<model_id>",
+    "messages": [{"role": "user", "content": "Dis bonjour"}]
+  }' | python3 -m json.tool
+```
+
+> **Le premier appel charge le modèle en VRAM — il peut être long.**
+> Un modèle activé n'est pas maintenu en mémoire en permanence : la première
+> requête qui le cible le **charge** (quelques secondes pour le modèle de
+> recette, ~60–90 s pour un gros modèle de plusieurs dizaines de Go). Les
+> requêtes suivantes sont nettement plus rapides, puis le modèle se décharge
+> après `IDLE_TIMEOUT_SECONDS` sans requête. Ne prenez pas cette attente pour
+> une erreur : la gateway met les requêtes concurrentes en file d'attente
+> pendant le chargement. Le détail de ce comportement est dans
+> [docs/api.md §10](api.md#10-comportement-au-premier-appel).
+
 ---
 
 ## Table des matières
