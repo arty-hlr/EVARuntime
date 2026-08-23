@@ -252,7 +252,7 @@ Métriques exposées (noms exacts) :
 | `eva_vram_total_gb` | gauge | — | VRAM totale du budget |
 | `eva_vram_available_gb` | gauge | — | VRAM disponible estimée |
 | `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
-| `eva_inference_ttft_seconds` | histogram | `model`, `node`, `outcome` | Temps entre la réception de la requête et le premier contenu SSE visible (queue et chargement inclus) |
+| `eva_inference_ttft_seconds` | histogram | `model`, `node`, `outcome` | Temps entre la réception de la requête et le premier delta SSE significatif (`content`, `reasoning_content` ou `tool_calls`; queue et chargement inclus) |
 | `eva_model_load_seconds` | histogram | `model`, `node`, `outcome` | Durée d'un appel réel de chargement local ou distant |
 | `eva_capacity_queue_wait_seconds` | histogram | `model`, `node`, `outcome` | Attente dans la queue locale de capacité VRAM/ports |
 | `eva_llama_kv_cache_usage_ratio` | gauge | `model` (+ `node` en cluster) | Occupation du KV cache (0–1) |

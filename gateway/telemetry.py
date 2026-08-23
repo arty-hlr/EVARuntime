@@ -117,7 +117,7 @@ class BoundedHistogram:
 
 TTFT_SECONDS = BoundedHistogram(
     "eva_inference_ttft_seconds",
-    "Temps visible client jusqu'au premier contenu SSE.",
+    "Temps visible client jusqu'au premier delta SSE significatif.",
     (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0),
 )
 MODEL_LOAD_SECONDS = BoundedHistogram(
