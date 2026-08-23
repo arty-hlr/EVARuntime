@@ -71,11 +71,50 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 
 ### Source de vérité
 
-Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité unique pour tous les modèles
-disponibles sur la gateway. Il est lu au démarrage et peut être modifié en
-direct via l'API admin (écriture atomique : temp + rename). Il vit sous
+Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité
+**persistante** pour tous les modèles disponibles sur la gateway. Il est lu au
+démarrage et peut être modifié en direct via l'API admin. Il vit sous
 `/var/lib`, writable par `llmservice`, tandis que secrets et topologie restent
 sous `/etc/llm-gateway`, non writable par le service.
+
+**Une mutation admin ne resérialise pas le fichier** (COR-020). Elle le
+**retouche textuellement** : ajout en fin de document, retouche des seules lignes
+de champ qui changent, retrait du seul bloc d'une entrée supprimée. Le texte
+candidat est reparsé et comparé au document attendu ; s'il ne signifie pas
+exactement ce qui était prévu, l'écriture est **refusée** plutôt que remplacée
+par une réécriture globale — celle-ci détruirait les commentaires
+d'exploitation du fichier, qui sont de la documentation. C'est la politique
+d'AUT-007 (`bootstrap/registry_writer.py`), réutilisée par `model_registry.py`
+pour qu'il n'existe qu'**une** politique d'écriture de `models.yaml`.
+
+La **localisation** d'une entrée dans ce texte suit la même règle depuis COR-028 :
+elle vit dans `model_registry._entry_bounds`, et `registry_writer` s'y adosse au
+lieu d'entretenir un second localisateur. Le premier ancrait sur une ligne
+`- id: <model_id>`, donc sur les seules entrées dont `id` est la première clé ;
+`yaml.safe_dump` trie les clés et met `capabilities` en tête, si bien que sur
+tout hôte dont le `models.yaml` était déjà passé par une mutation admin, l'étape
+`enable_model` de l'amorçage refusait un fichier pourtant valide. Le refus reste
+la bonne issue quand l'entrée est réellement introuvable ou ambiguë : le
+localisateur voit plus large, il ne refuse pas moins.
+
+S'y ajoutent une sauvegarde horodatée et bornée
+(`models.yaml.pre-admin.<stamp>.bak`, 5 conservées, motif distinct des
+`*.pre-bootstrap.*` du bootstrap), une écriture atomique validée par le chargeur
+du registre lui-même, le `fsync` du fichier **et** du répertoire parent — sans
+lequel le renommage n'est pas durable —, et la restauration du mode, du
+propriétaire et du groupe après `os.replace`. Un refus restaure l'état mémoire :
+la gateway ne reste jamais en avance sur son disque. Un verrou optimiste compare
+en outre le document relu au snapshot qui précédait la mutation : toute édition
+sémantique concurrente, scalaire comprise, provoque un refus explicite plutôt
+qu'un écrasement ; une retouche de commentaire seule reste permise et préservée.
+Ce garde ne remplace pas un verrou inter-processus entre deux gateways écrivant
+le même fichier. Détails opérationnels et liste des refus : `docs/admin.md`.
+
+La seule superposition à cette vérité est l'activation provisoire de
+`bootstrap-apply` : un snapshot validé peut être publié **en mémoire** dans le
+worker unique, sous un bail borné, pendant la recette du premier token. Le YAML
+reste désactivé jusqu'à la confirmation ; un redémarrage ou l'expiration du bail
+revient donc à l'état persistant sûr.
 
 ```yaml
 models:
@@ -142,8 +181,331 @@ binaire `llama-server` de chaque node doit supporter `--spec-type` (vérifier av
 3. `path` doit être absolu (`path.is_absolute()`) et pointer vers un `.gguf`
 4. `mmproj_path`, si présent, subit les mêmes validations que `path`
 5. Si `ALLOWED_MODEL_DIRS` est configuré : `path` et `mmproj_path` doivent être sous un répertoire autorisé
-6. `vram_gb > 0` et `ubatch_size ≤ batch_size`
-7. Warning si `vision` ∈ capabilities mais `mmproj_path` absent (HTTP 500 garanti sinon)
+6. `enabled`, s'il est présent, doit être un vrai booléen YAML (`true` ou
+   `false`) ; les chaînes telles que `"false"` sont refusées au lieu d'être
+   coercées en vrai
+7. `vram_gb > 0` et `ubatch_size ≤ batch_size`
+8. Warning si `vision` ∈ capabilities mais `mmproj_path` absent (HTTP 500 garanti sinon)
+
+---
+
+## Planificateur d'amorçage (`bootstrap`)
+
+Le registre décrit ce que **cette** installation sert. Le paquet
+`gateway/bootstrap/` répond à la question d'avant : sur un hôte encore nu, que
+faudrait-il installer pour atteindre le premier token, et pourquoi ? Il produit
+un **plan** — un document — et n'applique rien.
+
+### Trois étapes, et pourquoi elles sont séparées
+
+| Couche | Artefact | Privilèges | Écrit sur l'hôte |
+|---|---|---|---|
+| Installation du socle | `gateway/deploy/install.sh` | `root` | oui — utilisateur système, venv, systemd, nginx, secrets |
+| Planification | `python cli.py bootstrap-plan` | aucun | **non** |
+| Application relue | `python cli.py bootstrap-apply … --apply` | selon les chemins du plan | oui — runtime, modèles, registre et preuves |
+
+`install.sh` reste la voie supportée pour poser le **service** : utilisateur,
+venv, systemd, nginx et secrets. Il ne remplace ni `env` ni `models.yaml` (cf.
+[guide de déploiement](deployment.md#4-installation-du-gateway)). Une
+installation locale neuve pointe déjà `LLAMA_SERVER_BIN` sur le lien canonique
+`/opt/llama.cpp/current/llama-server`, mais tolère que ce lien n'existe pas
+encore : `/health` et l'administration restent disponibles, tandis que `/ready`
+reste rouge. Le registre livré ne contient aucun modèle actif dont le GGUF est
+absent. Une fois cette gateway mono-worker joignable sur loopback,
+`bootstrap-apply` exécute le plan relu pour poser le runtime et les modèles puis
+prouver le premier token.
+Le caractère mono-worker est un invariant du protocole : le snapshot
+provisoire, son verrou et son bail vivent dans la mémoire du processus. L'unité
+systemd officielle respecte cet invariant (`--workers 1`) ; un lancement manuel
+avec plusieurs workers n'est pas supporté.
+
+`bootstrap-plan` est la couche non privilégiée. Elle inventorie, calcule, explique
+— et s'arrête là. Aucun téléchargement, aucune compilation, aucune écriture de
+registre, aucun `systemctl`. Le seul sous-processus que la chaîne puisse lancer
+est `llama-server --version`, et seulement si l'opérateur fournit `--llama-bin`.
+
+La séparation existe parce que ces trois étapes n'ont ni le même risque ni le
+même public. Un plan se lit, se discute, se colle dans un ticket et se rejoue à
+l'identique sans conséquence ; l'installation du socle et l'application relue
+modifient l'hôte, mais pas les mêmes artefacts. Les confondre reviendrait à
+demander `root` pour obtenir un avis, et à faire d'une lecture de diagnostic une
+modification du système.
+
+L'application de production reçoit explicitement l'`EnvironmentFile` systemd.
+Elle refuse un registre différent de `MODELS_CONFIG_PATH`, un binaire publié
+différent de `LLAMA_SERVER_BIN` et un plancher de sécurité nul. Après — et
+seulement après — un parcours runtime entièrement réussi, elle remplace
+atomiquement `LLAMA_SERVER_BIN` et `LLAMA_SERVER_MIN_BUILD` dans ce fichier sans
+réécrire les secrets ni les autres réglages. Le service redémarré charge donc
+exactement le runtime dont l'installation vient d'être prouvée.
+
+### Pipeline
+
+```text
+inventaire matériel  (bootstrap/inventory.py, AUT-002)
+      ↓
+résolution runtime   (bootstrap/runtime_resolver.py, AUT-003)
+      ↓
+recommandation       (bootstrap/llmfit.py, AUT-004 — optionnelle)
+      ↓
+catalogue approuvé   (bootstrap/catalog.py + catalog.yaml, AUT-005)
+      ↓
+sélection + budget   (bootstrap/planner.py, AUT-001)
+      ↓
+séquence d'étapes    → schema.BootstrapPlan (bootstrap/schema.py)
+```
+
+Les producteurs ne se connaissent pas : ils se projettent vers `schema`, jamais
+l'inverse. C'est ce qui permet à l'un d'échouer sans entraîner les autres — un
+`nvidia-smi` cassé dégrade la section `hardware` sans empêcher le catalogue
+d'être lu, ni le plan d'exister pour dire où est le trou. `planner.py` est le
+seul module qui importe tous les autres, et le seul à connaître l'ordre global.
+
+Un GGUF déjà présent dans le volume des modèles est inspecté par
+`bootstrap/gguf_meta.py` (AUT-013) : lecture bornée de l'en-tête, sans
+matérialiser les tenseurs ni le vocabulaire, pour affiner l'estimation à partir
+du fichier réel plutôt que de la valeur déclarée.
+
+### Contrat du plan
+
+`schema.BootstrapPlan` tient quatre promesses, chacune vérifiable dans le module :
+
+| Promesse | Mécanisme |
+|---|---|
+| versionné | `schema_version` (entier stable), comme le `SCHEMA_VERSION` de `doctor` |
+| validé | `validate_plan_dict()` — un plan mal formé n'est jamais « appliqué au mieux » |
+| sans secret | `find_secret_leaks()` sur le document rendu, noms de champs **et** valeurs |
+| lisible | `render_human()` produit la même information que le JSON, en français |
+
+Chaque section porte un statut (`ok`, `warn`, `fail`, `skip`) et des constats.
+Un constat de niveau `fail` bloque **quel que soit le statut de sa section** :
+la première écriture ne collectait les bloqueurs que dans les sections déjà en
+`fail`, et un producteur émettant un `fail` dans une section `warn` aurait vu son
+bloqueur disparaître en silence.
+
+### Non-divulgation
+
+Le plan est conçu pour être copié dans un ticket. `render_json()` comme
+`render_human()` passent par `assert_no_secrets()` : si le document contient une
+valeur ressemblant à un secret, **rien n'est rendu** — la commande échoue.
+
+Deux filets indépendants, parce qu'aucun ne suffit seul :
+
+- **par nom de champ** — `token`, `secret`, `api_key`, `password`… Un tel champ
+  n'a le droit de porter qu'un booléen ou `null` ; un booléen de présence
+  (`"token_present": true`) est la façon recommandée de signaler un secret sans
+  le dire ;
+- **par forme de valeur** — un `hf_…`, un `sk-…`, une clé `llmgw-…`, un en-tête
+  `Bearer`, un bloc PEM ou une URL `user:password@` rangés sous un nom anodin.
+
+Le message de refus cite le **chemin** et le motif, jamais la valeur : un rapport
+de fuite qui recopie le secret est lui-même une fuite.
+
+### Téléchargements sortants
+
+Les artefacts runtime et modèles partagent `bootstrap/public_https.py`. Cette
+frontière refuse tout schéma autre que HTTPS, les identifiants dans l'URL, les
+noms locaux et les adresses littérales non publiques. Pour chaque requête et
+chaque redirection, le hostname est résolu une seule fois ; une réponse vide,
+invalide, privée ou mixte est refusée en bloc. La connexion TCP utilise ensuite
+exactement les adresses validées, tandis que le certificat et SNI restent liés
+au hostname initial. Il n'existe donc pas de seconde résolution exploitable par
+DNS rebinding, et `http.client` n'hérite pas des proxies d'environnement.
+
+Ce contrôle ne remplace pas la preuve supply-chain : l'archive runtime et chaque
+fichier du catalogue sont toujours confrontés à leur SHA-256 avant promotion.
+Inversement, le SHA ne suffirait pas à fermer un SSRF, car une requête vers le
+réseau privé a déjà produit son effet même si son corps est ensuite rejeté.
+
+### Ordre des étapes
+
+```text
+accept_license → download_model → verify_artifact → write_registry (désactivé)
+  → calibrate_model → enable_model (provisoire) → smoke_test → warmup_model
+```
+
+Trois inversions seraient des défauts, pas des goûts :
+
+- **vérifier après avoir posé l'artefact** ne protège de rien — le contrôle
+  SHA-256 précède la mise en service, jamais l'inverse ;
+- **activer avant d'avoir calibré** publie une capacité supposée : `write_registry`
+  écrit délibérément `enabled: false`, et `enable_model` est la seule étape qui
+  rend le modèle servable — provisoirement dans la mémoire de la gateway, pas
+  encore dans le fichier ;
+- **séparer l'activation provisoire de sa recette** rend le plan non compensable :
+  le pré-vol exige le triplet adjacent `calibrate_model → enable_model → smoke_test`
+  pour le même modèle ;
+- **préchauffer avant la recette** conserverait en mémoire un modèle dont aucun
+  token n'a encore été prouvé.
+
+`verify_artifact` est une action à **deux domaines**, et un seul l'emploie. Pour
+les GGUF du catalogue, elle suit `download_model` et relit réellement les octets.
+Pour l'archive de `llama-server`, elle **n'existe pas** : le plan ne l'émet pas
+(COR-030). La raison est qu'à ce numéro d'étape l'archive n'est pas encore
+téléchargée — c'est `install_runtime` qui la récupère puis confronte son empreinte
+avant d'extraire quoi que ce soit. Une étape qui ne peut rien vérifier était
+sautée par l'applicateur, et une étape sautée ne prouve rien : la condition n°1 du
+jalon M2 retombait `unsatisfied` sur une installation pourtant réussie, et
+`bootstrap-apply` sortait en code 3. L'empreinte attendue est donc inscrite dans le
+détail de l'étape `install_runtime`, qui est celle qui la contrôle.
+
+`smoke_test` est exécutée **pour chaque modèle**, immédiatement après son
+activation provisoire. Elle traverse le chemin public réel (nginx → gateway →
+`llama-server`) et ferme la transition DEC-010 : succès, la preuve complète
+persiste `enabled: true` ; échec, preuve illisible, exception ou annulation,
+l'applicateur ferme l'admission live puis décharge sans forcer les requêtes déjà
+actives. Pendant toute cette fenêtre, le fichier reste `enabled: false` : un
+redémarrage revient donc à l'état sûr. L'état live porte en plus un bail borné :
+si l'applicateur est tué sans pouvoir compenser, la gateway expire elle-même
+l'activation provisoire, ferme l'admission et tente le déchargement. Une entrée qui
+était déjà active avant l'exécution n'est jamais qualifiée de provisoire et ne
+peut donc pas être désactivée par cette compensation. La recette reprend le
+parcours du premier token déjà outillé par
+[`smoke_test.sh`](deployment.md#recette-du-premier-token-smoke_testsh) : TTFT
+mesuré, rapport sans secret.
+
+Le bail n'est pas `MODEL_LOAD_TIMEOUT + constante` : il additionne le pire
+chemin séquentiel autorisé par les timeouts de readiness, d'identité, de load,
+de stream, de log d'usage, de nettoyage et de confirmation, puis une marge. Une
+configuration qui demanderait plus que le maximum contractuel de 3600 s est
+refusée ; elle n'est jamais tronquée silencieusement.
+
+Le raccord passe par `POST /admin/models/{id}/bootstrap-sync`, uniquement sur
+l'origin admin loopback et sous `ADMIN_SECRET`. Les trois transitions
+`activate`, `confirm` et `rollback` portent l'empreinte SHA-256 exacte du YAML ;
+`activate` porte aussi la VRAM calibrée et la durée du bail. Une mutation
+concurrente du fichier, d'un autre modèle ou de l'état mémoire est refusée. Les
+mutations admin ordinaires du registre sont également refusées tant que la
+transition est ouverte. Les mutations disque déportées par `asyncio.to_thread`
+sont attendues jusqu'à leur terminaison même sous annulation : la compensation
+ne peut donc pas être doublée par un thread qui republierait `enabled: true`
+après le rollback.
+
+### Estimé contre mesuré
+
+Les ressources du catalogue et l'estimation tirée de l'en-tête GGUF sont des
+**estimations conservatrices**, jamais des mesures. La hiérarchie est explicite :
+
+```text
+en-tête GGUF + paramètres  →  ESTIMATION conservatrice
+                           →  chargement réel (étape calibrate_model)
+                           →  mesure des pics
+                           →  valeur de capacité approuvée
+```
+
+Aucune valeur estimée ne doit être recopiée telle quelle dans le `vram_gb` du
+registre. `calibrate_model` est l'étape qui remplace l'estimation par des pics
+observés et **propose** un `vram_gb` sans l'appliquer silencieusement ; tant
+qu'elle n'a pas eu lieu, l'entrée reste `enabled: false`.
+
+Les « paramètres » de cette chaîne sont ceux du modèle inspecté, et de lui seul :
+`ctx_size`, `parallel` et les types de cache KV viennent des `runtime.defaults` de
+**son** entrée de catalogue (COR-027). Le poste dominant de l'estimation est le
+cache KV, proportionnel au produit `ctx_size × parallel` : appliquer à un modèle
+les réglages d'un autre — ce que faisait le planificateur au-delà du premier
+modèle retenu — produit un chiffre faux de plusieurs ordres de grandeur, et faux
+dans le sens de la sous-estimation quand le premier modèle est le plus modeste.
+
+### LLMfit : conseiller, jamais autorité
+
+La règle d'activation, littéralement :
+
+```text
+recommandation LLMfit                        ← simple ordonnancement
+  + modèle approuvé par le catalogue         ← filtre dur
+  + estimation conservatrice                 ← filtre dur
+  + chargement réel de calibration           ← étape du plan, pas une évaluation
+  = modèle activable
+```
+
+Absent, LLMfit fait sortir la section `recommendation` en `skip` et le plan reste
+valide : c'est le cas par défaut sur une machine nue comme en CI. Présent, il ne
+peut qu'**ordonner** des candidats déjà approuvés par le catalogue et déjà
+retenus par le budget de l'hôte. Il ne peut ni ajouter un modèle absent du
+catalogue, ni ressusciter une entrée non épinglée, ni relever un budget.
+
+La subordination est structurelle et pas seulement déclarative :
+
+- `llmfit.py` ne construit ni n'importe `schema.PlanStep` et ne nomme aucune
+  constante `ACTION_*` : il lui est impossible d'émettre `enable_model` ;
+- les identifiants qui en sortent sont publiés sous la clé `candidate`, jamais
+  `model` ou `model_id` : rien de ce qu'il écrit n'a la forme d'une entrée de
+  registre ;
+- chaque entrée porte `catalog_approved: null` — « non statué ici » ;
+- le rapprochement avec le catalogue exige une correspondance exacte
+  (identifiant d'entrée ou `repo_id`) : un rapprochement flou ferait entrer par
+  la petite porte le pouvoir refusé par la grande.
+
+Deux asymétries volontaires dans les statuts émis. **Absence n'est pas échec** :
+un conseiller optionnel manquant ne doit jamais empêcher un plan d'exister. Mais
+**ce que l'opérateur a déclaré doit tenir** : une empreinte épinglée qui ne
+correspond plus, ou un profil manuel désigné et illisible, sont des `fail` — non
+parce que le conseil manque, mais parce que la machine n'est pas dans l'état
+déclaré.
+
+### Limites connues, écrites noir sur blanc
+
+Trois zones où le code est en avance sur la preuve. Elles sont énoncées ici
+plutôt que découvertes en production :
+
+- **Les fixtures de test LLMfit sont synthétiques.** Le dépôt amont ne publie ni
+  les noms de champs ni un exemple de sortie de `recommend --json` ; la forme
+  validée par l'adaptateur est dérivée de la spécification. Tous les fichiers de
+  `gateway/tests/fixtures/llmfit/` sont préfixés `synthetic-`, et un test échoue
+  si ce préfixe disparaît. À remplacer par de vraies captures avant de s'appuyer
+  sur LLMfit en production.
+- **La matrice d'artefacts `llama-server` mélange constats et hypothèses.**
+  Chaque variante de `DEFAULT_VARIANTS` porte un champ `evidence` :
+  `constat-§6` pour ce que la spécification affirme, `hypothèse-à-confirmer` pour
+  ce qui est plausible mais non vérifié (le résolveur n'a pas d'accès réseau et
+  ne consulte aucune page de release). Sont des **constats** : les images GHCR
+  officielles `server-cuda` et `server-cuda13` sur `linux-x86_64`, les builds
+  locaux CUDA 12/13 sur `linux-x86_64`, et le build local CPU `linux-x86_64`
+  (réellement exercé lors du déploiement du 2026-07-30). Tout le reste — archives
+  natives de release, image CPU GHCR, builds ROCm, Vulkan, arm64 et Metal — est
+  une hypothèse. Une variante retenue sur hypothèse déclenche un `warn` : le plan
+  ne présente jamais une supposition comme un fait.
+- **Aucun test n'a été exécuté contre un GPU réel.** Les chemins GPU sont
+  couverts par des sondes injectées ; la VRAM reste déclarative tant qu'une
+  calibration n'a pas eu lieu sur la machine cible.
+
+Par ailleurs, `DEFAULT_VARIANTS` ne porte **aucun digest** : rien n'est épinglé
+dans ce dépôt à ce jour, et inventer une empreinte serait pire que de ne pas en
+avoir. Avec la politique par défaut, seules les variantes `local-build` sont donc
+éligibles ; les autres apparaissent dans les motifs de rejet avec la mention
+« non épinglé », qui est l'information utile.
+
+Ses `reference` d'archive ne valent pas davantage : elles désignent la **page de
+releases** du projet, pas un artefact. Même munie d'une empreinte, la matrice
+livrée ne donnerait à `runtime_installer` aucune URL téléchargeable. L'opérateur
+fournit donc la sienne — `bootstrap-plan --runtime-variants`, chargée par
+`gateway/bootstrap/runtime_variants.py`, modèle dans
+`gateway/deploy/runtime-variants.yaml.example`. Trois propriétés structurent ce
+chargeur :
+
+- il **remplace** la matrice livrée au lieu de s'y ajouter. En union, une faute
+  de frappe dans `platform` rendrait l'entrée épinglée invisible et un
+  `local-build` livré l'emporterait en silence : l'opérateur lirait un plan
+  réussi qui ignore son épinglage ;
+- il est **fail-closed** : un fichier malformé refuse en bloc et ne se replie
+  jamais sur `DEFAULT_VARIANTS` ni sur ses seules entrées valides ;
+- il impose le niveau de preuve `constat-opérateur` — troisième valeur d'`evidence`.
+  Un fichier ne peut pas se réclamer de `constat-§6` : §6 ne connaît aucune
+  empreinte, et lui laisser l'autorité de la spécification annulerait la
+  distinction constat/hypothèse dont vit le rapport d'installation. Le plan porte
+  un constat `info` nommant l'origine des variantes employées.
+
+La politique d'URL vit dans ce chargeur et non dans le résolveur : elle réutilise
+`bootstrap/public_https.py`, donc `socket` et `http.client`, que le garde-fou
+d'isolation de `runtime_resolver` interdit précisément d'y faire entrer. Elle
+ajoute à la politique publique HTTPS trois contraintes — le chemin doit désigner
+une archive extractible, sans chaîne de requête ni fragment — et
+`production.runtime_installer_from_plan` l'applique désormais aussi, pour refuser
+une URL inexploitable **avant** le téléchargement plutôt qu'après, au contrôle
+d'empreinte.
+
+Usage opérationnel de la commande : [guide administrateur](admin.md#9-planificateur-damorçage--bootstrap-plan).
+Catalogue de modèles approuvés : [guide de déploiement](deployment.md#catalogue-de-modèles-approuvés-amorçage).
 
 ---
 
@@ -470,8 +832,72 @@ et overflows de parsing GGUF menant au RCE. Trois garde-fous :
 | Mesure | Mise en œuvre |
 |--------|---------------|
 | `--context-shift` désactivé | `build_llama_cmd` n'émet **jamais** ce flag — c'est le vecteur de la CVE `n_discard`. |
-| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; un build inférieur au minimum refuse le démarrage (0 = désactivé, non fatal si version illisible). |
+| Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; **fail-closed** dès que le plancher est `> 0` — un build inférieur **ou une version illisible** refuse le démarrage (0 = désactivé, la sonde se contente alors d'un avertissement). Même verdict que `doctor`, quel que soit le chemin de démarrage (SEC-009). |
 | Intégrité GGUF | Champ `sha256` par modèle : le hash du fichier est recalculé et comparé avant chargement. |
+| Manifeste recoupé | Un manifeste de provenance §6 posé à côté du binaire ne vaut attestation qu'après confrontation **au binaire lui-même** : version et commit rendus par `--version`, puis empreinte SHA-256 du binaire face à celle consignée dans `install.binary_sha256`. Voir ci-dessous. |
+
+#### Un manifeste non recoupé n'est pas une attestation (SEC-009)
+
+Le manifeste de provenance est un fichier texte posé à côté d'un exécutable.
+Rien n'empêche de le recopier d'un autre hôte, ni de le laisser survivre au
+remplacement manuel du binaire qu'il décrit. `bootstrap/runtime_installer` le
+savait déjà : son contrôle d'idempotence recalcule l'empreinte du binaire posé à
+chaque passe. `bootstrap/runtime_resolver._judge_existing_binary` ne le faisait
+pas et accordait `reuse_existing` sur parole.
+
+Un binaire en place n'est désormais conservé qu'après quatre confrontations,
+toutes nécessaires, du moins cher au plus cher :
+
+| Constat | Ce qui est confronté | Verdict |
+|---|---|---|
+| `runtime_manifest_build_mismatch` | `version:` du manifeste ↔ build rendu par `--version` | remplacé |
+| `runtime_manifest_commit_mismatch` | `commit:` du manifeste ↔ SHA court rendu par `--version` (comparaison par préfixe, le binaire n'en rend que 7 caractères) | remplacé |
+| `runtime_backend_mismatch` | backend déclaré ↔ candidats de l'hôte | remplacé |
+| `runtime_binary_unattested` | aucun `install.binary_sha256` dans le manifeste | remplacé |
+| `runtime_binary_unreadable` | empreinte du binaire incalculable | remplacé |
+| `runtime_binary_tampered` | empreinte observée ↔ empreinte consignée | remplacé |
+
+Le refus est toujours **nommé** : la réinstallation depuis la variante épinglée
+est le remède, jamais un repli silencieux. Le binaire n'est lu — donc haché — que
+si un manifeste est fourni : sans attestation à confronter, lire des centaines de
+Mo ne prouverait rien.
+
+Quand `--version` ne rend pas de commit, ce recoupement-là est simplement omis :
+on ne peut pas le faire, on ne l'invente pas. Les autres restent.
+
+##### D'où vient le manifeste confronté (SEC-017)
+
+Ces six confrontations n'ont de valeur que si un manifeste leur est réellement
+fourni. Elles ne l'étaient pas : `planner._resolve_runtime` ne passait au
+résolveur que le chemin du binaire, jamais son manifeste, et le recoupement
+n'avait donc lieu que dans les tests. Le planificateur relit désormais le
+`provenance.yaml` que `runtime_installer` pose **à côté du binaire**, et en tire
+trois issues dégradées, chacune portant son constat dans le plan :
+
+| Constat | Cause | Conséquence |
+|---|---|---|
+| `runtime_manifest_absent` (`info`) | aucun fichier au chemin attendu — cas nominal d'un binaire compilé à la main | pas d'attestation ; le constat dit **où** le manifeste était attendu |
+| `runtime_manifest_unreadable` (`warn`) | droits insuffisants, fichier tronqué, YAML invalide | pas d'attestation |
+| `runtime_manifest_invalid` (`warn`) | relu, mais refusé par les règles de §6 | pas d'attestation |
+
+Fail-closed dans les trois cas : **l'absence de manifeste ne vaut jamais
+attestation**. Un manifeste approximatif vaut d'ailleurs moins que pas de
+manifeste, précisément parce qu'on lui fait confiance.
+
+#### Aucun invariant de production porté par un `assert` (COR-021)
+
+`python -O` retire toutes les instructions `assert` du bytecode, et rien
+n'interdit `-O` dans une unité systemd (`ExecStart=… python -O …`, ou
+`PYTHONOPTIMIZE=1` dans l'`EnvironmentFile`). Un garde-fou écrit
+`assert x is not None` disparaît alors en silence, et le refus explicite se
+transforme en `AttributeError` opaque quelques lignes plus loin.
+
+Le code de production des deux composants n'en contient donc aucun : un invariant
+dont la violation doit produire une erreur lève une exception nommée
+(`ProvenanceError`, `LLMfitError`) ou retourne un refus explicite. Un test balaie
+l'AST de tous les modules de `gateway/` et `node_agent/` — tests exclus — et
+échoue à la première occurrence. Il porte deux contrôles positifs : le scanner
+sait voir un `assert` imbriqué, et son périmètre couvre bien les deux composants.
 
 ### Isolation réseau
 
@@ -530,6 +956,199 @@ Le champ `model` dans `usage_log` stocke l'ID du modèle tel que résolu
 par le routing (ex : `"llama-3.3-70b-instruct"`), permettant les rapports
 d'usage par modèle.
 
+### Migrations versionnées
+
+Un `CREATE TABLE IF NOT EXISTS` n'atteint **jamais** une base déjà créée : sans
+mécanisme de migration, une base déployée conserve indéfiniment son schéma
+d'origine et aucun changement de contrainte ne l'atteint. `gateway/database.py`
+embarque donc un moteur de migration versionné.
+
+#### Versionnement
+
+La version du schéma est portée par `PRAGMA user_version`, un entier stocké
+dans l'en-tête du fichier SQLite :
+
+| `user_version` | Signification |
+|---|---|
+| `0` | base neuve, ou base déployée avant l'introduction du mécanisme |
+| `N` | les migrations `1..N` ont été appliquées |
+
+Le code déclare sa version cible dans `SCHEMA_VERSION`, dérivée de la dernière
+entrée du tuple `MIGRATIONS`. `init_db()` amène la base à cette version puis
+n'a plus aucun effet : il est idempotent et peut être appelé à chaque démarrage
+comme à chaque commande CLI.
+
+#### Structure d'une migration
+
+```python
+@dataclass(frozen=True)
+class Migration:
+    version: int                  # user_version atteint après application
+    description: str              # journalisée ; jamais de donnée personnelle
+    statements: tuple[str, ...]   # SQL exécuté instruction par instruction
+    apply: Callable | None        # hook Python, même transaction
+    check_foreign_keys: bool      # PRAGMA foreign_key_check avant COMMIT
+```
+
+Règles :
+
+- **Ajouter** une entrée en fin de tuple `MIGRATIONS`, avec `version` égale à la
+  précédente + 1. Ne **jamais** réécrire une entrée déjà livrée : une base en
+  production l'a déjà appliquée et ne la rejouera pas.
+- `statements` est un tuple d'instructions, pas un script. `executescript()` de
+  `sqlite3` valide implicitement la transaction en cours : l'utiliser
+  romprait l'atomicité de la migration.
+- `apply` est nécessaire dès que la migration doit inspecter l'état réel de la
+  base (plutôt que de le supposer) ou recréer une table.
+- `check_foreign_keys=True` sur toute migration qui recrée une table. Il est à
+  `False` par défaut car une base historique peut porter des violations
+  préexistantes, sans lien avec la migration : le démarrage du service ne doit
+  pas en dépendre.
+
+#### Transactionnalité et clés étrangères
+
+Chaque migration s'exécute dans un `BEGIN IMMEDIATE` qui englobe son SQL, son
+hook Python **et** l'écriture de `user_version` : `user_version` n'avance
+qu'avec la migration, et un échec annule tout. Les migrations déjà validées ne
+sont pas perdues — la base s'arrête simplement à la dernière version appliquée.
+
+`PRAGMA foreign_keys` est **silencieusement ignoré à l'intérieur d'une
+transaction**. Le moteur le positionne donc à `OFF` **avant** d'ouvrir la
+première transaction, pour toute la série de migrations, et le restaure à `ON`
+dans un `finally`. C'est une nécessité du motif de recréation de table : le
+`DROP TABLE` de l'ancienne table casserait sinon les références. Les connexions
+applicatives (`get_db()`) rétablissent `foreign_keys = ON` à chaque ouverture.
+
+`user_version` est relue **sous le verrou d'écriture**, après le
+`BEGIN IMMEDIATE` : si un autre processus (service et CLI démarrés en parallèle)
+a appliqué la migration entre-temps, elle est ignorée au lieu d'être rejouée.
+Une migration de recréation de table n'est donc jamais exécutée deux fois.
+
+#### Recréer une table pour changer une contrainte
+
+SQLite ne sait pas modifier une clé étrangère par `ALTER TABLE`. Le seul motif
+possible est *create new → copy → drop old → rename*, encapsulé par le helper
+`_rebuild_table()`. Exemple complet — passer `usage_log.user_id` en
+`ON DELETE CASCADE` :
+
+```python
+async def _migration_usage_log_cascade(db: aiosqlite.Connection) -> None:
+    """Recrée usage_log pour supprimer les lignes d'un utilisateur supprimé."""
+    await _rebuild_table(
+        db,
+        table="usage_log",
+        create_new_sql="""
+            CREATE TABLE usage_log__new (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id             INTEGER NOT NULL
+                                    REFERENCES users(id) ON DELETE CASCADE,
+                api_key_id          INTEGER
+                                    REFERENCES api_keys(id) ON DELETE SET NULL,
+                timestamp           TEXT    NOT NULL DEFAULT (datetime('now')),
+                model               TEXT    NOT NULL,
+                prompt_tokens       INTEGER NOT NULL DEFAULT 0,
+                completion_tokens   INTEGER NOT NULL DEFAULT 0,
+                total_tokens        INTEGER NOT NULL DEFAULT 0,
+                duration_ms         INTEGER,
+                status_code         INTEGER,
+                request_id          TEXT
+            )
+        """,
+        copy_columns=(
+            "id", "user_id", "api_key_id", "timestamp", "model",
+            "prompt_tokens", "completion_tokens", "total_tokens",
+            "duration_ms", "status_code", "request_id",
+        ),
+        index_statements=(
+            "CREATE INDEX idx_usage_user_time ON usage_log(user_id, timestamp)",
+            "CREATE INDEX idx_usage_timestamp ON usage_log(timestamp)",
+        ),
+    )
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    # … migrations existantes, inchangées …
+    Migration(
+        version=2,
+        description="usage_log.user_id en ON DELETE CASCADE",
+        apply=_migration_usage_log_cascade,
+        check_foreign_keys=True,
+    ),
+)
+```
+
+Points d'attention pour ce motif :
+
+- `create_new_sql` doit créer la table sous le nom `<table>__new`.
+- Les index de l'ancienne table disparaissent avec le `DROP` :
+  `index_statements` doit les redéclarer (mêmes noms, la table étant supprimée).
+- `copy_columns` liste explicitement les colonnes copiées ; c'est aussi le point
+  d'entrée pour transformer une valeur (`SELECT` implicite colonne par colonne).
+- Si des lignes orphelines préexistent, `check_foreign_keys=True` fera échouer
+  la migration : nettoyer les orphelins dans la même migration, avant l'appel.
+
+#### Sauvegarde préalable
+
+Avant la **première migration réellement applicable**, le moteur produit une
+sauvegarde. Aucune copie n'est faite si la base est déjà à jour, ni si elle est
+neuve (rien à protéger).
+
+- Chemin : `<db_path>.pre-migration.v<version_origine>.<horodatage UTC>.bak`,
+  par exemple `gateway.db.pre-migration.v0.20260730T101500Z.bak`.
+- Méthode : API de sauvegarde SQLite (`Connection.backup()`), pas une copie de
+  fichier — en mode WAL, le fichier principal seul est incomplet.
+- Permissions : fichier créé en `0600` avant toute écriture, puis restreint à
+  l'intersection avec le mode de la base. Une sauvegarde n'est jamais plus
+  largement accessible que la base elle-même.
+- `O_EXCL` : une sauvegarde existante n'est jamais écrasée.
+
+Ces sauvegardes ne sont pas purgées automatiquement : elles font partie de
+l'état à surveiller côté disque, et ne sont produites qu'à chaque changement de
+version de schéma.
+
+#### Comportement en cas d'échec — fail-closed
+
+Toute erreur remonte sous forme de `MigrationError` depuis `init_db()`, donc
+depuis le lifespan FastAPI : **le service ne démarre pas** sur une base à moitié
+migrée. Deux cas explicites :
+
+| Situation | Comportement |
+|---|---|
+| Migration qui échoue | `ROLLBACK`, `user_version` inchangée, `MigrationError` |
+| `user_version` > `SCHEMA_VERSION` | refus immédiat, aucune écriture, message désignant le rollback applicatif |
+
+Le second cas correspond à un retour arrière de version du code sur une base
+déjà migrée. Il produit une erreur claire plutôt qu'une corruption silencieuse.
+
+Les journaux tracent la version d'origine, la version cible, la description de
+chaque migration et le chemin de la sauvegarde — jamais de donnée personnelle ni
+de secret.
+
+#### Procédure opérateur
+
+Migration normale (déploiement) :
+
+1. Arrêter le service (`systemctl stop llm-gateway`) — la migration s'exécute au
+   démarrage et ne doit pas concurrencer un service actif.
+2. Déployer le nouveau code, puis démarrer le service.
+3. Vérifier le journal : `journalctl -u llm-gateway | grep "Migration SQLite"`.
+4. Contrôler la version atteinte :
+   `sqlite3 /var/lib/llm-gateway/gateway.db "PRAGMA user_version;"`.
+
+En cas d'échec de migration :
+
+1. Le service ne démarre pas ; lire la `MigrationError` dans le journal.
+2. La base est restée dans son état d'avant la migration fautive — elle est
+   exploitable par la version précédente du code si celle-ci acceptait cette
+   `user_version`.
+3. Sinon, restaurer la sauvegarde produite juste avant :
+   ```bash
+   systemctl stop llm-gateway
+   cp gateway.db.pre-migration.v0.20260730T101500Z.bak gateway.db
+   rm -f gateway.db-wal gateway.db-shm
+   ```
+4. Redéployer la version de code correspondant au schéma restauré.
+
 ---
 
 ## Rate limiting in-memory
@@ -567,7 +1186,7 @@ Client             nginx               FastAPI             llama-server
 proxy_buffering        off;
 add_header X-Accel-Buffering no always;
 chunked_transfer_encoding on;
-proxy_read_timeout     600s;
+proxy_read_timeout     900s;   # dérivé du load_timeout_seconds max du registre
 ```
 
 ---
@@ -721,12 +1340,25 @@ samples.sort()
 p95 = samples[int(0.95 * len(samples))]
 ```
 
+Le chemin chaud ajoute aussi trois histogrammes en mémoire exposés par
+`/admin/metrics/prometheus` : TTFT du premier delta SSE significatif (contenu,
+raisonnement ou appel d'outil), durée de chargement du modèle et attente de
+capacité locale. Le TTFT démarre avant la lecture du body et inclut donc
+l'attente VRAM ainsi que le chargement à la demande ; un chunk de rôle ou
+d'usage sans delta significatif ne le clôt pas. En cluster, le chargement
+et le TTFT portent le `node_id` du placement. Les labels sont volontairement
+limités à `model`, `node` et un résultat technique, avec une borne stricte de
+512 séries par histogramme.
+
 ### Sécurité du dashboard
 
 - Pas de contenu de prompt ou de réponse
 - Pas de clé API (ni hash ni préfixe)
 - Token admin dans `sessionStorage` (jamais `localStorage`)
-- La page HTML est servie sans auth — les données JSON exigent le bearer token
+- Chart.js est vendored et servi par la gateway : le dashboard d'incident ne
+  dépend d'aucun CDN, font provider ou accès Internet.
+- Une CSP et des headers anti-framing/nosniff protègent la page. Le HTML est
+  servi sans auth — les données JSON exigent toujours le bearer token.
 
 ---
 

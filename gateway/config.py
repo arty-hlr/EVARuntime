@@ -5,6 +5,7 @@ jamais dans le code source.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +18,39 @@ def secret_is_placeholder(secret: str) -> bool:
     return not secret or secret.strip().upper().startswith("CHANGE_ME")
 
 
+def split_list_setting(value: object, name: str) -> object:
+    """
+    Normalise un réglage de liste reçu depuis l'environnement.
+
+    Accepte une valeur vide (→ liste vide), une liste CSV — la syntaxe que
+    documentent `.env.example` et `docs/deployment.md` — ou un tableau JSON.
+    Une valeur déjà structurée (liste Python, cas des tests et des appels
+    directs) traverse sans modification.
+
+    Même sémantique que `AgentSettings.allowed_model_dirs_list()` du node-agent,
+    qui a rencontré le même piège avant nous.
+    """
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    if not raw:
+        return []
+    # Un objet JSON serait sinon traité comme un unique élément CSV : l'allowlist
+    # contiendrait une entrée qui ne correspond à rien, donc un contrôle de
+    # sécurité inerte sans le moindre message. On refuse explicitement.
+    if raw.startswith("{"):
+        raise ValueError(f"{name} : attendu une liste CSV ou un tableau JSON, pas un objet")
+    if raw.startswith("["):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} : tableau JSON invalide") from exc
+        if not isinstance(decoded, list) or not all(isinstance(v, str) for v in decoded):
+            raise ValueError(f"{name} : le JSON doit être une liste de chaînes")
+        return [item.strip() for item in decoded if item.strip()]
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -27,7 +61,7 @@ class Settings(BaseSettings):
 
     # ── Chemins ────────────────────────────────────────────────────────────────
     models_config_path: Path = Path("/var/lib/llm-gateway/models.yaml")
-    llama_server_bin: Path = Path("/usr/local/bin/llama-server")
+    llama_server_bin: Path = Path("/opt/llama.cpp/current/llama-server")
     db_path: Path = Path("/var/lib/llm-gateway/gateway.db")
     log_dir: Path = Path("/var/log/llm-gateway")
 
@@ -39,8 +73,8 @@ class Settings(BaseSettings):
     # Build minimal accepté du binaire llama-server. 0 = pas d'enforcement (défaut).
     # Recommandé : fixer au premier build patché contre GHSA-8947-pfff-2f3c
     # (écriture OOB via n_discard/context-shift) et les overflows de parsing GGUF.
-    # Si > 0 et que le binaire lu est plus ancien, le démarrage est REFUSÉ ; si la
-    # version est illisible, on se contente d'un avertissement (non fatal).
+    # Si > 0 et que le binaire lu est plus ancien OU illisible, le démarrage est
+    # REFUSÉ : un plancher qu'on ne peut pas attester reste fail-closed.
     llama_server_min_build: int = 0
 
     # ── Pool de ports multi-modèles ────────────────────────────────────────────
@@ -65,7 +99,17 @@ class Settings(BaseSettings):
     # ── Répertoires autorisés pour les fichiers .gguf ─────────────────────────
     # Liste séparée par des virgules. Vide = pas de restriction (tous répertoires autorisés).
     # Exemple : ALLOWED_MODEL_DIRS=/models,/data/models
-    allowed_model_dirs: list[str] = Field(default_factory=list)
+    #
+    # L'annotation `str | list[str]` est volontaire, ce n'est pas un raccourci.
+    # pydantic-settings décode un champ *complexe* — donc `list[str]` — comme du
+    # JSON directement dans la source d'environnement, AVANT tout validateur.
+    # Une valeur CSV, et même une valeur vide, faisaient donc échouer le
+    # démarrage sur `SettingsError` : le fichier livré par `.env.example` rendait
+    # le service mort. Élargir l'annotation rend le champ non-complexe pour la
+    # source ; le validateur `mode="before"` ci-dessous produit toujours une
+    # `list[str]`. Le node-agent contourne le même piège autrement
+    # (`allowed_model_dirs: str` + accesseur), cf. `node_agent/config.py`.
+    allowed_model_dirs: str | list[str] = Field(default_factory=list)
 
     # ── Lifecycle modèle ───────────────────────────────────────────────────────
     idle_timeout_seconds: int = 300
@@ -77,7 +121,16 @@ class Settings(BaseSettings):
     # pinnés se libèrent avant de forcer le déchargement. 0 = pas d'attente.
     shutdown_drain_timeout_seconds: float = 25.0
     # Intervalle de poll pendant le drain (court pour réactivité).
+    # Utilisé aussi par le drain des opérations admin de déchargement.
     shutdown_drain_poll_seconds: float = 0.2
+    # Drain des requêtes actives sur une opération ADMIN de déchargement
+    # (POST /admin/models/{id}/unload, DELETE /admin/models/{id},
+    #  PATCH enabled:false ou llama_params, POST /admin/unload).
+    # Volontairement beaucoup plus court que le drain de shutdown : une route
+    # admin ne doit jamais bloquer longtemps. Si des requêtes sont encore actives
+    # à l'expiration, l'opération est refusée en 409 (jamais un stream tué en
+    # silence) — sauf force=true explicite. 0 = refus immédiat si occupé.
+    admin_unload_drain_timeout_seconds: float = 5.0
 
     # Réconciliation VRAM avec nvidia-smi (détection de dérive, NON FATAL).
     # 0 = désactivé. Intervalle entre deux sondes nvidia-smi.
@@ -112,6 +165,15 @@ class Settings(BaseSettings):
     httpx_max_keepalive: int = 100
     httpx_keepalive_expiry: float = 30.0
 
+    # ── Readiness structurelle (/ready) ───────────────────────────────────────
+    # Durée de mémorisation des contrôles système de /ready (existence du binaire
+    # llama-server, présence des GGUF activés, inscriptibilité de la DB…).
+    # Ces contrôles ne font que des stat/access, mais /ready est sondée souvent
+    # par systemd, nginx et update.sh : le cache borne le coût sur un stockage
+    # lent (NFS). Le cache est de toute façon invalidé dès que la configuration
+    # ou la liste des modèles activés change. 0 = pas de cache (toujours frais).
+    readiness_cache_ttl_seconds: float = 15.0
+
     # ── Sécurité ───────────────────────────────────────────────────────────────
     # Clé interne entre la gateway et llama-server (jamais exposée aux users)
     internal_api_key: str = "CHANGE_ME_INTERNAL_KEY"
@@ -126,7 +188,10 @@ class Settings(BaseSettings):
     # Origines autorisées, séparées par des virgules.
     # "*" (défaut) convient en dev ; en production, restreindre aux domaines
     # clients connus : CORS_ALLOW_ORIGINS=https://app.univ-pau.fr
-    cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"])
+    # Même contrainte d'annotation que `allowed_model_dirs` ci-dessus : sans
+    # elle, le validateur `split_cors_origins` ne s'exécutait jamais, l'échec
+    # ayant lieu dans la source d'environnement.
+    cors_allow_origins: str | list[str] = Field(default_factory=lambda: ["*"])
 
     # ── Rate limiting par défaut ───────────────────────────────────────────────
     default_rpm_limit: int = 20
@@ -199,9 +264,12 @@ class Settings(BaseSettings):
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def split_cors_origins(cls, v: object) -> object:
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(",") if origin.strip()]
-        return v
+        return split_list_setting(v, "CORS_ALLOW_ORIGINS")
+
+    @field_validator("allowed_model_dirs", mode="before")
+    @classmethod
+    def split_allowed_model_dirs(cls, v: object) -> object:
+        return split_list_setting(v, "ALLOWED_MODEL_DIRS")
 
     @field_validator("cluster_health_interval", "cluster_health_failures_to_offline")
     @classmethod
@@ -235,9 +303,11 @@ class Settings(BaseSettings):
     @field_validator(
         "shutdown_drain_timeout_seconds",
         "shutdown_drain_poll_seconds",
+        "admin_unload_drain_timeout_seconds",
         "vram_reconcile_interval_seconds",
         "vram_reconcile_probe_timeout_seconds",
         "vram_reconcile_drift_threshold",
+        "readiness_cache_ttl_seconds",
     )
     @classmethod
     def validate_robustness_non_negative(cls, v: float) -> float:

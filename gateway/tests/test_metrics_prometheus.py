@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 
 import main
 import metrics as metrics_mod
+import readiness
+import telemetry
 from config import settings
 
 
@@ -61,6 +63,9 @@ def test_prometheus_ok_content_type_and_types(client, admin_headers):
         ("eva_vram_total_gb", "gauge"),
         ("eva_vram_available_gb", "gauge"),
         ("eva_models_loaded", "gauge"),
+        ("eva_inference_ttft_seconds", "histogram"),
+        ("eva_model_load_seconds", "histogram"),
+        ("eva_capacity_queue_wait_seconds", "histogram"),
     ]:
         assert f"# TYPE {name} {mtype}" in body, f"# TYPE manquant pour {name}"
 
@@ -84,16 +89,40 @@ def test_prometheus_declared_types_appear_before_samples(client, admin_headers):
     resp = client.get("/admin/metrics/prometheus", headers=admin_headers)
     lines = resp.text.splitlines()
 
-    declared: set[str] = set()
+    declared: dict[str, str] = {}
     for line in lines:
         if line.startswith("# TYPE "):
-            declared.add(line.split()[2])
+            _, _, name, mtype = line.split()
+            declared[name] = mtype
     for line in lines:
         if not line or line.startswith("#"):
             continue
         m = _SAMPLE_RE.match(line)
         assert m is not None
-        assert m.group("name") in declared
+        name = m.group("name")
+        if name in declared:
+            continue
+        base = next(
+            (
+                name.removesuffix(suffix)
+                for suffix in ("_bucket", "_sum", "_count")
+                if name.endswith(suffix)
+            ),
+            None,
+        )
+        assert base is not None and declared.get(base) == "histogram"
+
+
+def test_prometheus_exports_runtime_histogram(client, admin_headers):
+    telemetry.TTFT_SECONDS.observe(0.2, model="m1", node="node-a")
+
+    resp = client.get("/admin/metrics/prometheus", headers=admin_headers)
+
+    assert resp.status_code == 200
+    labels = 'model="m1",node="node-a",outcome="success"'
+    assert f'eva_inference_ttft_seconds_bucket{{{labels},le="0.25"}} 1' in resp.text
+    assert f'eva_inference_ttft_seconds_bucket{{{labels},le="+Inf"}} 1' in resp.text
+    assert f"eva_inference_ttft_seconds_count{{{labels}}} 1" in resp.text
 
 
 def test_prometheus_no_crash_when_no_data(client, admin_headers):
@@ -151,6 +180,40 @@ def test_prometheus_rejects_bad_secret(client):
 
 
 # ── Readiness /ready vs liveness /health ──────────────────────────────────────
+#
+# COR-005 a rendu /ready STRICTEMENT structurelle : monkeypatcher `status()` ne
+# suffit plus, il faut aussi un environnement structurellement sain (binaire,
+# GGUF des modèles activés, DB inscriptible). Les quatre tests ci-dessous
+# encodaient l'ancien comportement permissif — ils passaient alors que ni le
+# binaire llama-server ni les GGUF n'existaient dans l'environnement de test.
+# Ils sont conservés (contrat de capacité de service, inchangé) mais adossés à
+# l'environnement sain construit par `tests.test_readiness`, où vivent les
+# régressions dédiées à la readiness structurelle.
+
+from tests.test_readiness import (  # noqa: E402
+    _FakeManager,
+    _gguf,
+    _healthy_settings,
+    _model,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_readiness_cache():
+    telemetry.reset_all()
+    readiness.clear_cache()
+    yield
+    telemetry.reset_all()
+    readiness.clear_cache()
+
+
+def _wire_sound_env(monkeypatch, tmp_path, status: dict) -> None:
+    """Environnement structurellement sain + `status()` imposé par le test."""
+    cfg = _healthy_settings(tmp_path)
+    manager = _FakeManager([_model(_gguf(tmp_path))], status)
+    monkeypatch.setattr(main, "model_manager", manager)
+    monkeypatch.setattr(main, "settings", cfg)
+
 
 def _status_no_capacity() -> dict:
     return {
@@ -178,8 +241,8 @@ def _status_all_nodes_offline() -> dict:
     }
 
 
-def test_ready_503_when_no_model_and_no_capacity(client, monkeypatch):
-    monkeypatch.setattr(main.model_manager, "status", _status_no_capacity)
+def test_ready_503_when_no_model_and_no_capacity(client, monkeypatch, tmp_path):
+    _wire_sound_env(monkeypatch, tmp_path, _status_no_capacity())
     resp = client.get("/ready")
     assert resp.status_code == 503
     body = resp.json()
@@ -187,8 +250,8 @@ def test_ready_503_when_no_model_and_no_capacity(client, monkeypatch):
     assert body["reason"] == "no_model_ready_and_no_capacity"
 
 
-def test_ready_200_when_model_ready(client, monkeypatch):
-    monkeypatch.setattr(main.model_manager, "status", _status_with_ready_model)
+def test_ready_200_when_model_ready(client, monkeypatch, tmp_path):
+    _wire_sound_env(monkeypatch, tmp_path, _status_with_ready_model())
     resp = client.get("/ready")
     assert resp.status_code == 200
     body = resp.json()
@@ -196,20 +259,27 @@ def test_ready_200_when_model_ready(client, monkeypatch):
     assert "m1" in body["models_ready"]
 
 
-def test_ready_200_when_capacity_available(client, monkeypatch):
+def test_ready_200_when_capacity_available(client, monkeypatch, tmp_path):
     """Aucun modèle ready mais de la VRAM disponible → prêt à charger."""
-    status = {
+    _wire_sound_env(monkeypatch, tmp_path, {
         "vram_budget": {"total_gb": 48.0, "used_gb": 0.0, "available_gb": 48.0},
         "models": [{"id": "m1", "state": "unloaded"}],
         "capacity_queue": {},
-    }
-    monkeypatch.setattr(main.model_manager, "status", lambda: status)
+    })
     resp = client.get("/ready")
     assert resp.status_code == 200
 
 
-def test_ready_503_when_all_cluster_nodes_offline(client, monkeypatch):
-    monkeypatch.setattr(main.model_manager, "status", _status_all_nodes_offline)
+def test_ready_503_when_all_cluster_nodes_offline(client, monkeypatch, tmp_path):
+    nodes_yaml = tmp_path / "nodes.yaml"
+    nodes_yaml.write_text("nodes: []\n", encoding="utf-8")
+    cfg = _healthy_settings(
+        tmp_path, cluster_mode="cluster", cluster_nodes_path=nodes_yaml
+    )
+    manager = _FakeManager([_model(_gguf(tmp_path))], _status_all_nodes_offline())
+    monkeypatch.setattr(main, "model_manager", manager)
+    monkeypatch.setattr(main, "settings", cfg)
+
     resp = client.get("/ready")
     assert resp.status_code == 503
     assert resp.json()["reason"] == "all_nodes_offline"

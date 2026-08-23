@@ -1,0 +1,161 @@
+# Catalogue de modèles approuvés EVARuntime — AUT-005, §8 de codex-analyse.md.
+#
+# CE FICHIER N'EST PAS LE REGISTRE OPÉRATIONNEL.
+# `gateway/models.yaml` décrit ce que CETTE installation sert, avec des chemins
+# locaux et des `vram_gb` calibrés. Ce catalogue-ci décrit ce que le bootstrap a
+# le DROIT de proposer au téléchargement : provenance, licence, intégrité. Les
+# deux ne se recouvrent jamais et n'ont pas le même cycle de vie.
+#
+# RÈGLE D'INTÉGRITÉ — la plus importante de ce fichier.
+# Une révision et un SHA-256 ne se devinent pas, ne s'approximent pas et ne se
+# recopient pas d'une autre entrée. Si vous ne pouvez pas relever la vraie
+# valeur, écrivez `null` : le chargeur marquera l'entrée `pending` et REFUSERA
+# d'en planifier le téléchargement. Une entrée bloquée est un désagrément ; un
+# SHA inventé transforme la vérification d'intégrité en théâtre.
+#
+# Comment épingler une entrée (lecture publique, aucun jeton requis) :
+#
+#   curl -s https://huggingface.co/api/models/<repo_id>?blobs=true \
+#     | python3 -c 'import json,sys; d=json.load(sys.stdin); \
+#         print(d["sha"]); \
+#         [print(s["rfilename"], s.get("lfs",{}).get("sha256"), s.get("size")) \
+#          for s in d["siblings"]]'
+#
+# Recoupez ensuite avec l'en-tête `X-Linked-Etag` renvoyé par
+# `curl -sI https://huggingface.co/<repo_id>/resolve/<revision>/<fichier>` :
+# les deux endpoints doivent donner le même SHA-256.
+
+catalog_version: 1
+
+# §8 impose de distinguer la licence du LOGICIEL DE TÉLÉCHARGEMENT de celles des
+# modèles. Elle est commune à toutes les entrées : elle vit donc ici.
+downloader:
+  name: "eva-bootstrap downloader"
+  license_id: "agpl-3.0"
+  license_url: "https://www.gnu.org/licenses/agpl-3.0.html"
+  notes: >-
+    Module du dépôt (`gateway/bootstrap/downloader.py`), bâti sur la
+    bibliothèque standard. Révision figée, liste exacte de fichiers, écriture
+    vers un nom temporaire, vérification SHA-256 puis renommage atomique
+    (AUT-006). Le jeton éventuel passe par l'environnement ou un credential
+    store, jamais par argv. `huggingface_hub` a été évalué puis écarté : il
+    tire requests/filelock/fsspec/tqdm dans le chemin d'un outil qui doit
+    tourner avant le venv de la gateway, il possède le temporaire et le
+    renommage, et il vérifie l'ETag du serveur là où nous voulons l'empreinte
+    que ce catalogue a épinglée après revue.
+
+models:
+  # ── Entrée 1 ───────────────────────────────────────────────────────────────
+  # Retenue parce qu'elle est Apache-2.0 de bout en bout (base ET GGUF publiés
+  # par Qwen), non gated, et qu'un Q4_K_M de 0,46 Gio produit un premier token
+  # sur un hôte modeste — y compris sans GPU.
+  - id: "qwen2.5-0.5b-instruct-q4_k_m"
+    family: "qwen2.5"
+    display_name: "Qwen2.5 0.5B Instruct — Q4_K_M"
+    description: >-
+      Modèle de conversation minimal, destiné à la recette du premier token et
+      à la validation d'une installation. Ne pas le confondre avec un modèle de
+      production.
+    use_cases: ["smoke_test", "chat"]
+    source:
+      provider: "huggingface"
+      repo_id: "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+      repo_url: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+      # Relevé le 2026-07-31 sur l'API publique HF, recoupé avec X-Linked-Etag.
+      revision: "9217f5db79a29953eb74d5343926648285ec7e67"
+      revision_recorded_on: "2026-07-31"
+      files:
+        - name: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+          role: "weights"
+          sha256: "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+          size_bytes: 491400032
+    license:
+      base_model:
+        id: "apache-2.0"
+        url: "https://www.apache.org/licenses/LICENSE-2.0"
+        repo_id: "Qwen/Qwen2.5-0.5B-Instruct"
+      fine_tune:
+        id: "apache-2.0"
+        url: "https://www.apache.org/licenses/LICENSE-2.0"
+        repo_id: "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+      usage_terms: null
+      gated: false
+      redistribution_allowed: true
+      operator_acceptance_required: true
+      notes: >-
+        La quantisation GGUF est publiée par l'éditeur du modèle de base, sous
+        la même licence : aucun empilement de licences à arbitrer. La mention de
+        licence d'une model card n'est pas une validation juridique — l'opérateur
+        reste tenu de l'acceptation explicite.
+    runtime:
+      min_llama_build: 0
+      capabilities: ["text_generation", "streaming"]
+      requires_mmproj: false
+      defaults:
+        ctx_size: 8192
+        parallel: 1
+        # f16 plutôt que le q8_0 de l'exemple de §8 : le cache d'un modèle de
+        # cette taille pèse 0,1 Gio en f16, et f16 n'impose ni flash attention
+        # ni build récent. Le premier token ne doit dépendre de rien.
+        cache_type_k: "f16"
+        cache_type_v: "f16"
+    resources:
+      # Valeurs ESTIMÉES (AUT-013), pas mesurées : poids + cache KV + marge
+      # runtime, majorés de 20 %. À remplacer par une calibration réelle (§9).
+      disk_gb: 0.46
+      initial_vram_gb: 1.6
+      initial_ram_gb: 1.6
+      estimation_basis: "gguf_header"
+
+  # ── Entrée 2 ───────────────────────────────────────────────────────────────
+  # Retenue pour ne pas dépendre d'un seul éditeur : famille, tokenizer et
+  # provenance différents, mais même exigence Apache-2.0 non gated. Q8_0 offre
+  # un second point de comparaison sur le mélange de quantisation.
+  - id: "smollm2-360m-instruct-q8_0"
+    family: "smollm2"
+    display_name: "SmolLM2 360M Instruct — Q8_0"
+    description: >-
+      Second modèle d'amorçage, d'un éditeur distinct, pour que la recette du
+      premier token ne repose pas sur la disponibilité d'un unique dépôt.
+    use_cases: ["smoke_test", "chat"]
+    source:
+      provider: "huggingface"
+      repo_id: "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF"
+      repo_url: "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GGUF"
+      # Relevé le 2026-07-31 sur l'API publique HF, recoupé avec X-Linked-Etag.
+      revision: "593b5a2e04c8f3e4ee880263f93e0bd2901ad47f"
+      revision_recorded_on: "2026-07-31"
+      files:
+        - name: "smollm2-360m-instruct-q8_0.gguf"
+          role: "weights"
+          sha256: "48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201"
+          size_bytes: 386404992
+    license:
+      base_model:
+        id: "apache-2.0"
+        url: "https://www.apache.org/licenses/LICENSE-2.0"
+        repo_id: "HuggingFaceTB/SmolLM2-360M-Instruct"
+      fine_tune:
+        id: "apache-2.0"
+        url: "https://www.apache.org/licenses/LICENSE-2.0"
+        repo_id: "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF"
+      usage_terms: null
+      gated: false
+      redistribution_allowed: true
+      operator_acceptance_required: true
+      notes: >-
+        Base et quantisation publiées par le même éditeur, sous Apache-2.0.
+    runtime:
+      min_llama_build: 0
+      capabilities: ["text_generation", "streaming"]
+      requires_mmproj: false
+      defaults:
+        ctx_size: 4096
+        parallel: 1
+        cache_type_k: "f16"
+        cache_type_v: "f16"
+    resources:
+      disk_gb: 0.36
+      initial_vram_gb: 1.6
+      initial_ram_gb: 1.6
+      estimation_basis: "gguf_header"

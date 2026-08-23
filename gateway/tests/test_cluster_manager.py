@@ -19,6 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import telemetry
 
 from cluster.cluster_manager import ClusterManager, ClusterModelHandle
 from cluster.node_client import (
@@ -204,6 +205,7 @@ def make_manager(
 class TestPlacement:
     @pytest.mark.anyio
     async def test_loads_on_single_node(self):
+        telemetry.reset_all()
         backend = FakeNodeBackend("a", total_vram=48.0)
         mgr = make_manager([backend])
         await mgr.start_health_monitor()
@@ -216,6 +218,14 @@ class TestPlacement:
         assert handle.model.id == "m1"
         assert len(backend.load_calls) == 1
         assert backend.load_calls[0]["id"] == "m1"
+        assert handle.telemetry_node == "a"
+        series = telemetry.MODEL_LOAD_SECONDS.snapshot().series
+        assert len(series) == 1
+        assert (series[0].model, series[0].node, series[0].outcome) == (
+            "m1",
+            "a",
+            "success",
+        )
 
     @pytest.mark.anyio
     async def test_best_fit_picks_tighter_node(self):
@@ -956,3 +966,22 @@ class TestGracefulShutdown:
 
         assert backend.unload_all_called is True
         assert backend._loaded == {}
+
+
+@pytest.mark.anyio
+async def test_admission_rechecks_enabled_after_waiting_for_model_lock():
+    """Un rollback gagné pendant l'attente du lock interdit tout nouveau load."""
+    backend = FakeNodeBackend("a")
+    model = FakeModelDef("m1", 20.0, enabled=True)
+    mgr = make_manager([backend], models=[model])
+    lock = mgr._model_locks.setdefault("m1", asyncio.Lock())
+    await lock.acquire()
+    task = asyncio.create_task(mgr.ensure_model_loaded("m1"))
+    await asyncio.sleep(0)
+
+    model.enabled = False
+    lock.release()
+
+    with pytest.raises(PermissionError):
+        await task
+    assert backend.load_calls == []

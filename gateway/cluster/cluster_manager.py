@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from model_registry import ModelDefinition, ModelRegistry
+from telemetry import MODEL_LOAD_SECONDS
 
 from .node_client import NodeClient, NodeUnreachableError, NodeProtocolError
 from .node_protocol import ModelStateOnNode, NodeHealth
@@ -173,6 +174,10 @@ class ClusterModelHandle:
     def active_requests(self) -> int:
         return self._info.active_requests
 
+    @property
+    def telemetry_node(self) -> str:
+        return self._info.node_id
+
     async def report_backend_failure(self) -> None:
         """
         Signale un échec de connexion au llama-server.
@@ -219,6 +224,7 @@ class ClusterManager:
         # Un seul chargement/replacement concurrent par modèle. Les locks par
         # nœud protègent, eux, la capacité et l'ordre unload -> load.
         self._model_locks: dict[str, asyncio.Lock] = {}
+        self._bootstrap_blocked: set[str] = set()
         self._unloading_all = False
 
         self._monitor_task: asyncio.Task | None = None
@@ -494,16 +500,21 @@ class ClusterManager:
 
     # ── Point d'entrée principal (proxy.py) ───────────────────────────────────
 
-    async def ensure_model_loaded(self, model_id: str) -> ClusterModelHandle:
-        """
-        Garantit qu'un modèle est chargé quelque part dans le cluster.
+    def block_bootstrap_admission(self, model_id: str) -> None:
+        """Ferme l'admission synchroniquement, avant tout await de rollback."""
+        self._bootstrap_blocked.add(model_id)
 
-        1. Valide que le modèle est dans le registre et activé.
-        2. Fast path si déjà chargé.
-        3. Sous locks courts : placement via scheduler et mutations d'état.
-           Les load/unload réseau restent hors du lock global.
-        4. Retourne un ClusterModelHandle compatible proxy.py.
-        """
+    def unblock_bootstrap_admission(self, model_id: str) -> None:
+        self._bootstrap_blocked.discard(model_id)
+
+    def is_model_loaded(self, model_id: str) -> bool:
+        return model_id in self._placement
+
+    def _admitted_model(self, model_id: str) -> ModelDefinition:
+        if model_id in self._bootstrap_blocked:
+            raise RuntimeError(
+                f"Le modèle '{model_id}' est fermé par une transition administrative."
+            )
         model = self._registry.get(model_id)
         if model is None:
             raise LookupError(
@@ -514,9 +525,25 @@ class ClusterManager:
                 f"Le modèle '{model_id}' est désactivé dans le registre. "
                 f"Activez-le via PATCH /admin/models/{model_id}."
             )
+        return model
+
+    async def ensure_model_loaded(self, model_id: str) -> ClusterModelHandle:
+        """
+        Garantit qu'un modèle est chargé quelque part dans le cluster.
+
+        1. Valide que le modèle est dans le registre et activé.
+        2. Fast path si déjà chargé.
+        3. Sous locks courts : placement via scheduler et mutations d'état.
+           Les load/unload réseau restent hors du lock global.
+        4. Retourne un ClusterModelHandle compatible proxy.py.
+        """
+        self._admitted_model(model_id)
 
         model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
         async with model_lock:
+            # Le registre ou le gate bootstrap peuvent changer pendant l'attente
+            # du lock. Ce recheck ferme la course rollback/admission.
+            model = self._admitted_model(model_id)
             refresh_state: _NodeState | None = None
             async with self._lock:
                 if self._unloading_all:
@@ -546,14 +573,18 @@ class ClusterManager:
                         refresh_state = node_state
                     else:
                         info.touch()
+                        self._admitted_model(model_id)
                         return ClusterModelHandle(info, model, self)
 
             if refresh_state is not None:
                 refreshed = await self._refresh_reconciled(refresh_state, model)
                 if refreshed is not None:
+                    self._admitted_model(model_id)
                     return refreshed
 
-            return await self._place_and_load(model)
+            handle = await self._place_and_load(model)
+            self._admitted_model(model_id)
+            return handle
 
     async def _place_and_load(self, model: ModelDefinition) -> ClusterModelHandle:
         """Placement + chargement avec failover, sans I/O sous le lock global."""
@@ -647,6 +678,8 @@ class ClusterManager:
                     )
                     continue
 
+                load_started_at = time.monotonic()
+                load_outcome = "success"
                 try:
                     resp = await chosen_state.client.load_model(model.to_dict())
                     if resp.model_id != model.id:
@@ -655,8 +688,10 @@ class ClusterManager:
                             f"reçu '{resp.model_id}'"
                         )
                 except asyncio.CancelledError:
+                    load_outcome = "cancelled"
                     raise
                 except Exception as exc:
+                    load_outcome = "error"
                     async with self._lock:
                         self._record_failure_locked(chosen_state, exc)
                     failed_nodes.add(chosen_state.node_id)
@@ -668,6 +703,13 @@ class ClusterManager:
                         exc,
                     )
                     continue
+                finally:
+                    MODEL_LOAD_SECONDS.observe(
+                        max(0.0, time.monotonic() - load_started_at),
+                        model=model.id,
+                        node=chosen_state.node_id,
+                        outcome=load_outcome,
+                    )
 
                 info = _LoadedInfo(
                     node_id=chosen_state.node_id,
@@ -1144,18 +1186,25 @@ class ClusterManager:
         """
         Retourne l'état agrégé pour /admin/status — même format que LocalModelManager.
         """
-        # Seuls les nœuds ONLINE contribuent à la readiness/capacité. Le
-        # total effectif est used + available annoncé (après overhead/marge),
-        # pas la VRAM physique brute.
-        used_gb = sum(
-            s.last_health.used_vram_gb for s in self._nodes.values()
+        # Seuls les nœuds ONLINE contribuent à la readiness/capacité.
+        #
+        # Le budget NET (allouable aux modèles) est used + available annoncé par
+        # les agents, donc déjà après leur overhead et leur marge — jamais la
+        # VRAM physique brute. On expose en plus le total physique et la réserve
+        # agrégée pour tenir la même arithmétique qu'en local :
+        #   total_gb - overhead_gb == budget_net_gb
+        online = [
+            s.last_health for s in self._nodes.values()
             if s.online and s.last_health
-        )
-        available_gb = sum(
-            s.last_health.available_vram_gb for s in self._nodes.values()
-            if s.online and s.last_health
-        )
-        total_gb = used_gb + available_gb
+        ]
+        used_gb = sum(h.used_vram_gb for h in online)
+        available_gb = sum(h.available_vram_gb for h in online)
+        budget_net_gb = used_gb + available_gb
+        physical_gb = sum(h.total_vram_gb for h in online)
+        # Réserve agrégée des nœuds (overhead + marge de chacun), en GB. La
+        # `safety_margin` locale est un ratio mono-hôte : aucun sens agrégé ici,
+        # elle reste donc absente du statut cluster.
+        overhead_gb = max(0.0, physical_gb - budget_net_gb)
 
         models_status = []
         for model in self._registry.list_all():
@@ -1211,9 +1260,11 @@ class ClusterManager:
 
         return {
             "vram_budget": {
-                "total_gb": round(total_gb, 2),
+                "total_gb": round(physical_gb, 2),
+                "overhead_gb": round(overhead_gb, 2),
                 "used_gb": round(used_gb, 2),
                 "available_gb": round(max(0.0, available_gb), 2),
+                "budget_net_gb": round(budget_net_gb, 2),
                 "nodes": len(self._nodes),
                 "nodes_online": sum(1 for s in self._nodes.values() if s.online),
             },

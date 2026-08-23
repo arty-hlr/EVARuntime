@@ -48,6 +48,7 @@ from background import fire_and_forget
 from config import settings
 from model_manager import CapacityQueueFull, CapacityQueueTimeout, ModelManager
 from server_manager import ServerManager
+from telemetry import TTFT_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +176,8 @@ async def proxy_request(
     - Proxy la requête vers le bon llama-server
     - Log l'usage
     """
+    request_start_time = time.monotonic()
+
     # ── Lire le body ──────────────────────────────────────────────────────────
     try:
         body_bytes = await request.body()
@@ -252,6 +255,7 @@ async def proxy_request(
             _stream_proxy(
                 path, body, user, request_id, start_time, manager,
                 on_start=_release_stream_guard,
+                telemetry_start_time=request_start_time,
             ),
             media_type="text/event-stream",
             headers={
@@ -309,16 +313,6 @@ async def _non_stream_proxy(
     if isinstance(data, dict):
         data["model"] = manager.model.id
 
-        has_any_tool_calls = any(
-            choice.get("message", {}).get("tool_calls")
-            for choice in data.get("choices", [])
-        )
-        for choice in data.get("choices", []):
-            msg = choice.get("message", {})
-            msg.pop("reasoning_content", None)
-            if has_any_tool_calls and msg.get("content"):
-                msg["content"] = None
-
         # Supporte le format OpenAI {"usage": {...}} ET le format natif llama.cpp
         # /completion qui retourne {"tokens_predicted": N, "tokens_evaluated": M}.
         usage = data.get("usage") or {
@@ -350,14 +344,15 @@ async def _stream_proxy(
     start_time: float,
     manager: ServerManager,
     on_start: Callable[[], None] | None = None,
+    telemetry_start_time: float | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Générateur async qui pipe les chunks SSE de llama-server vers le client.
 
-    Quand la requête contient des tools : on bufferise tout le stream pour
-    détecter si le modèle fait un tool_call. Si oui, on supprime le texte
-    "thinking aloud" (content) avant les tool_calls — le SDK Vercel AI
-    n'accepte pas un stream avec content + tool_calls mélangés.
+    Chaque événement est relayé dès sa réception, y compris lorsque la
+    requête contient des tools. Les extensions du backend comme
+    ``reasoning_content`` sont préservées : les réécrire ou les supprimer
+    casserait les harness compatibles DeepSeek et fausserait le TTFT visible.
 
     Pin/unpin : manager.pin() est appelé en premier (avant tout yield) et
     manager.unpin() est garanti dans le finally, même en cas de déconnexion
@@ -373,7 +368,27 @@ async def _stream_proxy(
     prompt_tokens = 0
     completion_tokens = 0
     status_code = 200
-    has_tools = bool(body.get("tools"))
+    ttft_recorded = False
+    ttft_start = start_time if telemetry_start_time is None else telemetry_start_time
+
+    def _record_ttft(chunk: dict) -> None:
+        nonlocal ttft_recorded
+        if ttft_recorded:
+            return
+        meaningful = any(
+            bool(choice.get("delta", {}).get("content"))
+            or bool(choice.get("delta", {}).get("reasoning_content"))
+            or bool(choice.get("delta", {}).get("tool_calls"))
+            for choice in chunk.get("choices", [])
+        )
+        if not meaningful:
+            return
+        TTFT_SECONDS.observe(
+            max(0.0, time.monotonic() - ttft_start),
+            model=manager.model.id,
+            node=getattr(manager, "telemetry_node", "local"),
+        )
+        ttft_recorded = True
 
     body_with_usage = {**body, "stream_options": {"include_usage": True}}
 
@@ -390,73 +405,25 @@ async def _stream_proxy(
         ) as response:
             status_code = response.status_code
 
-            if has_tools:
-                # ── Mode bufferisé (requête avec tools) ──────────────────
-                chunks: list[dict] = []
-                has_tool_calls = False
+            async for line in response.aiter_lines():
+                if not line:
+                    yield b"\n"
+                    continue
 
-                async for line in response.aiter_lines():
-                    if not line or line == "data: [DONE]":
-                        continue
-                    if line.startswith("data: "):
-                        try:
-                            chunk = json.loads(line[6:])
-                            if "model" in chunk:
-                                chunk["model"] = manager.model.id
-                            for choice in chunk.get("choices", []):
-                                delta = choice.get("delta", {})
-                                delta.pop("reasoning_content", None)
-                                if delta.get("tool_calls"):
-                                    has_tool_calls = True
-                            if usage := chunk.get("usage"):
-                                prompt_tokens = usage.get("prompt_tokens", 0)
-                                completion_tokens = usage.get("completion_tokens", 0)
-                            chunks.append(chunk)
-                        except json.JSONDecodeError:
-                            pass
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    try:
+                        chunk = json.loads(line[6:])
+                        if "model" in chunk:
+                            chunk["model"] = manager.model.id
+                        if usage := chunk.get("usage"):
+                            prompt_tokens = usage.get("prompt_tokens", 0)
+                            completion_tokens = usage.get("completion_tokens", 0)
+                        _record_ttft(chunk)
+                        line = "data: " + json.dumps(chunk, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        pass
 
-                for chunk in chunks:
-                    if has_tool_calls:
-                        for choice in chunk.get("choices", []):
-                            delta = choice.get("delta", {})
-                            if delta.get("content") and not delta.get("tool_calls"):
-                                delta.pop("content", None)
-
-                    choices = chunk.get("choices", [])
-                    all_empty = all(
-                        not choice.get("delta") and choice.get("finish_reason") is None
-                        for choice in choices
-                    ) if choices else False
-                    if not all_empty or not choices:
-                        yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()
-
-                yield b"data: [DONE]\n\n"
-
-            else:
-                # ── Mode streaming direct (sans tools) ───────────────────
-                async for line in response.aiter_lines():
-                    if not line:
-                        yield b"\n"
-                        continue
-
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            chunk = json.loads(line[6:])
-                            if "model" in chunk:
-                                chunk["model"] = manager.model.id
-                            for choice in chunk.get("choices", []):
-                                delta = choice.get("delta", {})
-                                reasoning = delta.pop("reasoning_content", None)
-                                if reasoning and not delta.get("content"):
-                                    delta["content"] = reasoning
-                            if usage := chunk.get("usage"):
-                                prompt_tokens = usage.get("prompt_tokens", 0)
-                                completion_tokens = usage.get("completion_tokens", 0)
-                            line = "data: " + json.dumps(chunk, ensure_ascii=False)
-                        except json.JSONDecodeError:
-                            pass
-
-                    yield (line + "\n\n").encode()
+                yield (line + "\n\n").encode()
 
     except httpx.TimeoutException:
         await _report_backend_failure(manager)

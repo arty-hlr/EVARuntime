@@ -11,7 +11,7 @@ sans modification — la sélection est transparente.
 
 Interface commune exposée par les deux implémentations :
     await model_manager.ensure_model_loaded(model_id) → ServerManager | ClusterModelHandle
-    await model_manager.unload_model(model_id)
+    await model_manager.unload_model(model_id)   # refuse si requêtes actives
     await model_manager.shutdown()
     await model_manager.start_health_monitor()   # no-op en mode local
           model_manager.status()
@@ -28,6 +28,7 @@ from collections import deque
 from config import settings
 from model_registry import ModelDefinition, ModelRegistry
 from server_manager import ModelState, ServerManager
+from telemetry import CAPACITY_QUEUE_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +108,25 @@ class CapacityQueueTimeout(CapacityQueueError):
     """La requête a trop attendu une libération de capacité."""
 
 
+# ── Erreurs de cycle de vie (opérations admin) ────────────────────────────────
+
+class ModelBusyError(RuntimeError):
+    """
+    Une opération admin de déchargement a été refusée : le modèle traite encore
+    des requêtes actives après le drain. Mappée en HTTP 409 par admin.py.
+
+    Équivalent local du refus explicite de `ClusterManager.unload_model()`.
+    """
+
+
+class ModelDrainingError(RuntimeError):
+    """
+    Admission refusée : le modèle est en cours de déchargement administratif
+    (quarantaine). Temporaire — la requête peut être réessayée. Mappée en 503
+    comme les autres RuntimeError d'admission.
+    """
+
+
 # ── LocalModelManager (mode local — comportement historique) ──────────────────
 
 class LocalModelManager:
@@ -125,6 +145,11 @@ class LocalModelManager:
         fait hors condition après réservation du port.
     """
 
+    # Le forçage d'un déchargement malgré des requêtes actives n'existe qu'en
+    # mode local (la gateway possède ses propres sous-processus). admin.py teste
+    # cet attribut plutôt que le mode de déploiement.
+    supports_unload_force = True
+
     def __init__(self, registry: ModelRegistry) -> None:
         self._registry = registry
 
@@ -137,6 +162,15 @@ class LocalModelManager:
 
         self._capacity_cond = asyncio.Condition()
         self._capacity_waiters: deque[object] = deque()
+        self._model_locks: dict[str, asyncio.Lock] = {}
+
+        # Modèles en quarantaine : un déchargement admin est en cours de drain.
+        # Aucune NOUVELLE requête n'est admise sur ces modèles, sinon le drain
+        # pourrait ne jamais converger. Toujours vidé dans un bloc finally.
+        self._draining: set[str] = set()
+        # Gate fail-closed du bootstrap. Il survit à un unload en échec ; seul
+        # le protocole bootstrap explicite peut rouvrir l'admission.
+        self._bootstrap_blocked: set[str] = set()
 
         # Réconciliation VRAM (nvidia-smi) — additif dans status(). None tant
         # qu'aucune sonde réussie n'a eu lieu (cas des tests sans GPU).
@@ -147,6 +181,45 @@ class LocalModelManager:
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
     async def ensure_model_loaded(self, model_id: str) -> ServerManager:
+        """Sérialise admission/chargement avec le rollback du même modèle."""
+        # Rejet immédiat pendant un drain, sans attendre le lock détenu par
+        # l'unload. Le même contrôle est refait sous lock ci-dessous.
+        self._admitted_model(model_id)
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            return await self._ensure_model_loaded_locked(model_id)
+
+    def block_bootstrap_admission(self, model_id: str) -> None:
+        """Ferme l'admission synchroniquement, avant tout await de rollback."""
+        self._bootstrap_blocked.add(model_id)
+        self._notify_capacity_changed()
+
+    def unblock_bootstrap_admission(self, model_id: str) -> None:
+        self._bootstrap_blocked.discard(model_id)
+        self._notify_capacity_changed()
+
+    def is_model_loaded(self, model_id: str) -> bool:
+        manager = self._managers.get(model_id)
+        return manager is not None and manager.state in {
+            ModelState.LOADING, ModelState.READY, ModelState.UNLOADING,
+        }
+
+    def _admitted_model(self, model_id: str) -> ModelDefinition:
+        if model_id in self._bootstrap_blocked or model_id in self._draining:
+            raise ModelDrainingError(
+                f"Le modèle '{model_id}' est fermé par une transition administrative."
+            )
+        model = self._registry.get(model_id)
+        if model is None:
+            raise LookupError(f"Modèle inconnu : '{model_id}'. Consultez GET /admin/models.")
+        if not model.enabled:
+            raise PermissionError(
+                f"Le modèle '{model_id}' est désactivé dans le registre. "
+                f"Activez-le via PATCH /admin/models/{model_id}."
+            )
+        return model
+
+    async def _ensure_model_loaded_locked(self, model_id: str) -> ServerManager:
         """
         Garantit qu'un modèle est chargé et retourne son ServerManager.
 
@@ -156,21 +229,17 @@ class LocalModelManager:
            alloue un port et crée le ServerManager.
         4. Attend le chargement hors du lock.
         """
-        model = self._registry.get(model_id)
-        if model is None:
-            raise LookupError(f"Modèle inconnu : '{model_id}'. Consultez GET /admin/models.")
-        if not model.enabled:
-            raise PermissionError(
-                f"Le modèle '{model_id}' est désactivé dans le registre. "
-                f"Activez-le via PATCH /admin/models/{model_id}."
-            )
+        model = self._admitted_model(model_id)
 
         force_extra_eviction = False
         last_error: Exception | None = None
         for attempt in range(2):
+            model = self._admitted_model(model_id)
+
             manager = self._managers.get(model_id)
             if manager and manager.state == ModelState.READY:
                 await manager.ensure_loaded()
+                self._admitted_model(model_id)
                 return manager
 
             async with self._capacity_cond:
@@ -179,6 +248,7 @@ class LocalModelManager:
                     pass
                 else:
                     await self._ensure_capacity(model, force_extra_eviction=force_extra_eviction)
+                    model = self._admitted_model(model_id)
 
                     port = self._port_pool.pop(0)
                     self._allocated_ports[model_id] = port
@@ -199,6 +269,7 @@ class LocalModelManager:
 
             try:
                 await manager.ensure_loaded()
+                self._admitted_model(model_id)
                 return manager
             except Exception as exc:
                 last_error = exc
@@ -249,10 +320,13 @@ class LocalModelManager:
             )
 
         ticket: object | None = None
+        queue_started_at: float | None = None
+        queue_outcome = "success"
         extra_eviction_done = not force_extra_eviction
         deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
         try:
             while True:
+                self._admitted_model(model.id)
                 is_turn = ticket is None and not self._capacity_waiters
                 is_turn = is_turn or (
                     ticket is not None
@@ -286,12 +360,19 @@ class LocalModelManager:
 
                 if ticket is None:
                     if len(self._capacity_waiters) >= settings.capacity_queue_max_waiters:
+                        CAPACITY_QUEUE_SECONDS.observe(
+                            0.0,
+                            model=model.id,
+                            node="local",
+                            outcome="full",
+                        )
                         raise CapacityQueueFull(
                             f"Impossible de charger '{model.id}' : queue VRAM pleine "
                             f"({settings.capacity_queue_max_waiters} requêtes en attente). "
                             f"Réessayez dans quelques secondes."
                         )
                     ticket = object()
+                    queue_started_at = time.monotonic()
                     self._capacity_waiters.append(ticket)
                     log.info(
                         "Requête pour '%s' mise en attente de capacité VRAM "
@@ -304,6 +385,7 @@ class LocalModelManager:
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    queue_outcome = "timeout"
                     raise CapacityQueueTimeout(
                         f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
                         f"après {settings.capacity_queue_timeout_seconds}s d'attente. "
@@ -313,12 +395,27 @@ class LocalModelManager:
                 try:
                     await asyncio.wait_for(self._capacity_cond.wait(), timeout=remaining)
                 except asyncio.TimeoutError as exc:
+                    queue_outcome = "timeout"
                     raise CapacityQueueTimeout(
                         f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
                         f"après {settings.capacity_queue_timeout_seconds}s d'attente. "
                         f"Réessayez dans quelques secondes."
                     ) from exc
+        except asyncio.CancelledError:
+            queue_outcome = "cancelled"
+            raise
+        except Exception:
+            if queue_started_at is not None and queue_outcome == "success":
+                queue_outcome = "error"
+            raise
         finally:
+            if queue_started_at is not None:
+                CAPACITY_QUEUE_SECONDS.observe(
+                    max(0.0, time.monotonic() - queue_started_at),
+                    model=model.id,
+                    node="local",
+                    outcome=queue_outcome,
+                )
             if ticket is not None:
                 try:
                     self._capacity_waiters.remove(ticket)
@@ -454,47 +551,188 @@ class LocalModelManager:
 
     # ── Actions admin ─────────────────────────────────────────────────────────
 
-    async def unload_model(self, model_id: str) -> None:
+    async def unload_model(
+        self,
+        model_id: str,
+        *,
+        force: bool = False,
+        drain_timeout: float | None = None,
+    ) -> None:
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            await self._unload_model_locked(
+                model_id,
+                force=force,
+                drain_timeout=drain_timeout,
+            )
+
+    async def _unload_model_locked(
+        self,
+        model_id: str,
+        *,
+        force: bool = False,
+        drain_timeout: float | None = None,
+    ) -> None:
+        """
+        Décharge un modèle à la demande d'un opérateur (routes /admin/*).
+
+        INVARIANT : un modèle qui traite une requête active n'est jamais tué
+        silencieusement (mêmes garanties que pour l'éviction LRU et le shutdown).
+
+        Déroulé : quarantaine du modèle (plus aucune nouvelle requête admise),
+        drain borné par `drain_timeout` (défaut :
+        `settings.admin_unload_drain_timeout_seconds`), puis :
+          - drain réussi → déchargement normal ;
+          - requêtes encore actives et force=False (défaut) → `ModelBusyError`,
+            le modèle reste chargé et immédiatement réutilisable (409 côté HTTP) ;
+          - requêtes encore actives et force=True → déchargement quand même, avec
+            un log critique (l'opérateur assume l'interruption des générations).
+
+        Sans effet si le modèle n'est pas chargé.
+        """
         async with self._capacity_cond:
             manager = self._managers.get(model_id)
         if manager is None:
-            return
-        await manager.unload(reason="admin request")
+            return  # rien de chargé : ni quarantaine ni drain nécessaires
 
-    async def unload_all_models(self) -> None:
-        """Décharge tous les modèles sans arrêter les tâches de la gateway."""
-        # Drain borné : attendre que les requêtes actives (modèles pinnés) se
-        # terminent avant de tuer leurs llama-server. RETOUR IMMÉDIAT si aucun
-        # modèle n'est pinné.
-        await self._drain_pinned(settings.shutdown_drain_timeout_seconds)
+        timeout = (
+            settings.admin_unload_drain_timeout_seconds
+            if drain_timeout is None
+            else drain_timeout
+        )
 
-        model_ids = list(self._managers.keys())
-        log.info("Déchargement global : %d modèle(s)…", len(model_ids))
-        for model_id in model_ids:
+        self._draining.add(model_id)
+        try:
+            drained = await self._drain_pinned(
+                timeout, [model_id], context=f"Déchargement admin de '{model_id}'",
+            )
+
+            # Le modèle a pu disparaître pendant le drain (moniteur d'inactivité,
+            # crash de llama-server, éviction LRU) — rien à décharger alors.
             manager = self._managers.get(model_id)
-            if manager:
-                await manager.unload(reason="admin unload all")
+            if manager is None:
+                return
+
+            reason = "admin request"
+            if not drained and manager.is_pinned:
+                active = getattr(manager, "active_requests", 1)
+                if not force:
+                    raise ModelBusyError(
+                        f"Le modèle '{model_id}' traite encore {active} requête(s) "
+                        f"active(s) après {timeout:.0f}s de drain — déchargement "
+                        f"refusé pour ne pas interrompre les générations en cours. "
+                        f"Réessayez plus tard, ou passez force=true pour "
+                        f"interrompre explicitement les requêtes actives."
+                    )
+                log.critical(
+                    "Déchargement FORCÉ de '%s' : %s requête(s) active(s) "
+                    "interrompue(s) sur demande explicite de l'opérateur "
+                    "(force=true) après %.0fs de drain.",
+                    model_id, active, timeout,
+                )
+                reason = "admin request (forcé, requêtes actives interrompues)"
+
+            await manager.unload(reason=reason)
+        finally:
+            # La quarantaine ne doit jamais fuir : un modèle laissé « draining »
+            # après une erreur serait définitivement inutilisable.
+            self._draining.discard(model_id)
+
+    async def unload_all_models(self, *, force: bool = False) -> None:
+        """
+        Décharge tous les modèles sans arrêter les tâches de la gateway
+        (action admin `POST /admin/unload`).
+
+        Comme `unload_model`, refuse par défaut d'interrompre des requêtes
+        actives : `ModelBusyError` si le drain n'a pas convergé (409 côté HTTP),
+        aucun modèle déchargé dans ce cas. Le chemin de shutdown appelle cette
+        méthode avec force=True : au SIGTERM, il faut finir par libérer la VRAM
+        et les ports, sous peine de laisser des llama-server orphelins.
+        """
+        drain_timeout = (
+            settings.shutdown_drain_timeout_seconds
+            if force
+            else settings.admin_unload_drain_timeout_seconds
+        )
+        context = "Shutdown" if force else "Déchargement admin global"
+
+        quarantined = list(self._managers.keys())
+        self._draining.update(quarantined)
+        try:
+            # Drain borné : attendre que les requêtes actives (modèles pinnés) se
+            # terminent avant de tuer leurs llama-server. RETOUR IMMÉDIAT si aucun
+            # modèle n'est pinné.
+            drained = await self._drain_pinned(drain_timeout, quarantined, context=context)
+
+            if not drained:
+                busy = [
+                    mid for mid in quarantined
+                    if (mgr := self._managers.get(mid)) is not None and mgr.is_pinned
+                ]
+                if busy and not force:
+                    raise ModelBusyError(
+                        "Impossible de tout décharger : requêtes actives sur "
+                        + ", ".join(f"'{mid}'" for mid in busy)
+                        + f" après {drain_timeout:.0f}s de drain. Aucun modèle n'a "
+                        "été déchargé. Réessayez plus tard, ou déchargez modèle par "
+                        "modèle avec POST /admin/models/{id}/unload?force=true."
+                    )
+                if busy:
+                    log.critical(
+                        "%s : déchargement forcé de %d modèle(s) avec requêtes "
+                        "encore actives : %s",
+                        context, len(busy), ", ".join(busy),
+                    )
+
+            model_ids = list(self._managers.keys())
+            log.info("Déchargement global : %d modèle(s)…", len(model_ids))
+            for model_id in model_ids:
+                manager = self._managers.get(model_id)
+                if manager:
+                    await manager.unload(reason="admin unload all")
+        finally:
+            self._draining.difference_update(quarantined)
 
     async def shutdown(self) -> None:
         # Arrêter la tâche de réconciliation VRAM en premier (best-effort).
         await self._stop_vram_reconcile()
-        await self.unload_all_models()
+        # Le shutdown force : après le drain borné, la VRAM et les ports DOIVENT
+        # être libérés avant que systemd ne tue le processus.
+        await self.unload_all_models(force=True)
 
-    async def _drain_pinned(self, timeout: float) -> None:
+    async def _drain_pinned(
+        self,
+        timeout: float,
+        model_ids: list[str] | None = None,
+        *,
+        context: str = "Shutdown",
+    ) -> bool:
         """
-        Attend (borné par `timeout`) que tous les modèles pinnés libèrent leurs
-        requêtes actives. Poll court. Retourne immédiatement si rien n'est pinné.
+        Attend (borné par `timeout`) que les modèles visés libèrent leurs requêtes
+        actives. Poll court. Retourne immédiatement si rien n'est pinné.
+
+        `model_ids=None` → tous les modèles chargés. Retourne True si plus aucune
+        requête active n'est en cours au retour, False si le timeout a expiré
+        alors que des modèles restaient pinnés.
+
+        Aucun effet de bord : ne décharge rien, ne modifie aucun état. C'est
+        l'appelant qui décide quoi faire du résultat (forcer au shutdown,
+        refuser en 409 sur une route admin).
         """
         def pinned_ids() -> list[str]:
-            return [mid for mid, mgr in self._managers.items() if mgr.is_pinned]
+            targets = list(self._managers.keys()) if model_ids is None else model_ids
+            return [
+                mid for mid in targets
+                if (mgr := self._managers.get(mid)) is not None and mgr.is_pinned
+            ]
 
         pinned = pinned_ids()
         if not pinned:
-            return  # aucune requête active — pas d'attente (cas des tests)
+            return True  # aucune requête active — pas d'attente (cas des tests)
 
         log.info(
-            "Shutdown : %d modèle(s) avec requêtes actives — drain (max %.0fs) : %s",
-            len(pinned), timeout, ", ".join(pinned),
+            "%s : %d modèle(s) avec requêtes actives — drain (max %.0fs) : %s",
+            context, len(pinned), timeout, ", ".join(pinned),
         )
 
         poll = max(0.01, settings.shutdown_drain_poll_seconds)
@@ -502,17 +740,19 @@ class LocalModelManager:
         while time.monotonic() < deadline:
             pinned = pinned_ids()
             if not pinned:
-                log.info("Shutdown : toutes les requêtes actives drainées, déchargement.")
-                return
+                log.info("%s : toutes les requêtes actives drainées.", context)
+                return True
             await asyncio.sleep(poll)
 
         still_pinned = pinned_ids()
         if still_pinned:
             log.warning(
-                "Shutdown : timeout de drain (%.0fs) — déchargement forcé de %d modèle(s) "
-                "avec requêtes encore actives : %s",
-                timeout, len(still_pinned), ", ".join(still_pinned),
+                "%s : timeout de drain (%.0fs) — %d modèle(s) avec requêtes "
+                "encore actives : %s",
+                context, timeout, len(still_pinned), ", ".join(still_pinned),
             )
+            return False
+        return True
 
     # ── Réconciliation VRAM (nvidia-smi) — best-effort, non fatal ─────────────
 
@@ -770,7 +1010,7 @@ def _build_manager():
 
     log.info(
         "Nœuds cluster configurés : %s",
-        ", ".join(f"{n.node_id}({n.base_url})" for n in cluster_cfg.nodes),
+        ", ".join(f"{n.id}({n.base_url})" for n in cluster_cfg.nodes),
     )
 
     return ClusterManager(

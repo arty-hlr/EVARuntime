@@ -17,11 +17,14 @@ Technique :
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 
 import httpx
 import pytest
 
 import proxy
+import telemetry
 
 
 @pytest.fixture
@@ -74,6 +77,9 @@ def _no_db_logging(monkeypatch):
         return None
 
     monkeypatch.setattr(proxy, "fire_and_forget", _swallow)
+    telemetry.reset_all()
+    yield
+    telemetry.reset_all()
 
 
 @pytest.fixture
@@ -98,6 +104,225 @@ def _sse_stream(*events: str) -> bytes:
     redécoupe comme le ferait un vrai llama-server.
     """
     return ("".join(f"{ev}\n\n" for ev in events)).encode()
+
+
+def _json_events(stream: bytes | str) -> list[dict]:
+    """Extrait les objets JSON d'un flux SSE collecté."""
+    text = stream.decode() if isinstance(stream, bytes) else stream
+    return [
+        json.loads(line[6:])
+        for line in text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+
+
+class GatedSSEStream(httpx.AsyncByteStream):
+    """Backend SSE qui attend un signal après son premier événement."""
+
+    def __init__(self) -> None:
+        self.waiting_for_release = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __aiter__(self):
+        yield _sse_stream(
+            'data: {"model":"upstream","choices":[{"delta":'
+            '{"reasoning_content":"Je réfléchis"}}]}',
+        )
+        self.waiting_for_release.set()
+        await self.release.wait()
+        yield _sse_stream(
+            'data: {"model":"upstream","choices":[{"delta":{"tool_calls":['
+            '{"index":0,"id":"call-1","type":"function","function":'
+            '{"name":"search","arguments":"{}"}}]}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":7}}',
+            "data: [DONE]",
+        )
+
+
+# ── 0. Raisonnement et tools : streaming réel, sans réécriture ──────────────────
+
+@pytest.mark.anyio
+async def test_stream_with_tools_emits_reasoning_before_backend_finishes(
+    restore_http_client,
+):
+    """
+    Un harness agentique envoie presque toujours ``tools``. Le premier delta de
+    raisonnement doit lui parvenir pendant que le backend produit encore la
+    suite, et garder son champ DeepSeek ``reasoning_content`` distinct.
+
+    Le verrou du faux backend est un contrôle positif : l'ancien proxy, qui lisait
+    tout le flux avant son premier yield, atteint ``waiting_for_release`` avant
+    que ``first_chunk`` soit disponible et fait donc échouer ce test sans
+    dépendre d'un sleep ou de la vitesse de la machine.
+    """
+    upstream = GatedSSEStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=upstream)
+
+    _inject_client(httpx.MockTransport(handler))
+    manager = FakeManager("deepseek-reasoner")
+    gen = proxy._stream_proxy(
+        "/v1/chat/completions",
+        {
+            "stream": True,
+            "tools": [{"type": "function", "function": {"name": "search"}}],
+        },
+        USER,
+        "req-reasoning-tools",
+        time.monotonic(),
+        manager,
+    )
+
+    first_chunk = asyncio.create_task(anext(gen))
+    backend_blocked = asyncio.create_task(upstream.waiting_for_release.wait())
+    done, _ = await asyncio.wait(
+        {first_chunk, backend_blocked},
+        timeout=1,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    emitted_before_backend_finished = first_chunk in done
+
+    # Termine toujours proprement le double, y compris avec l'ancien code
+    # bufferisé, afin de ne laisser ni tâche ni générateur pendant après l'assert.
+    upstream.release.set()
+    first = await first_chunk
+    remainder = b"".join([chunk async for chunk in gen])
+    await backend_blocked
+
+    assert emitted_before_backend_finished, (
+        "le proxy a attendu la fin du backend avant d'émettre le raisonnement"
+    )
+    assert _json_events(first)[0]["choices"][0]["delta"] == {
+        "reasoning_content": "Je réfléchis",
+    }
+    assert _json_events(first)[0]["model"] == "deepseek-reasoner"
+    assert _json_events(remainder)[0]["choices"][0]["delta"]["tool_calls"][0][
+        "id"
+    ] == "call-1"
+    assert manager.pin_calls == manager.unpin_calls == 1
+
+
+@pytest.mark.anyio
+async def test_stream_with_tools_preserves_content_and_tool_call_deltas(
+    restore_http_client,
+):
+    """Le proxy ne supprime aucun delta upstream lorsqu'un tool call survient."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_stream(
+            'data: {"choices":[{"delta":{"content":"Préambule"}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"name":"search","arguments":""}}]}}]}',
+            "data: [DONE]",
+        ))
+
+    _inject_client(httpx.MockTransport(handler))
+    gen = proxy._stream_proxy(
+        "/v1/chat/completions",
+        {"stream": True, "tools": [{"type": "function"}]},
+        USER,
+        "req-content-tools",
+        0.0,
+        FakeManager(),
+    )
+
+    deltas = [event["choices"][0]["delta"] for event in _json_events(
+        b"".join([chunk async for chunk in gen])
+    )]
+
+    assert deltas[0] == {"content": "Préambule"}
+    assert deltas[1]["tool_calls"][0]["function"]["name"] == "search"
+
+
+@pytest.mark.anyio
+async def test_stream_reasoning_content_is_preserved_and_records_ttft(
+    restore_http_client,
+):
+    """Un delta de raisonnement reste distinct et compte comme premier token."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_stream(
+            'data: {"choices":[{"delta":{"reasoning_content":"Analysons"}}]}',
+            "data: [DONE]",
+        ))
+
+    _inject_client(httpx.MockTransport(handler))
+    gen = proxy._stream_proxy(
+        "/v1/chat/completions",
+        {"stream": True},
+        USER,
+        "req-reasoning-ttft",
+        time.monotonic(),
+        FakeManager(),
+    )
+
+    events = _json_events(b"".join([chunk async for chunk in gen]))
+
+    assert events[0]["choices"][0]["delta"] == {
+        "reasoning_content": "Analysons",
+    }
+    assert telemetry.TTFT_SECONDS.snapshot().series[0].count == 1
+
+
+@pytest.mark.anyio
+async def test_non_stream_preserves_reasoning_content(restore_http_client):
+    """La variante non-streaming conserve aussi l'extension DeepSeek."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "Calcul interne",
+                    "content": "Réponse finale",
+                },
+            }],
+            "usage": {},
+        })
+
+    _inject_client(httpx.MockTransport(handler))
+    response = await proxy._non_stream_proxy(
+        "/v1/chat/completions",
+        {},
+        USER,
+        "req-reasoning-non-stream",
+        0.0,
+        FakeManager(),
+    )
+
+    message = json.loads(response.body)["choices"][0]["message"]
+    assert message["reasoning_content"] == "Calcul interne"
+    assert message["content"] == "Réponse finale"
+
+
+@pytest.mark.anyio
+async def test_stream_records_ttft_on_first_meaningful_chunk(restore_http_client):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_sse_stream(
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":1}}',
+            'data: {"choices":[{"delta":{"content":"bonjour"}}]}',
+            "data: [DONE]",
+        ))
+
+    _inject_client(httpx.MockTransport(handler))
+    manager = FakeManager()
+    gen = proxy._stream_proxy(
+        "/v1/chat/completions",
+        {"stream": True},
+        USER,
+        "req-ttft",
+        time.monotonic(),
+        manager,
+    )
+
+    _ = b"".join([chunk async for chunk in gen])
+
+    series = telemetry.TTFT_SECONDS.snapshot().series
+    assert len(series) == 1
+    assert (series[0].model, series[0].node, series[0].count) == (
+        "test-model",
+        "local",
+        1,
+    )
 
 
 # ── 1. Déconnexion client → unpin équilibré ───────────────────────────────────

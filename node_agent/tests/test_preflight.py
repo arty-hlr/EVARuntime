@@ -1,6 +1,7 @@
 """Tests du préflight de déploiement node-agent."""
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -11,13 +12,17 @@ from preflight import (
     load_settings_file,
     local_health_url,
     validate_runtime_files,
+    validate_runtime_version,
     validate_sensitive_file,
 )
 
 
 def test_preflight_accepts_complete_runtime(tmp_path):
     binary = tmp_path / "llama-server"
-    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.write_text(
+        "#!/bin/sh\necho 'version: 7000 (a1b2c3d)'\n",
+        encoding="utf-8",
+    )
     binary.chmod(0o750)
     cert = tmp_path / "agent.crt"
     key = tmp_path / "agent.key"
@@ -35,9 +40,43 @@ def test_preflight_accepts_complete_runtime(tmp_path):
         agent_tls_cert=cert,
         agent_tls_key=key,
         allowed_model_dirs=str(models),
+        llama_server_min_build=6000,
     )
 
     assert validate_runtime_files(configured) == []
+    assert asyncio.run(validate_runtime_version(configured)) == []
+
+
+def test_preflight_requires_positive_minimum_build(tmp_path):
+    binary = tmp_path / "llama-server"
+    binary.write_text("#!/bin/sh\necho 'version: 7000 (a1b2c3d)'\n", encoding="utf-8")
+    binary.chmod(0o750)
+    configured = AgentSettings(
+        _env_file=None,
+        llama_server_bin=binary,
+        llama_server_min_build=0,
+    )
+
+    errors = asyncio.run(validate_runtime_version(configured))
+
+    assert len(errors) == 1
+    assert "strictement positif" in errors[0]
+
+
+def test_preflight_rejects_runtime_below_minimum_build(tmp_path):
+    binary = tmp_path / "llama-server"
+    binary.write_text("#!/bin/sh\necho 'version: 5999 (a1b2c3d)'\n", encoding="utf-8")
+    binary.chmod(0o750)
+    configured = AgentSettings(
+        _env_file=None,
+        llama_server_bin=binary,
+        llama_server_min_build=6000,
+    )
+
+    errors = asyncio.run(validate_runtime_version(configured))
+
+    assert len(errors) == 1
+    assert "inférieure au build minimal 6000" in errors[0]
 
 
 def test_preflight_reports_missing_binary_tls_and_model_dir(tmp_path):
@@ -83,12 +122,19 @@ def test_preflight_cli_ignores_invalid_ambient_settings(tmp_path):
     cert.write_text("cert", encoding="utf-8")
     key.write_text("key", encoding="utf-8")
     key.chmod(0o640)
+    binary = tmp_path / "llama-server"
+    binary.write_text(
+        "#!/bin/sh\necho 'version: 7000 (a1b2c3d)'\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o750)
     env_file = tmp_path / "agent.env"
     env_file.write_text(
         "NODE_ID=node-from-file\n"
         f"AGENT_SECRET={'a' * 32}\n"
         f"INTERNAL_API_KEY={'b' * 32}\n"
-        f"LLAMA_SERVER_BIN={sys.executable}\n"
+        f"LLAMA_SERVER_BIN={binary}\n"
+        "LLAMA_SERVER_MIN_BUILD=6000\n"
         f"AGENT_TLS_CERT={cert}\n"
         f"AGENT_TLS_KEY={key}\n"
         f"ALLOWED_MODEL_DIRS={models}\n",

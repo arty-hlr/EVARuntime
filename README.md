@@ -38,6 +38,7 @@ The project is intentionally pragmatic: FastAPI, SQLite WAL, systemd, nginx and 
 - Multi-model VRAM budgeting with LRU eviction and best-effort VRAM reconciliation via `nvidia-smi`.
 - Optional multi-node mode with lightweight GPU agents, state reconciliation on startup and fast failover.
 - Supply-chain hardening: optional GGUF `sha256` integrity checks and `llama-server` build pinning.
+- Unprivileged bootstrap planner (`bootstrap-plan`): inventories the host and explains what it would install to reach a first token, without downloading, compiling or writing anything.
 - Observability: Prometheus text exposition (`/admin/metrics/prometheus`) and a `/ready` readiness probe.
 - Admin CLI and REST API for users, keys, models and reports.
 - Deployment assets for systemd, nginx, journald and scheduled SQLite backups.
@@ -67,11 +68,11 @@ Each model backend is managed as a gateway-owned subprocess instead of a permane
 
 ```text
 gateway/                 Main OpenAI-compatible gateway
+gateway/bootstrap/       Unprivileged bootstrap planner and approved-model catalog
 gateway/cluster/         Multi-node scheduling and remote node client
 gateway/deploy/          systemd, nginx and install scripts
 gateway/static/          Admin dashboard
 gateway/tests/           Gateway test suite
-gateway-student/         Restricted student-facing edge gateway
 node_agent/              Lightweight remote GPU node agent
 docs/                    Architecture, API, admin and deployment guides
 ```
@@ -101,6 +102,26 @@ cd EVARuntime
 sudo bash gateway/deploy/install.sh --mode local
 ```
 
+Production bootstrap has three explicit stages: review a non-mutating plan,
+install the service base, then apply the reviewed plan to publish the pinned
+runtime and models and prove the first token:
+
+```bash
+cd gateway && python cli.py bootstrap-plan
+```
+
+`bootstrap-plan` produces a versioned, secret-free document meant to be reviewed
+or pasted into a ticket. It writes nothing and installs nothing; without a pinned
+`llama.cpp` version and commit it deliberately reports a blocked plan rather than
+inventing a build number. The complete production sequence, including
+`bootstrap-apply`, systemd environment hardening, `doctor` and the public smoke
+test, is in the [deployment guide](docs/deployment.md#parcours-production-complet--mode-local).
+
+Once a local installation runs, [« Première requête authentifiée »](docs/deployment.md#première-requête-authentifiée)
+walks you from creating a user and an API key (`llmgw-…`) to the first
+`/v1/chat/completions` on `http://127.0.0.1:8000` — and explains why the gateway
+rejects `ADMIN_SECRET` on `/v1/*` routes.
+
 Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
 multi-node orchestrator, inspect the plan first, then install explicitly:
 
@@ -125,11 +146,15 @@ for TLS, ports, shared model paths, migration and rollback.
 
 ## API Example
 
+On a fresh local install the gateway listens directly on `http://127.0.0.1:8000`;
+behind nginx, use your public URL instead. The `model` field is the `id` declared
+in `models.yaml` (not the GGUF file name).
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
+    base_url="http://127.0.0.1:8000/v1",
     api_key="llmgw-your_api_key",
 )
 
@@ -160,7 +185,7 @@ for chunk in stream:
 cd /opt/llm-gateway
 
 sudo -u llmservice ./venv/bin/python cli.py add-user alice \
-  --email alice@univ-pau.fr --rpm 30
+  --email alice@example.com --rpm 30
 
 sudo -u llmservice ./venv/bin/python cli.py create-key alice --name research
 sudo -u llmservice ./venv/bin/python cli.py list-users
@@ -177,7 +202,7 @@ Start with [gateway/.env.example](gateway/.env.example). The important settings 
 | Setting | Purpose |
 | --- | --- |
 | `MODELS_CONFIG_PATH` | YAML model registry |
-| `LLAMA_SERVER_BIN` | Path to the CUDA-enabled `llama-server` binary |
+| `LLAMA_SERVER_BIN` | Published CUDA runtime (supported default: `/opt/llama.cpp/current/llama-server`) |
 | `INTERNAL_API_KEY` | Internal gateway-to-backend key |
 | `ADMIN_SECRET` | Secret for admin endpoints |
 | `IDLE_TIMEOUT_SECONDS` | Idle delay before unloading a model |
@@ -189,6 +214,7 @@ Never publish real `.env` files, generated secrets, TLS private keys, databases 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Dependency and CVE policy](docs/dependency-policy.md)
 - [API guide](docs/api.md)
 - [Admin guide](docs/admin.md)
 - [Deployment guide](docs/deployment.md)

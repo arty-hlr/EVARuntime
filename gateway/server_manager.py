@@ -33,6 +33,7 @@ import httpx
 
 from config import settings
 from model_registry import ModelDefinition
+from telemetry import MODEL_LOAD_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class ServerManager:
     def active_requests(self) -> int:
         return self._active_requests
 
+    @property
+    def telemetry_node(self) -> str:
+        return "local"
+
     def pin(self) -> None:
         """
         Signale le début d'une requête active.
@@ -232,6 +237,8 @@ class ServerManager:
 
     async def _load_and_signal(self, event: asyncio.Event) -> None:
         """Lance llama-server et signale l'event quand prêt (ou en cas d'erreur)."""
+        started_at = time.monotonic()
+        outcome = "success"
         try:
             await self._start_process()
             await self._wait_for_health()
@@ -244,6 +251,7 @@ class ServerManager:
                 # ensure_loaded prendrait le fast-path et toutes les requêtes
                 # échoueraient en 502 sans jamais revenir à UNLOADED.
                 if self._state != ModelState.LOADING:
+                    outcome = "cancelled"
                     log.info(
                         "Chargement de '%s' abandonné (état=%s) — unload concurrent.",
                         self._model.id, self._state.value,
@@ -263,13 +271,23 @@ class ServerManager:
 
             self._idle_task = asyncio.create_task(self._idle_monitor())
 
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
         except Exception as exc:
+            outcome = "error"
             log.error("Échec du chargement du modèle '%s' : %s", self._model.id, exc)
             self._load_error = exc
             await self._kill_process()
             async with self._state_lock:
                 self._state = ModelState.UNLOADED
         finally:
+            MODEL_LOAD_SECONDS.observe(
+                max(0.0, time.monotonic() - started_at),
+                model=self._model.id,
+                node="local",
+                outcome=outcome,
+            )
             event.set()
             if self._on_capacity_change:
                 self._on_capacity_change()

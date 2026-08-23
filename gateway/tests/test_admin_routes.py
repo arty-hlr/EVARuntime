@@ -111,6 +111,16 @@ MUTATING_ROUTES = [
     ("POST", "/admin/models", {"id": "x", "path": "/nope.gguf", "vram_gb": 1.0}),
     ("PATCH", "/admin/models/does-not-exist", {"enabled": False}),
     ("DELETE", "/admin/models/does-not-exist", None),
+    (
+        "POST",
+        "/admin/models/does-not-exist/bootstrap-sync",
+        {
+            "action": "activate",
+            "digest": "0" * 64,
+            "vram_gb": 1.0,
+            "lease_seconds": 30,
+        },
+    ),
     ("POST", "/admin/models/does-not-exist/load", None),
     ("POST", "/admin/models/does-not-exist/unload", None),
     ("POST", "/admin/unload", None),
@@ -384,6 +394,69 @@ def test_delete_model_known_id_succeeds_and_is_removed(
     response = client.delete("/admin/models/test-model", headers=admin_headers)
     assert response.status_code == 200
     assert temp_registry.get("test-model") is None
+
+
+# ── 5 bis. COR-029 — un refus d'écriture se lit pareil sur les trois verbes ──
+#
+# `RegistryWriteRefused` hérite délibérément de `ValueError` pour ressortir en
+# 422 avec son message : c'est celui qui dit à l'opérateur POURQUOI on a refusé,
+# et comment réparer son fichier. `DELETE` n'attrapait que `KeyError` ; le refus
+# ressortait donc en 500 au corps générique, message perdu.
+
+def _rendre_le_registre_non_retouchable(registry) -> bytes:
+    """
+    Réécrit `models.yaml` en style « flow », que le localisateur refuse.
+
+    Cas réel et non artificiel : la gateway refuse d'identifier une entrée dans
+    un `models: [{...}]`, et c'est le bon comportement (COR-020). Ce qui se
+    teste ici, c'est la traduction HTTP de ce refus, pas le refus lui-même.
+    """
+    document = yaml.safe_load(registry._path.read_text(encoding="utf-8"))
+    registry._path.write_text(
+        yaml.safe_dump(document, default_flow_style=True), encoding="utf-8"
+    )
+    return registry._path.read_bytes()
+
+
+@pytest.mark.parametrize("verbe", ["delete", "patch", "post"])
+def test_un_refus_d_ecriture_du_registre_rend_422_sur_les_trois_verbes(
+    client, admin_headers, temp_registry, tmp_path, verbe,
+):
+    temp_registry.add(_gguf_entry(tmp_path))
+    avant = _rendre_le_registre_non_retouchable(temp_registry)
+
+    if verbe == "delete":
+        response = client.delete("/admin/models/test-model", headers=admin_headers)
+    elif verbe == "patch":
+        response = client.patch(
+            "/admin/models/test-model", headers=admin_headers, json={"vram_gb": 2.0}
+        )
+    else:
+        response = client.post(
+            "/admin/models",
+            headers=admin_headers,
+            json=_gguf_entry(tmp_path, id="autre-modele"),
+        )
+
+    assert response.status_code == 422, response.text
+    # Le message de refus est ce qui rend la 422 exploitable : sans lui,
+    # l'opérateur ne sait pas quoi corriger dans son fichier.
+    detail = response.json()["detail"]
+    assert "identifi" in detail or "ne signifie pas" in detail or "flow" in detail
+    assert "rien n'a été écrit" in detail.lower()
+    assert temp_registry._path.read_bytes() == avant
+
+
+def test_un_identifiant_inconnu_reste_un_404_sur_delete(
+    client, admin_headers, temp_registry, tmp_path,
+):
+    """Contrôle positif : élargir le `except` n'a pas transformé les 404 en 422."""
+    temp_registry.add(_gguf_entry(tmp_path))
+    ok = client.delete("/admin/models/test-model", headers=admin_headers)
+    absent = client.delete("/admin/models/test-model", headers=admin_headers)
+
+    assert ok.status_code == 200
+    assert absent.status_code == 404
 
 
 def test_delete_user_unknown_username_returns_404(client, admin_headers, temp_db):

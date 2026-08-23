@@ -1,16 +1,16 @@
-# Guide utilisateur — API du Cluster EVA
+# Guide utilisateur — API EVARuntime (OpenAI-compatible)
 
-Ce guide s'adresse aux doctorants, enseignants-chercheurs, ingénieurs et stagiaires
-qui souhaitent exploiter le service d'inférence de grands modèles de langage (LLM)
-du cluster EVA depuis leurs scripts, notebooks ou applications.
+Ce guide s'adresse aux utilisateurs (chercheurs, ingénieurs, stagiaires…) qui
+souhaitent exploiter le service d'inférence de grands modèles de langage (LLM)
+servi par la gateway EVARuntime depuis leurs scripts, notebooks ou applications.
 
 L'API est **entièrement compatible avec le standard OpenAI** : tout code existant
 utilisant `openai-python`, LangChain, LiteLLM ou `curl` fonctionnera sans modification,
 en changeant uniquement l'URL de base et la clé d'authentification.
 
-> **Contacts principaux**
-> - **Mohamad El Akhal El Bouzidi** — responsable technique du service
-> - **Benjamin Mascret** — administrateur système et infrastructure
+> Si vous utilisez un service maintenu par un tiers, le moyen d'obtenir une clé
+> est défini par l'administrateur du service (voir
+> [section 1](#1-obtenir-une-clé-api)).
 
 ---
 
@@ -36,9 +36,35 @@ en changeant uniquement l'URL de base et la clé d'authentification.
 
 ## 1. Obtenir une clé API
 
-L'accès au service est nominatif. Pour en bénéficier, contactez l'un des responsables
-du service en précisant votre nom, votre adresse email institutionnelle et le cadre
-d'utilisation prévu (thèse, enseignement, projet de recherche, stage, etc.).
+Deux situations sont possibles : vous **administrez votre propre installation**
+de la gateway, ou vous êtes l'**utilisateur d'un service déjà déployé**.
+
+### Vous administrez votre propre installation
+
+Sur la machine où la gateway est installée, la CLI crée l'utilisateur puis sa
+clé API. La clé brute n'est affichée **qu'une seule fois** et n'est jamais
+stockée côté serveur (seule son empreinte SHA-256 est conservée) — copiez-la
+immédiatement.
+
+```bash
+cd /opt/llm-gateway
+
+# Créer l'utilisateur, puis sa clé API (remplacez <username>)
+sudo -u llmservice ./venv/bin/python cli.py add-user <username>
+sudo -u llmservice ./venv/bin/python cli.py create-key <username> --name <nom_de_cle>
+```
+
+> Les routes `/v1/*` s'authentifient avec cette **clé API utilisateur**
+> (`llmgw-…`), et non avec `ADMIN_SECRET`, qui ne protège que les routes
+> administratives `/admin/*`. Le parcours complet « installation locale →
+> première requête authentifiée » est décrit dans le
+> [guide de déploiement](deployment.md#première-requête-authentifiée).
+
+### Vous utilisez un service maintenu par un administrateur
+
+L'accès au service est nominatif. Pour en bénéficier, contactez l'administrateur
+du service en précisant votre nom, votre adresse email et le cadre d'utilisation
+prévu (thèse, enseignement, projet de recherche, stage, etc.).
 
 Vous recevrez une clé au format suivant :
 ```
@@ -65,10 +91,10 @@ La méthode recommandée est d'utiliser une variable d'environnement :
 
 ```bash
 # À ajouter dans ~/.bashrc ou ~/.zshrc
-export UPPA_LLM_KEY="llmgw-votre_cle_ici"
+export EVA_API_KEY="llmgw-votre_cle_ici"
 
 # Pour un projet Python : utiliser un fichier .env exclu du contrôle de version
-echo "UPPA_LLM_KEY=llmgw-votre_cle_ici" >> .env
+echo "EVA_API_KEY=llmgw-votre_cle_ici" >> .env
 echo ".env" >> .gitignore
 ```
 
@@ -76,7 +102,7 @@ En Python, la clé se lit simplement ainsi, sans jamais l'écrire dans le code :
 
 ```python
 import os
-api_key = os.environ["UPPA_LLM_KEY"]
+api_key = os.environ["EVA_API_KEY"]
 ```
 
 ---
@@ -86,13 +112,20 @@ api_key = os.environ["UPPA_LLM_KEY"]
 Avant d'écrire un script Python complet, il est utile de vérifier que le service
 répond et d'explorer les modèles disponibles. L'outil `curl` est idéal pour cela.
 
+Les exemples ci-dessous utilisent le chemin **local direct**
+`http://127.0.0.1:8000` — celui qu'écoute la gateway immédiatement après une
+installation (l'unité systemd lie uvicorn à `127.0.0.1:8000`). Une fois la
+gateway exposée derrière nginx/TLS, le même chemin est servi sous une URL
+publique (`https://gateway.example.com` ou votre domaine), sans changer quoi
+que ce soit d'autre dans les requêtes.
+
 ### Vérifier l'état du service
 
 Cet endpoint ne requiert pas d'authentification et indique si le service est opérationnel,
 quels modèles sont actuellement en mémoire GPU et combien de VRAM est disponible.
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/health
+curl -s http://127.0.0.1:8000/health
 ```
 
 Réponse attendue :
@@ -117,7 +150,7 @@ d'inférence maintenant. Utile pour un load balancer ou un script qui veut évit
 d'envoyer du trafic à une instance saturée.
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" https://llm.eva.univ-pau.fr/ready
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/ready
 ```
 
 - **`200`** — au moins un modèle est déjà chargé, **ou** il reste de la capacité
@@ -138,9 +171,14 @@ curl -s -o /dev/null -w "%{http_code}\n" https://llm.eva.univ-pau.fr/ready
 
 ### Lister les modèles disponibles
 
+Cette route est **authentifiée** avec une clé API utilisateur (`llmgw-…`), pas
+avec le secret administratif `ADMIN_SECRET`. Chaque entrée porte un champ `id` :
+c'est cet identifiant, défini dans `models.yaml`, qu'il faut envoyer dans le
+champ `model` d'une requête de génération — pas le nom du fichier `.gguf`.
+
 ```bash
-curl -s https://llm.eva.univ-pau.fr/v1/models \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/models \
+  -H "Authorization: Bearer $EVA_API_KEY" | python3 -m json.tool
 ```
 
 ### Voir l'état de la queue VRAM
@@ -150,8 +188,8 @@ uniquement l'état minimal de la queue d'admission, sans révéler les modèles
 chargés, les chemins fichiers ou le détail VRAM.
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/v1/capacity \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
+curl -s http://127.0.0.1:8000/v1/capacity \
+  -H "Authorization: Bearer $EVA_API_KEY" | python3 -m json.tool
 ```
 
 Réponse exemple :
@@ -175,8 +213,8 @@ Réponse exemple :
 ### Première requête de génération
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $EVA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-9b-q5_k_m",
@@ -221,7 +259,7 @@ Réponse attendue :
 
 La bibliothèque officielle `openai` est la méthode recommandée pour Python. Elle gère
 automatiquement la sérialisation JSON, le streaming et la gestion de base des erreurs.
-La reconfigurer pour pointer sur le cluster EVA ne demande qu'un seul changement.
+La reconfigurer pour pointer vers votre gateway ne demande qu'un seul changement.
 
 ### Installation
 
@@ -236,8 +274,8 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",  # seul changement par rapport à OpenAI
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",  # seul changement par rapport à OpenAI
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,  # le modèle peut mettre jusqu'à 90s à se charger la première fois
 )
 ```
@@ -332,8 +370,8 @@ import time
 from openai import OpenAI, APIStatusError, APITimeoutError, APIConnectionError
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,
     max_retries=0,  # on gère les relances manuellement pour plus de contrôle
 )
@@ -406,9 +444,9 @@ aussi bien le mode synchrone qu'asynchrone, et offre une gestion du timeout plus
 import httpx
 import os
 
-API_URL = "https://llm.eva.univ-pau.fr/v1/chat/completions"
+API_URL = "https://gateway.example.com/v1/chat/completions"
 HEADERS = {
-    "Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}",
+    "Authorization": f"Bearer {os.environ['EVA_API_KEY']}",
     "Content-Type": "application/json",
 }
 
@@ -501,8 +539,8 @@ import asyncio
 from openai import AsyncOpenAI
 
 async_client = AsyncOpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,
 )
 
@@ -523,8 +561,8 @@ asyncio.run(stream_response("Explique le fine-tuning en 5 points."))
 ### curl — streaming SSE
 
 ```bash
-curl -sN https://llm.eva.univ-pau.fr/v1/chat/completions \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+curl -sN https://gateway.example.com/v1/chat/completions \
+  -H "Authorization: Bearer $EVA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-9b-q5_k_m",
@@ -538,6 +576,35 @@ curl -sN https://llm.eva.univ-pau.fr/v1/chat/completions \
 # ...
 # data: [DONE]
 ```
+
+### Modèles de raisonnement et appels d'outils
+
+Les backends compatibles DeepSeek peuvent séparer la phase de raisonnement de
+la réponse finale avec l'extension `reasoning_content`. EVARuntime conserve ce
+champ tel quel, en streaming comme dans une réponse classique :
+
+```text
+data: {"choices":[{"delta":{"reasoning_content":"Analysons le problème..."}}]}
+data: {"choices":[{"delta":{"content":"La réponse est..."}}]}
+```
+
+Cette extension n'appartient pas au schéma OpenAI historique. Selon la version
+du SDK, elle peut être accessible comme attribut supplémentaire :
+
+```python
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    reasoning = getattr(delta, "reasoning_content", None)
+    if reasoning:
+        print(reasoning, end="", flush=True)
+    if delta.content:
+        print(delta.content, end="", flush=True)
+```
+
+La présence d'une liste `tools` ne change pas ce comportement. Les deltas
+`reasoning_content`, `content` et `tool_calls` sont relayés dès leur réception,
+sans attendre la fin de la génération. Le client reste responsable de leur
+affichage et de l'assemblage des arguments de chaque appel d'outil.
 
 ---
 
@@ -663,8 +730,8 @@ import os
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=600.0,  # prévoir large pour les longues générations
 )
 
@@ -711,8 +778,8 @@ print(response.choices[0].message.content)
 Paramètres standard et avancés coexistent dans le même corps JSON, sans imbrication :
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+curl -s https://gateway.example.com/v1/chat/completions \
+  -H "Authorization: Bearer $EVA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-9b-q5_k_m",
@@ -747,8 +814,8 @@ accepte une chaîne brute dans le champ `prompt`. Il est utile pour :
 - travailler avec des modèles sans template de conversation.
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/completion \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+curl -s https://gateway.example.com/completion \
+  -H "Authorization: Bearer $EVA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-9b-q5_k_m",
@@ -782,8 +849,8 @@ import httpx
 import os
 
 response = httpx.post(
-    "https://llm.eva.univ-pau.fr/completion",
-    headers={"Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}"},
+    "https://gateway.example.com/completion",
+    headers={"Authorization": f"Bearer {os.environ['EVA_API_KEY']}"},
     json={
         "model": "qwen3.5-9b-q5_k_m",
         "prompt": "La photosynthèse est",
@@ -820,8 +887,8 @@ avant de l'envoyer. Cela permet d'éviter les erreurs de contexte dépassé, don
 varie selon le modèle et la configuration.
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/v1/tokenize \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+curl -s https://gateway.example.com/v1/tokenize \
+  -H "Authorization: Bearer $EVA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-9b-q5_k_m",
@@ -839,8 +906,8 @@ import os
 def count_tokens(text: str, model: str = "qwen3.5-9b-q5_k_m") -> int:
     """Compte les tokens d'un texte selon le tokenizer exact du modèle cible."""
     r = httpx.post(
-        "https://llm.eva.univ-pau.fr/v1/tokenize",
-        headers={"Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}"},
+        "https://gateway.example.com/v1/tokenize",
+        headers={"Authorization": f"Bearer {os.environ['EVA_API_KEY']}"},
         json={"model": model, "content": text},
         timeout=10.0,
     )
@@ -863,8 +930,8 @@ else:
 Reconstruit du texte à partir d'une liste d'identifiants de tokens.
 
 ```bash
-curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
-  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+curl -s https://gateway.example.com/v1/detokenize \
+  -H "Authorization: Bearer $EVA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.5-9b-q5_k_m",
@@ -884,7 +951,13 @@ curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
 | `POST /v1/tokenize` | `content` (string) | `{"tokens": [...]}` | Compter les tokens avant envoi |
 | `POST /v1/detokenize` | `tokens` (array) | `{"content": "…"}` | Reconstruire du texte depuis des IDs |
 | `GET /v1/models` | — | OpenAI standard | Lister les modèles activés |
-| `GET /health` | — | JSON | État du service (sans authentification) |
+| `GET /v1/capacity` | — | JSON | État de la queue d'admission VRAM ([§2](#2-premier-test--curl)) |
+| `GET /health` | — | JSON | Liveness du service (sans authentification) |
+| `GET /ready` | — | JSON | Readiness — capacité à servir maintenant (sans authentification) |
+
+Tous ces chemins sont exposés sur l'URL publique. Aucun autre n'y répond : les
+routes d'administration sont restreintes au réseau campus par le reverse-proxy,
+et tout chemin non listé ici renvoie `404`.
 
 ---
 
@@ -892,7 +965,7 @@ curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
 
 LangChain est un framework Python très utilisé en recherche pour construire des
 pipelines NLP complexes : chaînes de traitement, agents, RAG. L'intégration avec
-le cluster EVA est immédiate — il suffit de renseigner l'URL de base et la clé.
+le service est immédiate — il suffit de renseigner l'URL de base et la clé.
 
 ### Requête simple
 
@@ -907,8 +980,8 @@ import os
 
 llm = ChatOpenAI(
     model="qwen3.5-9b-q5_k_m",
-    openai_api_base="https://llm.eva.univ-pau.fr/v1",
-    openai_api_key=os.environ["UPPA_LLM_KEY"],
+    openai_api_base="https://gateway.example.com/v1",
+    openai_api_key=os.environ["EVA_API_KEY"],
     temperature=0.7,
     max_tokens=2048,
     request_timeout=120,
@@ -926,7 +999,7 @@ print(response.content)
 
 Le RAG consiste à enrichir un prompt avec des extraits pertinents issus d'un corpus
 de documents, ce qui améliore considérablement la précision des réponses sur un domaine
-spécifique. L'exemple ci-dessous combine le LLM du cluster EVA avec des embeddings
+spécifique. L'exemple ci-dessous combine le LLM servi par la gateway avec des embeddings
 calculés localement (sans appel à un service externe).
 
 ```bash
@@ -940,11 +1013,11 @@ from langchain.chains import RetrievalQA
 from langchain_core.documents import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# LLM — servi par le cluster EVA
+# LLM — servi par la gateway
 llm = ChatOpenAI(
     model="qwen3.5-9b-q5_k_m",
-    openai_api_base="https://llm.eva.univ-pau.fr/v1",
-    openai_api_key=os.environ["UPPA_LLM_KEY"],
+    openai_api_base="https://gateway.example.com/v1",
+    openai_api_key=os.environ["EVA_API_KEY"],
     temperature=0.0,
 )
 
@@ -986,8 +1059,8 @@ npm install openai
 import OpenAI from 'openai';
 
 const client = new OpenAI({
-  baseURL: 'https://llm.eva.univ-pau.fr/v1',
-  apiKey: process.env.UPPA_LLM_KEY,
+  baseURL: 'https://gateway.example.com/v1',
+  apiKey: process.env.EVA_API_KEY,
   timeout: 120_000,  // 120 secondes
 });
 
@@ -1069,10 +1142,12 @@ import httpx
 
 # Option 1 — timeout long : le plus simple et le plus recommandé.
 # Le client attend silencieusement le chargement du modèle.
+# 330s couvre le plus lent des modèles activés (les modèles MoE demandent
+# jusqu'à ~310s à froid) ; le reverse-proxy, lui, laisse 900s.
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
-    timeout=150.0,
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
+    timeout=330.0,
 )
 response = client.chat.completions.create(
     model="qwen3.5-9b-q5_k_m",
@@ -1081,7 +1156,7 @@ response = client.chat.completions.create(
 
 # Option 2 — interroger /health en amont pour anticiper l'état du service.
 def get_service_status() -> dict:
-    r = httpx.get("https://llm.eva.univ-pau.fr/health", timeout=5)
+    r = httpx.get("https://gateway.example.com/health", timeout=5)
     return r.json()
 
 status = get_service_status()
@@ -1137,8 +1212,8 @@ from openai import (
 )
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,
     max_retries=0,
 )
@@ -1151,7 +1226,7 @@ try:
     print(response.choices[0].message.content)
 
 except AuthenticationError:
-    print("Erreur 401 : vérifiez votre clé API (variable UPPA_LLM_KEY).")
+    print("Erreur 401 : vérifiez votre clé API (variable EVA_API_KEY).")
     print("Contactez l'admin si vous pensez qu'elle a été révoquée.")
 
 except NotFoundError:
@@ -1177,10 +1252,10 @@ except APIStatusError as e:
         print(f"Erreur {e.status_code} : {e.message}")
 
 except APITimeoutError:
-    print("Timeout réseau — vérifiez votre connexion au réseau UPPA.")
+    print("Timeout réseau — vérifiez votre connexion au service.")
 
 except APIConnectionError:
-    print("Impossible de joindre llm.eva.univ-pau.fr — êtes-vous sur le réseau UPPA ?")
+    print("Impossible de joindre la gateway — est-elle démarrée et accessible ?")
 ```
 
 ### Erreur 401 — clé invalide
@@ -1189,14 +1264,14 @@ Trois vérifications à effectuer dans l'ordre :
 
 ```bash
 # 1. La variable d'environnement est-elle définie ?
-echo $UPPA_LLM_KEY
+echo $EVA_API_KEY
 
 # 2. Le mot-clé "Bearer" est-il présent dans le header ?
-curl -H "Authorization: Bearer $UPPA_LLM_KEY" …
+curl -H "Authorization: Bearer $EVA_API_KEY" …
 #                         ↑ obligatoire
 
 # 3. Y a-t-il des espaces ou caractères invisibles dans la clé ?
-echo -n "$UPPA_LLM_KEY" | cat -A
+echo -n "$EVA_API_KEY" | cat -A
 ```
 
 ### Erreur 429 — limite de débit
@@ -1287,8 +1362,8 @@ from pathlib import Path
 from openai import OpenAI, RateLimitError
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=60.0,
 )
 
@@ -1347,8 +1422,8 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,
 )
 
@@ -1394,8 +1469,8 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,
 )
 
@@ -1463,8 +1538,8 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.eva.univ-pau.fr/v1",
-    api_key=os.environ["UPPA_LLM_KEY"],
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
     timeout=120.0,
 )
 
@@ -1498,7 +1573,7 @@ Question : {question}"""
 
 
 docs = [
-    "Le projet EVARuntime est une gateway d'inférence LLM développée pour l'UPPA…",
+    "Le projet EVARuntime est une gateway d'inférence LLM open source…",
     "Le GPU L40S dispose de 48 Go de VRAM et d'une architecture Ada Lovelace…",
 ]
 
@@ -1512,7 +1587,7 @@ print(answer)
 
 | Problème | Démarche recommandée |
 |---|---|
-| Demande de clé API | Contacter Mohamad El Akhal El Bouzidi ou Benjamin Mascret |
+| Demande de clé API | Voir [Obtenir une clé API](#1-obtenir-une-clé-api) |
 | Clé invalide / révoquée (401) | Vérifier la variable d'environnement ; contacter l'admin |
 | Modèle inconnu (404) | Vérifier les IDs disponibles via `GET /v1/models` |
 | Quota dépassé (429) | Espacer les requêtes ; demander une augmentation si nécessaire |

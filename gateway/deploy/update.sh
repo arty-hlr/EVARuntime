@@ -13,10 +13,27 @@
 # systemd principal, timer de sauvegarde SQLite et son script. La rotation
 # journald est installée si absente (jamais écrasée). Le timer de sauvegarde
 # n'est (ré)activé automatiquement que s'il n'a jamais été installé — un timer
-# volontairement désactivé par l'opérateur est laissé tel quel.
+# volontairement désactivé par l'opérateur est laissé tel quel. Un timer activé
+# mais resté INACTIF (défaut OPS-008 des versions antérieures) est en revanche
+# armé, sans quoi aucune sauvegarde ne tourne jusqu'au prochain reboot.
 #
 # Il ne régénère jamais un secret existant et ne remplace jamais nodes.yaml.
 # Pour mettre à jour aussi nginx : ajouter --nginx en argument.
+#
+# ── Gate de validation (COR-006) ─────────────────────────────────────────────
+# Une version n'est conservée que si elle SERT réellement, pas seulement si elle
+# répond. Trois contrôles se succèdent :
+#
+#   1. `evaruntime doctor` AVANT la bascule, sur le venv neuf et le code déjà
+#      synchronisé : un hôte inapte est détecté sans jamais arrêter le service.
+#   2. `/ready` après le redémarrage (readiness structurelle stricte, COR-005).
+#   3. `deploy/smoke_test.sh` : recette du premier token de bout en bout sur le
+#      vrai chemin public, puis `doctor` une seconde fois.
+#
+# L'ancienne version (code, venv, unité, mode) reste conservée jusqu'à la fin de
+# la recette : tout échec fonctionnel la restaure. Une régression de TTFT est en
+# revanche une ALERTE et ne provoque JAMAIS de rollback, sauf si l'opérateur
+# l'exige explicitement avec --ttft-gate.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -32,19 +49,93 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 section() { echo -e "\n${CYAN}▶ $*${NC}"; }
 
+# ── Démarrages systemd (COR-017) ──────────────────────────────────────────────
+# Une unité qui a échoué plusieurs fois de suite atteint son start-limit :
+# systemd refuse alors TOUT démarrage (« Start request repeated too quickly »)
+# tant que le compteur n'est pas remis à zéro. C'est exactement ce qui a laissé
+# la gateway à terre après un rollback de mode. `reset-failed` remet ce compteur
+# à zéro; sur une unité saine c'est un no-op, donc sans risque avant chaque
+# démarrage. Toute (re)mise en marche d'une unité passe par ces fonctions.
+systemctl_start() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl start "$unit"
+}
+
+systemctl_restart() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl restart "$unit"
+}
+
+# `enable --now` = enable + start : il arme réellement le timer (OPS-008).
+systemctl_enable_now() {
+    local unit="$1"
+    systemctl reset-failed "$unit" 2>/dev/null || true
+    systemctl enable --now "$unit"
+}
+
+# Le service n'a pas pu être remis en marche alors que tout ce qui pouvait être
+# restauré l'a déjà été : c'est une COUPURE de service, pas un avertissement.
+# Message sans ambiguïté, commande de rétablissement exacte, sortie non nulle.
+service_down() {
+    echo "" >&2
+    echo -e "${RED}[INDISPONIBILITÉ]${NC} $*" >&2
+    echo -e "${RED}[INDISPONIBILITÉ]${NC} llm-gateway n'a PAS redémarré : la gateway est À TERRE." >&2
+    echo "  Rétablissement manuel immédiat :" >&2
+    echo "    sudo systemctl reset-failed llm-gateway" >&2
+    echo "    sudo systemctl start llm-gateway" >&2
+    echo "    sudo systemctl status llm-gateway --no-pager" >&2
+    echo "    sudo journalctl -u llm-gateway -n 100 --no-pager" >&2
+    exit 1
+}
+
 # SCRIPT_DIR = gateway/ (un niveau au-dessus de deploy/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=deploy-mode-lib.sh
 source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
+# shellcheck source=nginx-lib.sh
+source "$SCRIPT_DIR/deploy/nginx-lib.sh"
+# shellcheck source=venv-retention-lib.sh
+source "$SCRIPT_DIR/deploy/venv-retention-lib.sh"
+# shellcheck source=env-template-lib.sh
+source "$SCRIPT_DIR/deploy/env-template-lib.sh"
+# shellcheck source=gpu-preflight-lib.sh
+source "$SCRIPT_DIR/deploy/gpu-preflight-lib.sh"
+# shellcheck source=code-layout-lib.sh
+source "$SCRIPT_DIR/deploy/code-layout-lib.sh"
 
 usage() {
     cat <<EOF
 Usage: $0 [--mode local|cluster] [--cluster] [--allow-mode-change] [--nginx] [--dry-run]
+          [--smoke-base-url URL] [--smoke-model ID] [--ttft-threshold-ms N] [--ttft-gate]
+          [--skip-smoke-test] [--skip-doctor]
 
 Sans --mode, le mode présent dans /etc/llm-gateway/env est conservé (local si
 la clé est absente). --cluster reste un alias de --mode cluster.
 Une migration exige --allow-mode-change. --dry-run ne modifie ni le dépôt ni l'hôte.
+
+Validation de la version déployée (COR-006) :
+  --smoke-base-url URL   Chemin public exercé par la recette du premier token.
+                         Le viser sur nginx (https://…) couvre aussi TLS et le
+                         non-buffering SSE du reverse-proxy. Défaut : la gateway
+                         en direct. (env : EVA_SMOKE_BASE_URL)
+  --smoke-model ID       Modèle exercé. Défaut : DEFAULT_MODEL_ID, sinon le plus
+                         petit modèle activé.        (env : EVA_SMOKE_MODEL)
+  --ttft-threshold-ms N  Seuil d'ALERTE sur le TTFT. 0 = désactivé (défaut).
+                         (env : EVA_SMOKE_TTFT_THRESHOLD_MS)
+  --ttft-gate            Transforme le dépassement du seuil en cause de rollback.
+                         Sans cette option, un TTFT lent est signalé et la version
+                         reste déployée.             (env : EVA_SMOKE_TTFT_GATE=1)
+  --skip-smoke-test      DANGEREUX — désactive la recette du premier token : la
+                         version est alors validée sur /ready seul, comme avant
+                         COR-006. À réserver à un dépannage.
+  --skip-doctor          Désactive les préflights doctor avant et après bascule.
+
+Après une mise à jour validée, les venvs de release sont purgés en ne conservant
+que les 2 plus récents (l'actif et le précédent, pour un retour arrière manuel).
+EVA_GATEWAY_VENV_KEEP=N règle ce nombre; l'actif n'est jamais supprimé.
 EOF
 }
 
@@ -53,8 +144,27 @@ REQUESTED_MODE=""
 MODE_WAS_EXPLICIT=false
 ALLOW_MODE_CHANGE=false
 DRY_RUN=false
+RUN_SMOKE_TEST=true
+RUN_DOCTOR=true
+SMOKE_BASE_URL="${EVA_SMOKE_BASE_URL:-}"
+SMOKE_MODEL="${EVA_SMOKE_MODEL:-}"
+TTFT_THRESHOLD_MS="${EVA_SMOKE_TTFT_THRESHOLD_MS:-0}"
+TTFT_GATE=false
+[[ "${EVA_SMOKE_TTFT_GATE:-0}" != "1" ]] || TTFT_GATE=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --smoke-base-url)
+            [[ -n "${2:-}" ]] || { echo "--smoke-base-url requiert une URL" >&2; exit 2; }
+            SMOKE_BASE_URL="$2"; shift 2 ;;
+        --smoke-model)
+            [[ -n "${2:-}" ]] || { echo "--smoke-model requiert un identifiant" >&2; exit 2; }
+            SMOKE_MODEL="$2"; shift 2 ;;
+        --ttft-threshold-ms)
+            [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--ttft-threshold-ms requiert un entier" >&2; exit 2; }
+            TTFT_THRESHOLD_MS="$2"; shift 2 ;;
+        --ttft-gate)       TTFT_GATE=true; shift ;;
+        --skip-smoke-test) RUN_SMOKE_TEST=false; shift ;;
+        --skip-doctor)     RUN_DOCTOR=false; shift ;;
         --mode)
             [[ $# -ge 2 ]] || { echo "--mode requiert local ou cluster" >&2; usage; exit 2; }
             deploy_validate_mode "$2" || { echo "Mode invalide : $2" >&2; usage; exit 2; }
@@ -76,7 +186,25 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+[[ "$TTFT_THRESHOLD_MS" =~ ^[0-9]+$ ]] || \
+    { echo "Seuil TTFT invalide : $TTFT_THRESHOLD_MS (EVA_SMOKE_TTFT_THRESHOLD_MS)" >&2; exit 2; }
+
+SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
+NGINX_SITE="/etc/nginx/sites-available/llm-gateway"
+
 # Répertoires
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Même convention déclarative que `install.sh` : source unique, dérivée par
+# `gateway/tests/test_deploy_required_commands.py` et documentée en
+# `docs/deployment.md` §1. Aucun `command -v <nom littéral>` ailleurs.
+UPDATE_REQUIRED_COMMANDS=(awk chmod chown cp curl find git mkdir mktemp mv systemctl)
+# Mode local uniquement : l'orchestrateur cluster n'a pas de GPU.
+UPDATE_REQUIRED_COMMANDS_LOCAL=(nvidia-smi)
+# Exigée seulement quand la recette du premier token est jouée (COR-006).
+UPDATE_REQUIRED_COMMANDS_SMOKE=(python3)
+# Absentes, ces commandes désactivent une fonction sans bloquer la mise à jour.
+UPDATE_OPTIONAL_COMMANDS=(nginx sqlite3)
+
 INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
 DATA_DIR="${LLM_GATEWAY_DATA_DIR:-/var/lib/llm-gateway}"
 CONFIG_DIR="${LLM_GATEWAY_CONFIG_DIR:-/etc/llm-gateway}"
@@ -84,6 +212,12 @@ DB_PATH="$DATA_DIR/gateway.db"
 BACKUP_DIR="$DATA_DIR/backups"
 SERVICE_USER="llmservice"
 CONFIG_FILE="$CONFIG_DIR/env"
+# Rétention des venvs de release (OPS-010) : la release active + la précédente,
+# pour qu'un retour arrière manuel reste possible. Les plus anciennes sont
+# purgées une fois la version validée. Voir deploy/venv-retention-lib.sh.
+VENV_KEEP_RELEASES="${EVA_GATEWAY_VENV_KEEP:-2}"
+[[ "$VENV_KEEP_RELEASES" =~ ^[1-9][0-9]*$ ]] || \
+    error "EVA_GATEWAY_VENV_KEEP doit être un entier >= 1 (reçu : '$VENV_KEEP_RELEASES')."
 CURRENT_MODE="$(deploy_env_value "$CONFIG_FILE" CLUSTER_MODE)"
 EFFECTIVE_MODE="$(deploy_select_mode "$CONFIG_FILE" "$REQUESTED_MODE")" || exit 1
 PREVIOUS_MODE="${CURRENT_MODE:-local}"
@@ -98,9 +232,32 @@ echo "  Mode demandé : ${REQUESTED_MODE:-<auto>}"
 echo "  Mode existant  : ${CURRENT_MODE:-<absent; local par défaut>}"
 echo "  Mode effectif  : $EFFECTIVE_MODE"
 echo "  Conservation   : env, models.yaml, nodes.yaml, secrets, DB et GGUF"
+if [[ "$RUN_SMOKE_TEST" == true ]]; then
+    echo "  Validation     : doctor (avant/après) + /ready + recette du premier token"
+    echo "  Chemin exercé  : ${SMOKE_BASE_URL:-<gateway en direct>}"
+    if [[ "$TTFT_THRESHOLD_MS" -gt 0 ]]; then
+        if [[ "$TTFT_GATE" == true ]]; then
+            echo "  Seuil TTFT     : ${TTFT_THRESHOLD_MS} ms — GATE (dépassement = rollback)"
+        else
+            echo "  Seuil TTFT     : ${TTFT_THRESHOLD_MS} ms — alerte seulement (aucun rollback)"
+        fi
+    else
+        echo "  Seuil TTFT     : désactivé (mesure rapportée sans gate)"
+    fi
+else
+    echo "  Validation     : /ready SEUL — recette du premier token désactivée (--skip-smoke-test)"
+fi
 
 if [[ "$DRY_RUN" == true ]]; then
     echo "  Action         : aucune (--dry-run; pas de git pull, pip, systemd ou écriture)"
+    echo "  Rétention venv : $VENV_KEEP_RELEASES releases conservées (actif + précédents)"
+    # La purge n'a lieu qu'après une version VALIDÉE. On annonce ce qu'elle
+    # emporterait dans l'état actuel du disque, sans rien supprimer : la release
+    # neuve n'existant pas encore, la liste est majorante d'une place.
+    while IFS= read -r prunable_venv; do
+        [[ -n "$prunable_venv" ]] || continue
+        echo "                   serait purgé : $prunable_venv"
+    done < <(gateway_venv_prunable_releases "$INSTALL_DIR" "$INSTALL_DIR/venv" "$VENV_KEEP_RELEASES")
     if [[ -n "$CURRENT_MODE" && "$CURRENT_MODE" != "$EFFECTIVE_MODE" ]]; then
         echo "  Migration      : $CURRENT_MODE → $EFFECTIVE_MODE; l'exécution exigera --allow-mode-change"
     fi
@@ -113,16 +270,53 @@ fi
 [[ -d "$INSTALL_DIR" ]] || error "$INSTALL_DIR n'existe pas — lancez d'abord install.sh"
 [[ -f "$INSTALL_DIR/venv/bin/python" ]] || error "venv introuvable — lancez d'abord install.sh"
 [[ -f "$CONFIG_FILE" ]] || error "Configuration introuvable : $CONFIG_FILE"
-for required in awk chmod chown cp curl find git mkdir mktemp mv systemctl; do
-    command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
+required=()
+required+=("${UPDATE_REQUIRED_COMMANDS[@]}")
+[[ "$RUN_SMOKE_TEST" != true ]] || required+=("${UPDATE_REQUIRED_COMMANDS_SMOKE[@]}")
+for command_name in "${required[@]}"; do
+    command -v "$command_name" &>/dev/null || \
+        error "Préflight : commande requise introuvable : $command_name (cf. docs/deployment.md §1)"
 done
+UPDATE_ALLOW_NO_GPU="$(deploy_env_value "$CONFIG_FILE" "$GPU_WAIVER_ENV_KEY")"
+UPDATE_GPU_VERDICT="$(
+    deploy_gpu_verdict \
+        "$EFFECTIVE_MODE" "$UPDATE_ALLOW_NO_GPU" "${UPDATE_REQUIRED_COMMANDS_LOCAL[0]}"
+)" || error "Préflight local : hôte sans GPU et absence non assumée dans $CONFIG_FILE."
+if [[ "$UPDATE_GPU_VERDICT" == "waived" ]]; then
+    warn "Hôte SANS GPU : dérogation persistée respectée ($GPU_WAIVER_ENV_KEY=true)."
+elif [[ "$UPDATE_GPU_VERDICT" == "detected" ]] && \
+        deploy_gpu_waiver_declared "$UPDATE_ALLOW_NO_GPU"; then
+    warn "GPU détecté mais $GPU_WAIVER_ENV_KEY=true subsiste : doctor signalera cette renonciation périmée."
+fi
+if [[ "$RUN_SMOKE_TEST" == true ]]; then
+    [[ -f "$SMOKE_TEST_SCRIPT" ]] || \
+        error "Préflight : recette du premier token introuvable ($SMOKE_TEST_SCRIPT). Utilisez --skip-smoke-test en connaissance de cause."
+fi
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité orchestrateur introuvable"
 else
-    command -v nvidia-smi &>/dev/null || error "Préflight local : nvidia-smi introuvable"
     LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
-    [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
+    [[ -x "${LLAMA_BIN:-/opt/llama.cpp/current/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/opt/llama.cpp/current/llama-server})"
 fi
+# ── Durcissements absents d'un environnement antérieur à SEC-002 ──────────────
+# `update.sh` ne régénère JAMAIS /etc/llm-gateway/env : un hôte installé avant
+# SEC-002 n'aurait donc jamais ces clés. Elles ne sont PAS ajoutées d'autorité —
+# écrire « CORS_ALLOW_ORIGINS= » sur une installation qui sert un client
+# navigateur la casserait en silence, au milieu d'une mise à jour. On signale,
+# l'opérateur tranche.
+MISSING_HARDENING=()
+for hardening_key in "${DEPLOY_HARDENING_KEYS[@]}"; do
+    if ! grep -qE "^[[:space:]]*${hardening_key}=" "$CONFIG_FILE"; then
+        MISSING_HARDENING+=("$hardening_key")
+    fi
+done
+if (( ${#MISSING_HARDENING[@]} > 0 )); then
+    warn "Durcissements SEC-002 absents de $CONFIG_FILE : ${MISSING_HARDENING[*]}"
+    warn "→ Cette mise à jour ne les ajoute pas : les poser sans vous demander"
+    warn "  pourrait couper un client navigateur ou refuser le démarrage."
+    warn "→ Voir docs/deployment.md §5, puis « evaruntime doctor » avant de démarrer."
+fi
+
 info "Préflight validé; mise à jour en mode $EFFECTIVE_MODE."
 
 prepare_model_registry() {
@@ -171,17 +365,21 @@ restore_previous_service_unit() {
 
 restore_code_snapshot() {
     local snapshot="$1"
-    cp "$snapshot"/*.py "$INSTALL_DIR/"
-    cp "$snapshot/requirements.txt" "$INSTALL_DIR/"
-    rm -rf "$INSTALL_DIR/cluster" "$INSTALL_DIR/static"
-    [[ ! -d "$snapshot/cluster" ]] || cp -a "$snapshot/cluster" "$INSTALL_DIR/cluster"
+    deploy_restore_gateway_code "$snapshot" "$INSTALL_DIR"
+    rm -rf "$INSTALL_DIR/static"
     [[ ! -d "$snapshot/static" ]] || cp -a "$snapshot/static" "$INSTALL_DIR/static"
-    rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
-    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
+    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py \
+        "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
     [[ ! -d "$INSTALL_DIR/cluster" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+    [[ ! -d "$INSTALL_DIR/bootstrap" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/bootstrap"
     [[ ! -d "$INSTALL_DIR/static" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/static"
     chmod 640 "$INSTALL_DIR"/*.py
-    chmod 644 "$INSTALL_DIR/requirements.txt"
+    [[ ! -d "$INSTALL_DIR/cluster" ]] || chmod 750 "$INSTALL_DIR/cluster"
+    [[ ! -d "$INSTALL_DIR/cluster" ]] || chmod 640 "$INSTALL_DIR/cluster"/*.py
+    [[ ! -d "$INSTALL_DIR/bootstrap" ]] || chmod 750 "$INSTALL_DIR/bootstrap"
+    [[ ! -d "$INSTALL_DIR/bootstrap" ]] || \
+        chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
+    chmod 644 "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 }
 
 VENV_SWITCHED=false
@@ -213,7 +411,7 @@ rollback_venv() {
 }
 
 rollback_failed_transaction() {
-    local exit_code="$1"
+    local exit_code="$1" restart_failed=false
     [[ "$TRANSACTION_ARMED" == true ]] || return "$exit_code"
 
     trap - ERR
@@ -226,11 +424,123 @@ rollback_failed_transaction() {
     fi
     restore_previous_service_unit "${PREVIOUS_MODE:-local}"
     systemctl daemon-reload
+    # `set +e` est actif : on RESTAURE d'abord tout ce qui peut l'être, on relève
+    # l'échec de démarrage seulement ensuite (COR-017). L'inverse interromprait
+    # le rollback à mi-chemin.
     if [[ "$SERVICE_RESTART_STARTED" == true ]]; then
-        systemctl start llm-gateway
+        systemctl_start llm-gateway || restart_failed=true
     fi
     warn "Code, venv, mode et unité précédents restaurés. Snapshot : $CODE_SNAPSHOT"
+    if [[ "$restart_failed" == true ]]; then
+        service_down "Rollback transactionnel terminé, mais le redémarrage du service a ÉCHOUÉ."
+    fi
     exit "$exit_code"
+}
+
+# ── Gate de validation (COR-006) ──────────────────────────────────────────────
+
+# `evaruntime doctor` (AUT-012). Exit codes : 0 conforme, 1 échec bloquant,
+# 2 erreur d'usage CLI, 3 avertissements seulement, 4 erreur interne de doctor.
+# 0 ET 3 valent succès : le défaut nginx COR-009, par exemple, est signalé en
+# avertissement et ne doit pas empêcher un déploiement par ailleurs sain.
+# --verify-hashes n'est JAMAIS utilisé ici : il relit intégralement les GGUF,
+# soit plusieurs centaines de Go à chaque mise à jour.
+run_doctor() {
+    local python_bin="$1" label="$2" rc=0
+    [[ "$RUN_DOCTOR" == true ]] || { info "doctor ($label) ignoré (--skip-doctor)."; return 0; }
+    [[ -x "$python_bin" ]] || { warn "doctor ($label) : interpréteur introuvable ($python_bin) — contrôle ignoré."; return 0; }
+    [[ -f "$INSTALL_DIR/cli.py" ]] || { warn "doctor ($label) : cli.py introuvable — contrôle ignoré."; return 0; }
+
+    set +e
+    "$python_bin" "$INSTALL_DIR/cli.py" doctor \
+        --env-file "$CONFIG_FILE" \
+        --nginx-conf "$NGINX_SITE" \
+        --systemd-unit /etc/systemd/system/llm-gateway.service
+    rc=$?
+    set -e
+
+    case "$rc" in
+        0) info "doctor ($label) : hôte conforme."; return 0 ;;
+        3) warn "doctor ($label) : avertissements seulement (exit 3) — la mise à jour continue."; return 0 ;;
+        *) warn "doctor ($label) : échec bloquant (exit $rc)."; return 1 ;;
+    esac
+}
+
+# Recette du premier token. Rend l'exit code du script : 0 succès, 1 échec
+# fonctionnel, 3 préflight, 4 seuil TTFT (uniquement si --ttft-gate), 5 identité
+# éphémère résiduelle.
+run_smoke_test() {
+    local rc=0
+    local args=(--env-file "$CONFIG_FILE")
+    [[ -z "$SMOKE_BASE_URL" ]] || args+=(--base-url "$SMOKE_BASE_URL")
+    [[ -z "$SMOKE_MODEL" ]]    || args+=(--model "$SMOKE_MODEL")
+    [[ "$TTFT_THRESHOLD_MS" -le 0 ]] || args+=(--ttft-threshold-ms "$TTFT_THRESHOLD_MS")
+    [[ "$TTFT_GATE" != true ]] || args+=(--fail-on-ttft)
+
+    set +e
+    bash "$SMOKE_TEST_SCRIPT" "${args[@]}"
+    rc=$?
+    set -e
+    return "$rc"
+}
+
+# Restauration de la version précédente après un redémarrage. Extraite pour être
+# partagée par les deux causes de rollback post-bascule : readiness jamais
+# atteinte, et recette du premier token en échec. Ne rend jamais la main.
+rollback_deployed_release() {
+    local cause="$1" attempt
+
+    warn "$cause"
+
+    if [[ "$PREVIOUS_MODE" != "$EFFECTIVE_MODE" ]]; then
+        section "ROLLBACK  Mode $EFFECTIVE_MODE → $PREVIOUS_MODE"
+        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
+        rollback_venv
+        restore_code_snapshot "$CODE_SNAPSHOT"
+        restore_previous_service_unit "$PREVIOUS_MODE"
+        systemctl daemon-reload
+        systemctl stop llm-gateway || true
+        # Mode, code, venv et unité sont restaurés : plus rien n'est en attente.
+        # Un échec de démarrage ici est une indisponibilité, pas un avertissement.
+        systemctl_start llm-gateway || \
+            service_down "Rollback du mode $EFFECTIVE_MODE → $PREVIOUS_MODE : démarrage refusé par systemd."
+        for attempt in $(seq 1 20); do
+            sleep 2
+            if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+                error "Migration de mode échouée; le mode $PREVIOUS_MODE a été restauré et le service est sain."
+            fi
+        done
+        error "Migration de mode et rollback ont échoué. Intervention requise : journalctl -u llm-gateway -n 100"
+    fi
+
+    section "ROLLBACK  Restauration du snapshot déployé"
+    rollback_venv
+    restore_code_snapshot "$CODE_SNAPSHOT"
+    restore_previous_service_unit "$EFFECTIVE_MODE"
+    systemctl daemon-reload
+    systemctl stop llm-gateway || true
+    # Snapshot, venv et unité sont restaurés : plus rien n'est en attente.
+    # Un échec de démarrage ici est une indisponibilité, pas un avertissement.
+    systemctl_start llm-gateway || \
+        service_down "Rollback vers $CODE_SNAPSHOT : démarrage refusé par systemd."
+
+    ROLLBACK_OK=false
+    for attempt in $(seq 1 20); do
+        sleep 2
+        if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+            ROLLBACK_OK=true
+            break
+        fi
+    done
+
+    if [[ "$ROLLBACK_OK" == true ]]; then
+        warn "Rollback réussi depuis $CODE_SNAPSHOT; le checkout Git est resté intact."
+        warn "La version ${AFTER:0:8} n'est pas déployée; investiguez avant de réessayer."
+        [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update : $BACKUP_FILE"
+        exit 1
+    else
+        error "Rollback ÉCHOUÉ. Intervention requise : sudo journalctl -u llm-gateway -n 100 --no-pager"
+    fi
 }
 
 echo ""
@@ -265,9 +575,7 @@ fi
 # checkout Git de l'opérateur et ne le laisse pas en detached HEAD.
 CODE_SNAPSHOT="$BACKUP_DIR/code-pre-update-$(date +%Y%m%d-%H%M%S)-${BEFORE:0:8}"
 mkdir -p "$CODE_SNAPSHOT"
-cp "$INSTALL_DIR"/*.py "$CODE_SNAPSHOT/"
-cp "$INSTALL_DIR/requirements.txt" "$CODE_SNAPSHOT/"
-[[ ! -d "$INSTALL_DIR/cluster" ]] || cp -a "$INSTALL_DIR/cluster" "$CODE_SNAPSHOT/cluster"
+deploy_snapshot_gateway_code "$INSTALL_DIR" "$CODE_SNAPSHOT"
 [[ ! -d "$INSTALL_DIR/static" ]] || cp -a "$INSTALL_DIR/static" "$CODE_SNAPSHOT/static"
 UNIT_SNAPSHOT="$CODE_SNAPSHOT/llm-gateway.service"
 [[ ! -f /etc/systemd/system/llm-gateway.service ]] || cp -a /etc/systemd/system/llm-gateway.service "$UNIT_SNAPSHOT"
@@ -279,8 +587,8 @@ trap 'rollback_failed_transaction $?' ERR
 section "Préparation transactionnelle des dépendances Python"
 STAGED_VENV="$INSTALL_DIR/venv-release-${AFTER:0:12}-$(date +%Y%m%d%H%M%S)"
 "$INSTALL_DIR/venv/bin/python" -m venv "$STAGED_VENV"
-"$STAGED_VENV/bin/pip" install --upgrade pip --quiet
-"$STAGED_VENV/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" --quiet
+"$STAGED_VENV/bin/pip" install --require-hashes \
+    -r "$SCRIPT_DIR/requirements.lock" --quiet
 "$STAGED_VENV/bin/pip" check
 info "Venv neuf validé : $STAGED_VENV (l'ancien reste actif jusqu'au redémarrage)."
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
@@ -306,23 +614,18 @@ prepare_model_registry
 
 section "2/5  Synchronisation du code source"
 CODE_MUTATED=true
-cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
+deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"
 
-# Package cluster/ — requis en CLUSTER_MODE=cluster (importé par model_manager)
-mkdir -p "$INSTALL_DIR/cluster"
-cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
-
-# Purger le bytecode obsolète (modules renommés ou supprimés entre versions)
-rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
-
-chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
+chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py \
+    "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/bootstrap"
 chmod 640 "$INSTALL_DIR"/*.py "$INSTALL_DIR/cluster"/*.py
-chmod 750 "$INSTALL_DIR/cluster"
-chmod 644 "$INSTALL_DIR/requirements.txt"
+chmod 640 "$INSTALL_DIR/bootstrap"/*.py "$INSTALL_DIR/bootstrap/catalog.yaml"
+chmod 750 "$INSTALL_DIR/cluster" "$INSTALL_DIR/bootstrap"
+chmod 644 "$INSTALL_DIR/requirements.txt" "$INSTALL_DIR/requirements.lock"
 
-info "Fichiers Python copiés (gateway + cluster/)."
+info "Fichiers Python copiés (gateway + cluster/ + bootstrap/)."
 
 # ── 3. Synchronisation des fichiers statiques ─────────────────────────────────
 
@@ -359,7 +662,9 @@ info "Mode $EFFECTIVE_MODE activé."
 if [[ "$UPDATE_NGINX" == true ]]; then
     section "4b. Mise à jour nginx"
     if command -v nginx &>/dev/null; then
-        cp "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+        # Même rendu conditionnel qu'à l'installation (OPS-009).
+        nginx_render_conf "$SCRIPT_DIR/deploy/nginx.conf" /etc/nginx/sites-available/llm-gateway
+        info "nginx ${NGINX_DETECTED_VERSION:-?} — HTTP/2 : ${NGINX_HTTP2_FORM}"
         if nginx -t 2>/dev/null; then
             nginx -s reload
             info "nginx rechargé."
@@ -414,17 +719,35 @@ section "4d. Timer de sauvegarde + rotation journald"
 # État AVANT copie : distingue « jamais installé » de « désactivé volontairement ».
 BACKUP_TIMER_STATE="$(systemctl is-enabled llm-gateway-backup.timer 2>/dev/null || true)"
 
-mkdir -p "$INSTALL_DIR/deploy"
-cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+# Même jeu que sur une installation neuve : recette du premier token,
+# bibliothèques qu'elle source et modèle de matrice runtime compris.
+deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
-chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh" \
+          "$INSTALL_DIR/deploy/smoke_test.sh"
+chmod 640 "$INSTALL_DIR/deploy/deploy-mode-lib.sh" \
+          "$INSTALL_DIR/deploy/nginx-lib.sh" \
+          "$INSTALL_DIR/deploy/runtime-variants.yaml.example"
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
 cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
 systemctl daemon-reload
 
+# Un timer de sauvegarde récalcitrant ne doit jamais faire échouer — ni pire,
+# faire rollbacker — une mise à jour par ailleurs saine : les deux armements
+# ci-dessous sont volontairement non fatals et se contentent d'un avertissement.
 case "$BACKUP_TIMER_STATE" in
     enabled)
-        info "Timer de sauvegarde déjà actif — unités rafraîchies."
+        # OPS-008 : les versions antérieures faisaient `enable` sans `--now`. Le
+        # timer est alors `enabled` mais `inactive` : absent de `list-timers`, il
+        # ne sauvegarde rien jusqu'au prochain reboot. On répare cet état ici.
+        if systemctl is-active --quiet llm-gateway-backup.timer; then
+            info "Timer de sauvegarde déjà armé — unités rafraîchies."
+        elif systemctl_start llm-gateway-backup.timer; then
+            info "Timer de sauvegarde activé mais inactif — armé (03:15, rétention 14 j)."
+        else
+            warn "Timer de sauvegarde activé mais INACTIF, et son démarrage a échoué."
+            warn "  sudo systemctl start llm-gateway-backup.timer"
+        fi
         ;;
     disabled|masked)
         warn "Timer de sauvegarde présent mais désactivé (choix opérateur) — laissé tel quel."
@@ -432,12 +755,17 @@ case "$BACKUP_TIMER_STATE" in
         ;;
     *)
         # Vide/introuvable = jamais installé (première mise à jour depuis cette version).
-        if command -v sqlite3 &>/dev/null; then
-            systemctl enable llm-gateway-backup.timer
-            info "Timer de sauvegarde quotidienne activé (03:15, rétention 14 j)."
-        else
-            warn "sqlite3 introuvable — timer copié mais NON activé."
+        # `--now` : sans lui le timer resterait inactive jusqu'au prochain reboot.
+        # La base existe déjà à ce stade (elle vient même d'être sauvegardée en
+        # 4c), donc un éventuel rattrapage `Persistent=true` est sans danger.
+        if ! command -v sqlite3 &>/dev/null; then
+            warn "sqlite3 introuvable — timer copié mais NON armé."
             warn "  apt install sqlite3 && sudo systemctl enable --now llm-gateway-backup.timer"
+        elif systemctl_enable_now llm-gateway-backup.timer; then
+            info "Timer de sauvegarde quotidienne armé (03:15, rétention 14 j)."
+        else
+            warn "Timer de sauvegarde NON armé — vérifiez puis relancez :"
+            warn "  sudo systemctl enable --now llm-gateway-backup.timer"
         fi
         ;;
 esac
@@ -447,10 +775,23 @@ JOURNALD_DROPIN="/etc/systemd/journald.conf.d/llm-gateway.conf"
 if [[ ! -f "$JOURNALD_DROPIN" ]]; then
     mkdir -p /etc/systemd/journald.conf.d
     cp "$SCRIPT_DIR/deploy/journald-llm-gateway.conf" "$JOURNALD_DROPIN"
-    systemctl restart systemd-journald
+    systemctl_restart systemd-journald
     info "Rotation journald installée (SystemMaxUse=500M, rétention 30 j)."
 else
     info "Rotation journald déjà présente — conservée ($JOURNALD_DROPIN)."
+fi
+
+# ── 4e. doctor AVANT la bascule ──────────────────────────────────────────────
+# Le service tourne encore l'ANCIEN code : un hôte inapte est détecté sans
+# aucune coupure. On sonde avec le venv neuf et le code déjà synchronisé, donc
+# exactement l'exécutable qui servira après la bascule. Un échec bloquant
+# déclenche le rollback transactionnel : le service n'est jamais arrêté.
+
+section "4e. Préflight doctor (avant bascule)"
+if ! run_doctor "$STAGED_VENV/bin/python" "avant bascule"; then
+    warn "L'hôte ne satisfait pas les préflights de la version ${AFTER:0:8}."
+    warn "Le service n'a pas été arrêté; le code précédent est restauré."
+    rollback_failed_transaction 1
 fi
 
 # ── 5. Mise à jour du service systemd + redémarrage ──────────────────────────
@@ -468,7 +809,10 @@ systemctl stop llm-gateway || true
 activate_staged_venv
 
 info "Démarrage du service…"
-systemctl start llm-gateway || warn "systemctl start a échoué; la readiness déclenchera le rollback."
+# Chemin nominal : l'échec reste DÉLIBÉRÉMENT non fatal. La sonde de readiness
+# ci-dessous enchaîne sur `rollback_deployed_release`, qui restaure la version
+# précédente — un `error` ici court-circuiterait ce rollback.
+systemctl_start llm-gateway || warn "Le démarrage a échoué; la readiness déclenchera le rollback."
 
 # ── Attente du health check ───────────────────────────────────────────────────
 
@@ -484,64 +828,96 @@ for i in $(seq 1 20); do
 done
 echo ""
 
+TRANSACTION_ARMED=false
+trap - ERR
+
 if [[ "$HEALTHY" == true ]]; then
     HEALTH=$(curl -s http://127.0.0.1:8000/ready)
     info "Service prêt : $HEALTH"
 else
-    TRANSACTION_ARMED=false
-    trap - ERR
     # ── Rollback automatique ──────────────────────────────────────────────────
     # Le service n'est pas devenu ready. Code, venv, unité et mode reviennent au
     # snapshot précédent; la DB n'est jamais restaurée sans arbitrage humain.
-    warn "Le service ne répond pas après $((20 * 2))s."
-
-    if [[ "$PREVIOUS_MODE" != "$EFFECTIVE_MODE" ]]; then
-        section "ROLLBACK  Mode $EFFECTIVE_MODE → $PREVIOUS_MODE"
-        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
-        rollback_venv
-        restore_code_snapshot "$CODE_SNAPSHOT"
-        restore_previous_service_unit "$PREVIOUS_MODE"
-        systemctl daemon-reload
-        systemctl stop llm-gateway || true
-        systemctl start llm-gateway || true
-        for i in $(seq 1 20); do
-            sleep 2
-            if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
-                error "Migration de mode échouée; le mode $PREVIOUS_MODE a été restauré et le service est sain."
-            fi
-        done
-        error "Migration de mode et rollback ont échoué. Intervention requise : journalctl -u llm-gateway -n 100"
-    fi
-
-    section "ROLLBACK  Restauration du snapshot déployé"
-    rollback_venv
-    restore_code_snapshot "$CODE_SNAPSHOT"
-    restore_previous_service_unit "$EFFECTIVE_MODE"
-    systemctl daemon-reload
-    systemctl stop llm-gateway || true
-    systemctl start llm-gateway || true
-
-    ROLLBACK_OK=false
-    for i in $(seq 1 20); do
-        sleep 2
-        if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
-            ROLLBACK_OK=true
-            break
-        fi
-    done
-
-    if [[ "$ROLLBACK_OK" == true ]]; then
-        warn "Rollback réussi depuis $CODE_SNAPSHOT; le checkout Git est resté intact."
-        warn "La version ${AFTER:0:8} n'est pas déployée; investiguez avant de réessayer."
-        [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update : $BACKUP_FILE"
-        exit 1
-    else
-        error "Rollback ÉCHOUÉ. Intervention requise : sudo journalctl -u llm-gateway -n 100 --no-pager"
-    fi
+    rollback_deployed_release "Le service ne répond pas après $((20 * 2))s."
 fi
 
-TRANSACTION_ARMED=false
-trap - ERR
+# ── Validation fonctionnelle de la version (COR-006) ─────────────────────────
+# `/ready` ne prouve QUE la readiness structurelle : registre lisible, binaire
+# exécutable, GGUF présents, base inscriptible. Elle ne prouve pas qu'un token
+# sort. C'est exactement le trou par lequel une version incapable de générer
+# était acceptée avant COR-006. L'ancienne version reste conservée (snapshot de
+# code, venv précédent, unité) jusqu'à la fin de cette recette.
+
+section "Recette du premier token (smoke test)"
+if [[ "$RUN_SMOKE_TEST" != true ]]; then
+    warn "Recette du premier token DÉSACTIVÉE (--skip-smoke-test)."
+    warn "La version est validée sur /ready seul : une version incapable de générer"
+    warn "peut donc être conservée. Relancez la recette dès que possible :"
+    warn "  sudo bash $INSTALL_DIR/deploy/smoke_test.sh"
+else
+    SMOKE_RC=0
+    run_smoke_test || SMOKE_RC=$?
+    case "$SMOKE_RC" in
+        0)
+            info "Premier token prouvé de bout en bout : la version ${AFTER:0:8} SERT."
+            ;;
+        4)
+            # Ce code n'est atteignable que si l'opérateur a demandé --ttft-gate.
+            rollback_deployed_release \
+                "Gate TTFT activé et seuil dépassé (${TTFT_THRESHOLD_MS} ms) : rollback demandé par l'opérateur."
+            ;;
+        5)
+            # La version SERT — le défaut porte sur l'identité de smoke test, pas
+            # sur le code. Un rollback serait une réaction disproportionnée, mais
+            # un compte résiduel doit rester bruyant et non nul.
+            warn "La version ${AFTER:0:8} est fonctionnelle et RESTE déployée."
+            error "Identité de smoke test résiduelle : retirez-la immédiatement (voir le rapport ci-dessus)."
+            ;;
+        *)
+            rollback_deployed_release \
+                "Recette du premier token en ÉCHEC (code $SMOKE_RC) : la version ${AFTER:0:8} répond mais ne sert pas."
+            ;;
+    esac
+fi
+
+# ── doctor APRÈS bascule ─────────────────────────────────────────────────────
+# Deuxième passage, cette fois sur l'hôte réellement basculé : il peut relever
+# une dérive apparue avec la nouvelle version (limites systemd, timeouts nginx,
+# pool de ports). Non bloquant : la version a déjà PROUVÉ qu'elle sert, et un
+# rollback sur un simple constat de configuration serait disproportionné.
+
+section "Contrôle doctor (après bascule)"
+if ! run_doctor "$INSTALL_DIR/venv/bin/python" "après bascule"; then
+    warn "doctor signale un écart sur l'hôte basculé — à traiter, sans rollback :"
+    warn "  la version déployée a passé la recette du premier token."
+fi
+
+# ── Rétention des venvs de release (OPS-010) ─────────────────────────────────
+# Ici seulement : la version a PROUVÉ qu'elle sert, donc la release précédente
+# n'est plus qu'un filet de sécurité — c'est à ce titre qu'on la garde, et qu'on
+# ne garde qu'elle. Purger plus tôt supprimerait ce vers quoi un rollback
+# rebascule. Un échec de purge n'est JAMAIS un échec de mise à jour : la gateway
+# sert, il ne manque que de l'espace disque.
+
+section "Rétention des venvs de release"
+PRUNED=""
+PRUNE_STATUS=0
+PRUNED="$(gateway_venv_prune_releases "$INSTALL_DIR" "$INSTALL_DIR/venv" "$VENV_KEEP_RELEASES")" \
+    || PRUNE_STATUS=$?
+while IFS= read -r pruned_venv; do
+    [[ -n "$pruned_venv" ]] || continue
+    info "Venv de release purgé : $pruned_venv"
+done <<< "$PRUNED"
+if (( PRUNE_STATUS != 0 )); then
+    warn "Purge des anciens venvs incomplète; la gateway est en service."
+    warn "  Vérifiez l'espace disque puis : ls -d $INSTALL_DIR/venv-release-*"
+elif [[ -z "$PRUNED" ]]; then
+    info "$VENV_KEEP_RELEASES releases conservées — rien à purger."
+else
+    info "Venv actif conservé : $(readlink -f "$INSTALL_DIR/venv")"
+    [[ -z "$PREVIOUS_VENV_TARGET" ]] || \
+        info "Venv précédent conservé (retour arrière manuel) : $PREVIOUS_VENV_TARGET"
+fi
 
 # ── Vérification des secrets ──────────────────────────────────────────────────
 # Les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou CHANGE_ME_*.
@@ -565,7 +941,11 @@ echo "  Commandes utiles :"
 echo "    sudo journalctl -u llm-gateway -f          # logs en temps réel"
 echo "    sudo systemctl status llm-gateway          # état du service"
 echo "    curl http://127.0.0.1:8000/health          # santé de l'API"
-echo "    curl http://127.0.0.1:8000/ready           # gate de readiness production"
+echo "    curl http://127.0.0.1:8000/ready           # readiness structurelle (COR-005)"
+echo "    sudo bash $INSTALL_DIR/deploy/smoke_test.sh"
+echo "                                               # recette du premier token à la demande"
+echo "    $INSTALL_DIR/venv/bin/python $INSTALL_DIR/cli.py doctor --env-file $CONFIG_FILE"
+echo "                                               # préflight de l'hôte"
 if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
     echo ""
     echo "  IMPORTANT : update.sh ne met pas les nœuds à jour à distance."

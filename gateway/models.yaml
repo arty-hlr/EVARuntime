@@ -4,6 +4,12 @@
 # Il est lu au démarrage de la gateway et peut être modifié via l'API admin.
 # Les modifications via l'API sont persistées automatiquement.
 #
+# CES COMMENTAIRES SURVIVENT AUX MUTATIONS ADMIN (COR-020) : la persistance
+# retouche le texte du fichier, elle ne le resérialise pas. Une sauvegarde
+# `models.yaml.pre-admin.<horodatage>.bak` est produite avant chaque écriture
+# (5 conservées). Si la mise en page empêche une retouche sûre, l'API refuse en
+# HTTP 422 sans rien écrire. Détails : docs/admin.md.
+#
 # Champs obligatoires :
 #   id       : identifiant unique (minuscules, chiffres, tirets, points, underscores)
 #   path     : chemin absolu vers le fichier .gguf
@@ -38,13 +44,30 @@
 #   Overhead CUDA/framework : ~2.0 GB
 #   Marge de sécurité 5%   : ~2.4 GB
 #   Budget net disponible   : ~43.6 GB
+#
+# IMPORTANT — RAM HÔTE (pas seulement la VRAM) :
+#   Les llama-server sont des sous-processus de la gateway : ils vivent dans le
+#   MÊME cgroup systemd et comptent donc dans MemoryHigh/MemoryMax de l'unité
+#   (llm-gateway.service en local, llm-gateway-agent.service en cluster).
+#   - modèle entièrement offloadé (n_gpu_layers: 999 sans cpu_moe) : les pages
+#     mmap du GGUF sont propres après chargement, résident RAM ≈ 0 ;
+#   - modèle avec `cpu_moe: true` : les experts FFN restent lus depuis le mmap à
+#     chaque token → ils doivent rester RÉSIDENTS en RAM hôte, soit presque toute
+#     la taille du GGUF.
+#   Avant de passer un modèle à `enabled: true`, vérifier la table
+#   « modèle → RAM hôte requise → VRAM requise » de docs/deployment.md §15.
+#   Le test gateway/tests/test_deploy_memory_profiles.py échoue si un modèle
+#   activé dépasse ce que les limites systemd autorisent.
 
 models:
   - id: "llama-3.3-70b-instruct"
     path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
     description: "Llama 3.3 70B Instruct, quantisé Q4_K_M — modèle principal UPPA (L40S 48 GB)"
     vram_gb: 42.0
-    enabled: true
+    # Une installation neuve ne doit jamais annoncer prêt un GGUF absent.
+    # Activer après téléchargement manuel ou laisser bootstrap-apply le faire
+    # provisoirement, puis définitivement après la preuve du premier token.
+    enabled: false
     capabilities:
       - text_generation
       - tool_calls
@@ -65,7 +88,18 @@ models:
     path: "/data/models/MiniMax-M2.7-GGUF/UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf"
     description: "MiniMax M2.7 IQ4_XS — MoE hybride CPU/GPU : experts FFN sur RAM CPU, attention sur L40S 48 GB"
     vram_gb: 32.0             # Estimation : attention + embeddings + KV cache. Affiner via nvidia-smi au 1er démarrage.
-    enabled: true
+    # DÉSACTIVÉ PAR DÉFAUT — contrainte de RAM HÔTE, pas de VRAM.
+    # Avec `cpu_moe: true`, les experts FFN de ce GGUF (~248 GB sur 4 shards)
+    # restent résidents en RAM hôte : working set ≈ 235-240 GB. C'est plus que la
+    # RAM de l'hôte de référence (128 GB) et donc plus que ce que MemoryHigh=80 %
+    # autorise. Le résultat n'est pas forcément un OOM-kill (les pages mmap
+    # propres sont réclamables) mais un thrashing NVMe permanent : TTFT effondré,
+    # sans erreur visible, y compris pour les AUTRES modèles chargés.
+    # Pour l'activer : hôte avec >= 320 GB de RAM (working set ~236 GB sous
+    # MemoryHigh=80 %) et ~250 GB de NVMe rapide, puis
+    # `enabled: true` + mise à jour de la table docs/deployment.md §15 et du
+    # profil dans gateway/tests/test_deploy_memory_profiles.py.
+    enabled: false
     load_timeout_seconds: 600  # 248 GB depuis NVMe — chargement ~5-10 min selon le stockage
     capabilities:
       - text_generation
@@ -87,7 +121,7 @@ models:
     path: "/models/gemma-4-26b-it-a4b-Q4_K_M.gguf"    # À ajuster selon le chemin réel
     description: "Gemma4 with MoE architecture"
     vram_gb: 26.9
-    enabled: true
+    enabled: false
     load_timeout_seconds: 300    # MoE — chargement plus lent, surtout en parallèle
     capabilities:
       - text_generation
@@ -108,7 +142,7 @@ models:
     path: "/data/models/qwen3.5-27B-Claude/Qwen3.5-27B.Q5_K_M.gguf"
     description: "Qwen3.5 27B MoE (9B active params), Q5_K_M — experts FFN sur CPU, attention sur GPU"
     vram_gb: 7.0                 # Correct AVEC --cpu-moe : seules les couches attention + embeddings sont en GPU
-    enabled: true
+    enabled: false
     capabilities:
       - text_generation
       - streaming

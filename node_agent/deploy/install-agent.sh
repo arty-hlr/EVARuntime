@@ -3,12 +3,28 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# ── Commandes exigées par le préflight (OPS-011) ──────────────────────────────
+# Source de vérité UNIQUE et déclarative. `docs/deployment.md` §1 doit les lister
+# toutes, et `gateway/tests/test_deploy_required_commands.py` DÉRIVE la liste
+# attendue de ces tableaux au lieu de la recopier. Aucun `command -v <nom
+# littéral>` ne doit exister ailleurs dans ce script.
+#
+# `rsync` est ici la dépendance qui a fait échouer deux installations réelles au
+# premier écran : elle n'est PAS installée sur une Debian 13 minimale et
+# n'apparaissait dans aucune documentation (OPS-011).
+AGENT_REQUIRED_COMMANDS=(openssl python3 rsync systemctl)
+# Absente, cette commande n'empêche pas l'installation : le script se contente
+# d'avertir que le filtrage doit être fait ailleurs.
+AGENT_OPTIONAL_COMMANDS=(ufw)
+
 NODE_ID="${NODE_ID:-node-a}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-9443}"
 LLAMA_SERVER_HOST="${LLAMA_SERVER_HOST:-0.0.0.0}"
 BASE_LLAMA_PORT="${BASE_LLAMA_PORT:-8081}"
 MAX_LOADED_MODELS="${MAX_LOADED_MODELS:-5}"
+LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-/opt/llama.cpp/current/llama-server}"
+LLAMA_SERVER_MIN_BUILD="${LLAMA_SERVER_MIN_BUILD:-}"
 ORCHESTRATOR_CIDR="${ORCHESTRATOR_CIDR:-}"
 AGENT_SECRET_FILE=""
 
@@ -33,6 +49,8 @@ Usage: sudo bash install-agent.sh [options]
   --host IP                    Bind HTTPS de l'agent (défaut 0.0.0.0)
   --port PORT                  Port HTTPS de l'agent (défaut 9443)
   --llama-host IP              Bind data-plane llama-server (défaut 0.0.0.0)
+  --llama-server-bin PATH      Binaire attesté (défaut /opt/llama.cpp/current/llama-server)
+  --llama-min-build N          Premier build corrigé accepté (obligatoire, > 0)
   --base-llama-port PORT       Premier port data-plane (défaut 8081)
   --max-loaded-models N        Taille du pool de ports (défaut 5)
   --orchestrator-cidr CIDR     Source autorisée par UFW (ex. 10.42.0.10/32)
@@ -49,6 +67,8 @@ while [[ $# -gt 0 ]]; do
         --host) AGENT_HOST="${2:-}"; shift 2 ;;
         --port) AGENT_PORT="${2:-}"; shift 2 ;;
         --llama-host) LLAMA_SERVER_HOST="${2:-}"; shift 2 ;;
+        --llama-server-bin) LLAMA_SERVER_BIN="${2:-}"; shift 2 ;;
+        --llama-min-build) LLAMA_SERVER_MIN_BUILD="${2:-}"; shift 2 ;;
         --base-llama-port) BASE_LLAMA_PORT="${2:-}"; shift 2 ;;
         --max-loaded-models) MAX_LOADED_MODELS="${2:-}"; shift 2 ;;
         --orchestrator-cidr) ORCHESTRATOR_CIDR="${2:-}"; shift 2 ;;
@@ -67,14 +87,21 @@ done
 (( AGENT_PORT >= 1 && AGENT_PORT <= 65535 )) || die "AGENT_PORT hors plage."
 (( BASE_LLAMA_PORT >= 1 && BASE_LLAMA_PORT <= 65535 )) || die "BASE_LLAMA_PORT hors plage."
 (( MAX_LOADED_MODELS >= 1 )) || die "MAX_LOADED_MODELS doit être >= 1."
+[[ "$LLAMA_SERVER_BIN" =~ ^/[A-Za-z0-9._/:+-]+$ ]] || \
+    die "LLAMA_SERVER_BIN doit être un chemin absolu sans espace ni caractère shell."
+[[ "$LLAMA_SERVER_MIN_BUILD" =~ ^[0-9]+$ ]] && (( LLAMA_SERVER_MIN_BUILD > 0 )) || \
+    die "--llama-min-build est obligatoire et doit être un entier strictement positif."
+[[ -x "$LLAMA_SERVER_BIN" ]] || \
+    die "Binaire llama-server absent ou non exécutable : $LLAMA_SERVER_BIN"
 LAST_LLAMA_PORT=$((BASE_LLAMA_PORT + MAX_LOADED_MODELS - 1))
 (( LAST_LLAMA_PORT <= 65535 )) || die "La plage data-plane dépasse le port 65535."
 if (( AGENT_PORT >= BASE_LLAMA_PORT && AGENT_PORT <= LAST_LLAMA_PORT )); then
     die "Le port agent chevauche la plage data-plane."
 fi
 
-for command in python3 rsync openssl systemctl; do
-    command -v "$command" >/dev/null || die "Commande requise absente : $command"
+for command_name in "${AGENT_REQUIRED_COMMANDS[@]}"; do
+    command -v "$command_name" >/dev/null || \
+        die "Commande requise absente : $command_name (cf. docs/deployment.md §1)"
 done
 python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' || \
     die "Python 3.11 ou plus récent est requis."
@@ -96,7 +123,10 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-[[ -f "$REPO_ROOT/node_agent/main.py" && -f "$REPO_ROOT/gateway/server_manager.py" ]] || \
+[[ -f "$REPO_ROOT/node_agent/main.py" && \
+   -f "$REPO_ROOT/node_agent/requirements.lock" && \
+   -f "$REPO_ROOT/gateway/server_manager.py" && \
+   -f "$REPO_ROOT/gateway/llama_version.py" ]] || \
     die "Dépôt EVARuntime incomplet autour de $SCRIPT_DIR."
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -136,9 +166,13 @@ info "Code installé en lecture seule pour le service."
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     python3 -m venv "$VENV_DIR"
 fi
-"$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
-"$VENV_DIR/bin/python" -m pip install --quiet -r "$INSTALL_DIR/node_agent/requirements.txt"
-chown -R root:root "$VENV_DIR"
+"$VENV_DIR/bin/python" -m pip install --quiet --require-hashes \
+    -r "$INSTALL_DIR/node_agent/requirements.lock"
+# Après une mise à jour, $VENV_DIR est un symlink vers une release (COR-016) :
+# `chown -R` sur un symlink ne le traverse pas, on vise donc le venv réel.
+VENV_REAL="$(readlink -f "$VENV_DIR")"
+chown -h root:root "$VENV_DIR"
+chown -R root:root "$VENV_REAL"
 
 if [[ ! -f "$TLS_DIR/agent.crt" || ! -f "$TLS_DIR/agent.key" ]]; then
     PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -199,12 +233,12 @@ AGENT_TLS_KEY=$TLS_DIR/agent.key
 AGENT_SECRET=$AGENT_SECRET_VALUE
 INTERNAL_API_KEY=$INTERNAL_API_KEY_VALUE
 
-LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+LLAMA_SERVER_BIN=$LLAMA_SERVER_BIN
 LLAMA_SERVER_HOST=$LLAMA_SERVER_HOST
 LLAMA_SERVER_HEALTH_HOST=127.0.0.1
 BASE_LLAMA_PORT=$BASE_LLAMA_PORT
 MAX_LOADED_MODELS=$MAX_LOADED_MODELS
-LLAMA_SERVER_MIN_BUILD=0
+LLAMA_SERVER_MIN_BUILD=$LLAMA_SERVER_MIN_BUILD
 MODEL_LOAD_TIMEOUT_SECONDS=180
 IDLE_CHECK_INTERVAL_SECONDS=10
 
@@ -222,6 +256,16 @@ else
     append_env_if_missing AGENT_PORT "$AGENT_PORT"
     append_env_if_missing AGENT_TLS_CERT "$TLS_DIR/agent.crt"
     append_env_if_missing AGENT_TLS_KEY "$TLS_DIR/agent.key"
+    if grep -q '^LLAMA_SERVER_BIN=' "$ENV_FILE"; then
+        replace_env_value LLAMA_SERVER_BIN "$LLAMA_SERVER_BIN"
+    else
+        append_env_if_missing LLAMA_SERVER_BIN "$LLAMA_SERVER_BIN"
+    fi
+    if grep -q '^LLAMA_SERVER_MIN_BUILD=' "$ENV_FILE"; then
+        replace_env_value LLAMA_SERVER_MIN_BUILD "$LLAMA_SERVER_MIN_BUILD"
+    else
+        append_env_if_missing LLAMA_SERVER_MIN_BUILD "$LLAMA_SERVER_MIN_BUILD"
+    fi
     append_env_if_missing LLAMA_SERVER_HOST "$LLAMA_SERVER_HOST"
     append_env_if_missing LLAMA_SERVER_HEALTH_HOST 127.0.0.1
     append_env_if_missing IDLE_CHECK_INTERVAL_SECONDS 10
@@ -267,6 +311,11 @@ install -m 0644 -o root -g root \
 
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
+# COR-017 : une réinstallation par-dessus une unité en échec doit repartir d'un
+# compteur de démarrages vierge, sinon le `systemctl start` final (étape 3
+# ci-dessous) se heurte au start-limit : « Start request repeated too quickly ».
+# No-op sur une unité saine ou jamais démarrée.
+systemctl reset-failed "$SERVICE" 2>/dev/null || true
 
 if [[ -n "$ORCHESTRATOR_CIDR" ]]; then
     if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then

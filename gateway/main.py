@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import database as db
 from admin import router as admin_router
@@ -29,6 +29,7 @@ from model_manager import model_manager
 from model_registry import IntegrityError
 from proxy import aclose_http_client, init_http_client, models_response, proxy_request
 from rate_limiter import check_rate_limit
+from readiness import caller_is_privileged, evaluate_readiness
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -160,10 +161,11 @@ async def lifespan(app: FastAPI):
         )
 
     # ── Garde-fou supply-chain : version du binaire llama-server ──────────────
-    # NON FATAL par défaut : en test/CI il n'y a aucun binaire llama-server réel,
-    # donc la sonde se contente d'un avertissement et le démarrage continue. Le
-    # seul cas de refus est un enforcement EXPLICITE (LLAMA_SERVER_MIN_BUILD > 0)
-    # avec un build lu strictement inférieur au minimum patché.
+    # Inerte tant que LLAMA_SERVER_MIN_BUILD=0 (défaut) : en test/CI il n'y a
+    # aucun binaire llama-server réel, la sonde se contente d'un avertissement et
+    # le démarrage continue. Dès qu'un plancher est exigé, la politique est
+    # FAIL-CLOSED (SEC-009) : build lu inférieur au plancher OU version illisible
+    # → refus. Même sémantique que `doctor`, quel que soit le chemin de démarrage.
     # En local, ces artefacts vivent sur la gateway. En cluster, ils vivent sur
     # les nœuds et sont validés par le node-agent au moment du chargement.
     await _validate_inference_runtime(enabled_models)
@@ -242,6 +244,134 @@ app.include_router(metrics_router)
 
 # ── Middleware de logging des requêtes ────────────────────────────────────────
 
+# Routes dont le chemin porte un nom d'utilisateur : `/admin/users/<username>`
+# et `/admin/users/<username>/keys`. Le nom est une donnée personnelle, et
+# l'anonymisation RGPD (COR-002) serait vaine si le journal d'accès en gardait
+# une copie — c'est aussi une exigence explicite de la Definition of Done
+# (« aucune donnée sensible n'est journalisée »). Le segment est donc remplacé
+# avant écriture, sans masquer la route elle-même, qui reste exploitable.
+_USER_PATH_PREFIX = "/admin/users/"
+
+
+# Paramètres de requête dont la VALEUR peut rester lisible : structurels,
+# jamais personnels. Tout le reste est rédigé (SEC-010). La liste est une
+# autorisation explicite, pas une interdiction : un paramètre ajouté demain est
+# rédigé par défaut, et c'est le bon sens de la faute. `GET /admin/usage`
+# accepte `username`, employé par `deploy/smoke_test.sh` — le nom y est éphémère
+# et généré, mais un opérateur qui interroge la route avec un vrai nom écrirait
+# ce nom au journal, ce que SEC-008 interdit.
+_LOGGABLE_QUERY_PARAMS = frozenset({
+    "from_date", "to_date", "limit", "force", "period",
+})
+
+_REDACTED = "<redacted>"
+
+
+def _redact_path(path: str) -> str:
+    """
+    Remplace un nom d'utilisateur présent dans le chemin par `<redacted>`.
+
+    Conserve la forme de la route (méthode, ressource, sous-ressource) pour que
+    le journal reste utile au diagnostic, sans conserver l'identifiant.
+    """
+    if not path.startswith(_USER_PATH_PREFIX):
+        return path
+    remainder = path[len(_USER_PATH_PREFIX):]
+    if not remainder:
+        return path
+    # Seul le premier segment est un nom ; le reste (`/keys`) est structurel.
+    _, sep, tail = remainder.partition("/")
+    return f"{_USER_PATH_PREFIX}<redacted>{sep}{tail}"
+
+
+def _redact_query(query: str) -> str:
+    """
+    Rédige la valeur de tout paramètre qui n'est pas explicitement structurel.
+
+    Les NOMS de paramètres sont conservés : ils décrivent la forme de l'appel et
+    n'identifient personne. Seules les valeurs disparaissent, sauf autorisation
+    explicite dans `_LOGGABLE_QUERY_PARAMS`.
+    """
+    if not query:
+        return query
+    morceaux: list[str] = []
+    for paire in query.split("&"):
+        if not paire:
+            continue
+        nom, sep, _valeur = paire.partition("=")
+        if not sep:
+            # Paramètre sans valeur : le nom seul ne porte pas de donnée.
+            morceaux.append(nom)
+        elif nom.lower() in _LOGGABLE_QUERY_PARAMS:
+            morceaux.append(paire)
+        else:
+            morceaux.append(f"{nom}={_REDACTED}")
+    return "&".join(morceaux)
+
+
+def _redact_target(target: str) -> str:
+    """
+    Rédige une cible complète « chemin[?requête] », telle qu'un journal d'accès l'écrit.
+
+    `_redact_path` seul ne suffisait pas : le journal d'accès d'uvicorn écrit
+    `get_path_with_query_string(scope)`, donc chemin ET requête (SEC-010).
+    """
+    chemin, sep, requete = target.partition("?")
+    if not sep:
+        return _redact_path(chemin)
+    return f"{_redact_path(chemin)}?{_redact_query(requete)}"
+
+
+class _UvicornAccessRedactor(logging.Filter):
+    """
+    Rédige la cible dans le journal d'accès d'uvicorn (SEC-010).
+
+    Le middleware ci-dessous ne journalise que `request.url.path` : la requête
+    n'y a jamais transité. Mais uvicorn tient SON propre journal d'accès —
+    `--access-log` est actif dans les deux unités systemd — et il écrit
+    `'%s - "%s %s HTTP/%s" %d'` où le troisième argument est
+    `get_path_with_query_string(scope)` : chemin **et** query string, sans
+    rédaction. `GET /admin/users/<username>` comme `GET /admin/usage?username=…`
+    atterrissaient donc en clair dans journald, ce qui vidait `_redact_path` de
+    son sens en production.
+
+    Un filtre est le bon point d'accroche : il s'applique à tout handler du
+    logger, ne dépend pas du format, et ne peut pas être contourné par un
+    changement de configuration côté uvicorn. Il ne lève jamais — un journal ne
+    doit pas casser une requête.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            record.args = (args[0], args[1], _redact_target(args[2]), args[3], args[4])
+        return True
+
+
+def install_access_log_redaction() -> None:
+    """Pose le filtre de rédaction sur `uvicorn.access`, une seule fois."""
+    logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _UvicornAccessRedactor) for f in logger.filters):
+        logger.addFilter(_UvicornAccessRedactor())
+
+
+install_access_log_redaction()
+
+
+_DASHBOARD_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'none'; base-uri 'none'; connect-src 'self'; "
+        "font-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+        "img-src 'self' data:; object-src 'none'; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+    ),
+    "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.monotonic()
@@ -253,7 +383,7 @@ async def log_requests(request: Request, call_next):
         log.info(
             "%s %s %d %dms",
             request.method,
-            request.url.path,
+            _redact_target(request.url.path),
             response.status_code,
             duration_ms,
         )
@@ -266,7 +396,24 @@ async def log_requests(request: Request, call_next):
 async def dashboard_ui():
     """Sert le dashboard d'administration (SPA HTML)."""
     html_path = Path(__file__).parent / "static" / "dashboard.html"
-    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        content=html_path.read_text(encoding="utf-8"),
+        headers=_DASHBOARD_SECURITY_HEADERS,
+    )
+
+
+@app.get("/admin/assets/chart.umd.js", include_in_schema=False)
+async def dashboard_chart_asset():
+    """Sert la copie vérifiée de Chart.js sans dépendance réseau tierce."""
+    asset_path = Path(__file__).parent / "static" / "chart.umd.js"
+    return FileResponse(
+        asset_path,
+        media_type="text/javascript",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/health", include_in_schema=False)
@@ -283,57 +430,36 @@ async def health():
 
 
 @app.get("/ready", include_in_schema=False)
-async def ready():
+async def ready(request: Request):
     """
-    Readiness (distincte de la liveness de /health).
+    Readiness STRUCTURELLE stricte (distincte de la liveness de /health).
 
-    Renvoie 200 si la gateway peut SERVIR au moins une requête d'inférence :
-      - au moins un modèle est déjà ready, OU
-      - il reste de la capacité VRAM pour en charger un (mode local),
-        ou au moins un nœud est online (mode cluster).
-    Sinon 503 (aucun modèle ready ET aucune capacité / tous nœuds offline).
+    Renvoie 200 seulement si tous les contrôles structurels critiques passent :
+    registre lisible, au moins un modèle activé, binaire llama-server exécutable,
+    GGUF des modèles activés présents et lisibles, base inscriptible, au moins un
+    modèle qui tient dans le budget VRAM, et capacité de service disponible. En
+    mode cluster, binaire et GGUF sont délégués aux node-agents : l'équivalent
+    structurel est « inventaire de nœuds lisible ET au moins un nœud en ligne ».
+    Sinon 503, avec le code du premier contrôle critique en échec dans `reason`.
 
-    /health reste inchangé (liveness : le process répond). Le corps précise la
-    raison sans divulguer d'infra sensible (pas de chemins fichiers, pas d'URL).
+    Ce que /ready NE garantit PAS : qu'un modèle génère effectivement des tokens.
+    C'est la serving readiness, exposée en information (`levels.serving`) mais
+    prouvée seulement par le smoke test de mise à jour (COR-006).
+
+    Le corps public ne divulgue aucun chemin de fichier, URL de nœud ni secret :
+    seulement des identifiants de contrôle et des codes stables. Un appelant
+    présentant `ADMIN_SECRET` reçoit en plus les messages actionnables détaillés
+    (qui, eux, contiennent des chemins) — même niveau de confiance que /admin/*.
     """
-    try:
-        status = model_manager.status()
-    except Exception:
-        # status() ne devrait pas lever, mais fail-safe : pas de fuite d'infra.
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "reason": "status_unavailable"},
-        )
+    report = await evaluate_readiness(model_manager, config=settings)
 
-    models = status.get("models") or []
-    ready_models = [m["id"] for m in models if m.get("state") == "ready"]
-
-    budget = status.get("vram_budget") or {}
-    available_gb = budget.get("available_gb") or 0.0
-    # En cluster, status() expose nodes_online dans vram_budget ; en local,
-    # cette clé est absente → None (non contraignant côté local).
-    nodes_online = budget.get("nodes_online")
-
-    has_capacity = available_gb > 0.0
-    cluster_has_node = nodes_online is None or nodes_online > 0
-
-    is_ready = bool(ready_models) or (has_capacity and cluster_has_node)
-
-    body = {
-        "status": "ready" if is_ready else "not_ready",
-        "models_ready": ready_models,
-        "vram_available_gb": round(float(available_gb), 2),
-    }
-    if nodes_online is not None:
-        body["nodes_online"] = nodes_online
-
-    if is_ready:
-        return body
-
-    if nodes_online is not None and nodes_online == 0:
-        body["reason"] = "all_nodes_offline"
+    if caller_is_privileged(request.headers.get("authorization"), settings):
+        body = report.detailed_body()
     else:
-        body["reason"] = "no_model_ready_and_no_capacity"
+        body = report.public_body()
+
+    if report.structural_ok:
+        return body
     return JSONResponse(status_code=503, content=body)
 
 
@@ -455,7 +581,9 @@ async def detokenize(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    log.exception("Erreur non gérée sur %s %s", request.method, request.url.path)
+    log.exception(
+        "Erreur non gérée sur %s %s", request.method, _redact_path(request.url.path)
+    )
     return JSONResponse(
         status_code=500,
         content={

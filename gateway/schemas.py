@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Utilisateurs ──────────────────────────────────────────────────────────────
@@ -38,6 +38,32 @@ class UserResponse(BaseModel):
     rpm_limit: int
     monthly_token_limit: int
     notes: Optional[str]
+    # Non NULL = compte anonymisé (RGPD, DEC-001) : permet de le distinguer d'un
+    # compte simplement désactivé. `username` est alors un pseudonyme, `email` et
+    # `notes` sont définitivement effacés.
+    anonymized_at: Optional[str] = None
+
+
+class UserAnonymizeResponse(BaseModel):
+    """
+    Réponse de `DELETE /admin/users/{username}`.
+
+    La route porte le verbe `DELETE` pour compatibilité, mais son effet est une
+    anonymisation irréversible : ce corps de réponse énumère explicitement ce qui
+    est effacé et ce qui est conservé, pour qu'aucun opérateur ne puisse croire à
+    une suppression de ligne.
+    """
+    status: Literal["anonymized", "already_anonymized"]
+    message: str
+    user_id: int
+    anonymized_username: str = Field(
+        ..., description="Pseudonyme stable qui remplace le nom d'utilisateur effacé."
+    )
+    anonymized_at: str
+    keys_revoked: int = Field(..., description="Clés encore actives révoquées par cet appel.")
+    keys_total: int = Field(..., description="Clés attachées au compte, toutes révoquées.")
+    erased_fields: list[str]
+    retained: list[str]
 
 
 # ── Clés API ──────────────────────────────────────────────────────────────────
@@ -169,6 +195,29 @@ class ModelEntryUpdate(BaseModel):
     llama_params: Optional[LlamaParamsSchema] = None
 
 
+class BootstrapModelSync(BaseModel):
+    """Transition live étroite du bootstrap, sans aucune écriture YAML."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["activate", "rollback", "confirm"]
+    digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    vram_gb: Optional[float] = Field(None, gt=0.0, strict=True)
+    lease_seconds: Optional[int] = Field(None, ge=30, le=3600, strict=True)
+
+    @model_validator(mode="after")
+    def validate_action_fields(self):
+        if self.action == "activate" and self.vram_gb is None:
+            raise ValueError("vram_gb est obligatoire pour action=activate")
+        if self.action == "activate" and self.lease_seconds is None:
+            raise ValueError("lease_seconds est obligatoire pour action=activate")
+        if self.action != "activate" and self.vram_gb is not None:
+            raise ValueError("vram_gb n'est admis que pour action=activate")
+        if self.action != "activate" and self.lease_seconds is not None:
+            raise ValueError("lease_seconds n'est admis que pour action=activate")
+        return self
+
+
 # ── Statut système multi-modèles ──────────────────────────────────────────────
 
 class ModelStatusResponse(BaseModel):
@@ -185,16 +234,43 @@ class ModelStatusResponse(BaseModel):
     uptime_seconds: Optional[float]
     idle_seconds: Optional[float]
     llama_params: Optional[dict]
+    # Cluster uniquement : nœud d'hébergement et charge live. `llama_url` reste
+    # volontairement hors de ce schéma (détail d'infra interne) — il n'est
+    # exposé que par GET /admin/cluster.
+    node: Optional[str] = None
+    active_requests: Optional[int] = None
 
 
 class VramBudgetResponse(BaseModel):
-    """Budget VRAM global de la gateway."""
+    """
+    Budget VRAM global de la gateway — commun aux modes local et cluster.
+
+    Seuls `total_gb`, `used_gb` et `available_gb` ont un sens dans les deux
+    modes et restent donc obligatoires.
+
+    - `overhead_gb` / `budget_net_gb` : toujours fournis (config de l'hôte en
+      local, agrégation des nœuds ONLINE en cluster). Optionnels au niveau du
+      schéma pour qu'un manager dégradé produise un statut partiel plutôt
+      qu'une ResponseValidationError (→ 500) sur une route d'observabilité.
+    - `safety_margin` : ratio de configuration mono-hôte. Absent en cluster, où
+      la réserve des nœuds est déjà agrégée en GB dans `overhead_gb`.
+    - `nodes` / `nodes_online` : cluster uniquement.
+    - `gpu_used_mb_measured` / `vram_drift_mb` : local uniquement, et seulement
+      si une sonde nvidia-smi a réussi.
+    """
     total_gb: float
-    overhead_gb: float
-    safety_margin: float
+    overhead_gb: Optional[float] = None
+    safety_margin: Optional[float] = None
     used_gb: float
     available_gb: float
-    budget_net_gb: float
+    budget_net_gb: Optional[float] = None
+    # Cluster uniquement — sans ces champs, /admin/status masquerait la
+    # topologie (ils étaient silencieusement supprimés par le response model).
+    nodes: Optional[int] = None
+    nodes_online: Optional[int] = None
+    # Local uniquement — réconciliation nvidia-smi consommée par le dashboard.
+    gpu_used_mb_measured: Optional[float] = None
+    vram_drift_mb: Optional[float] = None
 
 
 class CapacityQueueStatusResponse(BaseModel):
