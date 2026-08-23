@@ -577,6 +577,35 @@ curl -sN https://gateway.example.com/v1/chat/completions \
 # data: [DONE]
 ```
 
+### Modèles de raisonnement et appels d'outils
+
+Les backends compatibles DeepSeek peuvent séparer la phase de raisonnement de
+la réponse finale avec l'extension `reasoning_content`. EVARuntime conserve ce
+champ tel quel, en streaming comme dans une réponse classique :
+
+```text
+data: {"choices":[{"delta":{"reasoning_content":"Analysons le problème..."}}]}
+data: {"choices":[{"delta":{"content":"La réponse est..."}}]}
+```
+
+Cette extension n'appartient pas au schéma OpenAI historique. Selon la version
+du SDK, elle peut être accessible comme attribut supplémentaire :
+
+```python
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    reasoning = getattr(delta, "reasoning_content", None)
+    if reasoning:
+        print(reasoning, end="", flush=True)
+    if delta.content:
+        print(delta.content, end="", flush=True)
+```
+
+La présence d'une liste `tools` ne change pas ce comportement. Les deltas
+`reasoning_content`, `content` et `tool_calls` sont relayés dès leur réception,
+sans attendre la fin de la génération. Le client reste responsable de leur
+affichage et de l'assemblage des arguments de chaque appel d'outil.
+
 ---
 
 ## 6. Paramètres de génération

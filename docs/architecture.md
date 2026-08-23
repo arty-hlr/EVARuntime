@@ -1341,10 +1341,11 @@ p95 = samples[int(0.95 * len(samples))]
 ```
 
 Le chemin chaud ajoute aussi trois histogrammes en mémoire exposés par
-`/admin/metrics/prometheus` : TTFT du premier contenu SSE, durée de chargement
-du modèle et attente de capacité locale. Le TTFT démarre avant la lecture du
-body et inclut donc l'attente VRAM ainsi que le chargement à la demande ; un
-chunk de rôle ou d'usage sans contenu ne le clôt pas. En cluster, le chargement
+`/admin/metrics/prometheus` : TTFT du premier delta SSE significatif (contenu,
+raisonnement ou appel d'outil), durée de chargement du modèle et attente de
+capacité locale. Le TTFT démarre avant la lecture du body et inclut donc
+l'attente VRAM ainsi que le chargement à la demande ; un chunk de rôle ou
+d'usage sans delta significatif ne le clôt pas. En cluster, le chargement
 et le TTFT portent le `node_id` du placement. Les labels sont volontairement
 limités à `model`, `node` et un résultat technique, avec une borne stricte de
 512 séries par histogramme.
