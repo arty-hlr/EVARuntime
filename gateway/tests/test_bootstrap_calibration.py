@@ -24,7 +24,7 @@ Aucun test ne lance de processus, n'ouvre de socket ni n'attend une seconde
 réelle : toutes les sondes sont des doubles, l'horloge est fausse, et le seul
 disque touché est `tmp_path`.
 
-Chaque test d'ABSENCE porte son contrôle positif — règle de `CLAUDE.md` : un test
+Chaque test d'ABSENCE porte son contrôle positif — règle de `AGENTS.md` : un test
 qui affirme « aucun YAML écrit » ou « aucune sonde appelée » sans prouver qu'il
 saurait en voir un passerait au vert le jour où le module deviendrait inerte.
 """
@@ -750,7 +750,7 @@ def test_le_modele_est_decharge_apres_chaque_passe(tmp_path):
 
 
 def test_le_modele_est_decharge_meme_quand_la_calibration_echoue(tmp_path):
-    """`CLAUDE.md` : un modèle laissé chargé par un diagnostic est une fuite de VRAM."""
+    """`AGENTS.md` : un modèle laissé chargé par un diagnostic est une fuite de VRAM."""
     sondes = Sondes(prompt_ok=False)
     resultat = _executer(sondes, tmp_path)
     assert resultat.status == ex.STEP_FAILED

@@ -648,7 +648,7 @@ def test_route_get_former_username_returns_404(client, admin_headers, temp_db) -
 async def test_anonymization_logs_no_personal_data(temp_db, caplog) -> None:
     """
     L'opération ne doit pas recréer la donnée ailleurs : ni le nom, ni l'e-mail,
-    ni les notes effacées n'apparaissent dans les journaux (§14 / CLAUDE.md).
+    ni les notes effacées n'apparaissent dans les journaux (§14 / AGENTS.md).
     """
     await db.init_db()
     user, _ = await _seed_user_with_keys_and_usage(

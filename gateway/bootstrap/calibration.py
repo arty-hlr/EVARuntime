@@ -1371,7 +1371,7 @@ async def _executer_passe(
     Une passe complète : charger, échantillonner, prompter, décharger.
 
     Le déchargement est dans un `finally`, y compris quand la passe échoue en
-    cours de route. `CLAUDE.md` est explicite : un modèle qui reste chargé après
+    cours de route. `AGENTS.md` est explicite : un modèle qui reste chargé après
     un outil de diagnostic est une fuite de VRAM en production. Un déchargement
     qui échoue transforme la passe en échec même si les mesures étaient bonnes —
     la machine est alors dans un état que l'opérateur doit connaître.

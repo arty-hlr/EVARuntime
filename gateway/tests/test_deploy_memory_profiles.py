@@ -277,7 +277,7 @@ def test_profile_vram_matches_registry(registry: ModelRegistry) -> None:
     }
     assert not drift, (
         f"vram_gb divergent entre models.yaml et MEMORY_PROFILES {drift}. "
-        f"Mettre les deux à jour ensemble (cf. CLAUDE.md : vram_gb et docs "
+        f"Mettre les deux à jour ensemble (cf. AGENTS.md : vram_gb et docs "
         f"changent dans le même commit)."
     )
 

@@ -29,7 +29,7 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 | **Où en est-on** | Jalons **M0 et M1 atteints**. Après fusion de la PR #13 dans `dev`, l'audit post-merge (§0.16) a réparé le contrat de l'installation réelle : runtime/service/registre alignés, artefacts d'exploitation installés, dépendances hashées, dashboard hors ligne, métriques runtime et runbook complet. M2 reste volontairement non prononcé |
 | **Ce qui bloque** | **Deux preuves P0 terrain**, pas un correctif local : exécuter la recette vrai petit GGUF (TST-004) et observer profils systemd/nginx sur le matériel de staging (OPS-001). Le `bootstrap-apply --apply` GPU/nginx et son rapport restent la preuve de sortie M2 |
 | **Ce qui vient ensuite** | Fournir une matrice `--runtime-variants` épinglée réelle, exécuter le runbook de `docs/deployment.md` sur l'hôte cible, lancer `doctor`, la recette petit GGUF puis le premier token via nginx, et archiver le rapport. Ensuite seulement : restore drill, endurance et SLO de M4/M5 |
-| **Santé des tests** | Branche post-merge : **2408 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
+| **Santé des tests** | Dernier relevé documenté : **2408 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). La collecte du 2026-08-24 recense **2414 tests gateway + 67 node-agent** ; les 10 tests de flux récemment ajoutés passent localement. `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
 | **Reste à faire** | 25 items sur 96 (§0.3). Tous les P0 de code/supply-chain identifiés sont fermés ; TST-004 et OPS-001 restent ouverts parce que leur acceptation exige un runtime/GGUF et un staging réels |
 | **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
 | **Ce que l'audit post-merge a appris** | Une procédure peut être juste module par module et rester inexécutable une fois installée : chemins runtime divergents, EnvironmentFile jamais promu, modèles absents activés, artefacts seulement copiés par update et documentation pointant vers un secret inexistant. Voir §0.16 |
@@ -65,12 +65,12 @@ le verdict post-merge et les preuves encore requises.
 
 | Champ | Valeur |
 |---|---|
-| Dernière mise à jour | 2026-08-04 |
+| Dernière mise à jour | 2026-08-24 |
 | Phase | **Audit post-merge de production — code et runbook durcis, jalon M2 toujours non prononcé.** Les défauts du layout installé, du service env, de la reproductibilité et de l'observabilité sont fermés. La sortie attend l'exécution physique GPU/nginx/GGUF et les deux P0 terrain TST-004 / OPS-001 |
 | Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
 | Jalon visé | **M2 — installation jusqu'au premier token** (§13) — état post-merge en **§0.16.1** |
-| Branche de travail | `codex/prod-readiness`, depuis `dev` fusionné (`eb03a74`) |
-| Base de référence | `eb03a74` — PR #13 fusionnée dans `dev` |
+| Branche de travail | `main` (`9337722`) |
+| Base de référence | `9337722` — état courant de `main` au 2026-08-24 |
 | Périmètre livré à ce jour | AUT-001 → AUT-020, COR-001, COR-002, COR-004 → COR-007, COR-009, COR-014 → COR-017, COR-020 → COR-031, PERF-001, OPS-006, OPS-008, OPS-009, OPS-011 → OPS-013, SEC-001 → SEC-004, SEC-008 → SEC-017, TST-001, TST-006, TST-007 |
 | Périmètre de la vague 7 | **18 items** : AUT-014, AUT-018, AUT-019, COR-020, COR-021, COR-026 → COR-030, OPS-011, OPS-012, SEC-002, SEC-009, SEC-010, SEC-016, SEC-017, TST-007 (§0.15) |
 | Ce qui bloque la sortie de M2 | Relever les SHA-256 amont réels, exécuter la recette petit GGUF, appliquer le plan sur GPU, traverser nginx, valider les limites systemd/nginx et archiver le rapport |
@@ -232,7 +232,7 @@ tests de régression, qui doivent échouer avant le correctif et passer après.
 |---|---|---|
 | DEC-001 | **Anonymisation** pour la suppression d'utilisateur : la ligne `users` est conservée, les données personnelles sont effacées, `is_active = 0`, les clés sont révoquées. L'historique d'usage agrégé reste exploitable, la personne n'est plus ré-identifiable. Écarté : `ON DELETE CASCADE` (perte de traçabilité de facturation) et `SET NULL` (casse les jointures des rapports). | 2026-07-30 |
 | DEC-010 | **Activation provisoire en mémoire avec retour arrière** pour dénouer la chaîne de preuve du plan d'amorçage (COR-022/COR-023). L'ordre devient `calibrate → enable_live → smoke_test → confirm_disk → warmup`. `models.yaml` reste `enabled: false` pendant la recette ; un bail local au worker ferme l'admission et décharge si l'applicateur disparaît. Assumé : une fenêtre pendant laquelle le modèle est servable par le vrai chemin public dans **un worker mono-processus**. Écarté : activation persistante avant preuve, activation sur calibration seule, ou chemin d'admission privé. | 2026-08-01 |
-| DEC-009 | **Suppression du composant `gateway-student`** : jamais déployé, aucun consommateur. Code, tests, documentation, unités systemd/nginx/nftables et job CI retirés du dépôt. Vérifié sans effet fonctionnel — ni `gateway` ni `node_agent` n'en dépendaient (aucun import, aucune clé `llmstu-*`, aucune route ni base partagée). Les items de backlog exclusivement student (**COR-011**, **OPS-005**, **OPS-007**) sont annulés, ainsi que **EVA-006** et **EVA-023** côté `claude-analyse-projet.md`. Écarté : garder le composant en l'état (surface de maintenance, CI et audit de dépendances pour du code mort). | 2026-07-30 |
+| DEC-009 | **Suppression du composant `gateway-student`** : jamais déployé, aucun consommateur. Code, tests, documentation, unités systemd/nginx/nftables et job CI retirés du dépôt. Vérifié sans effet fonctionnel — ni `gateway` ni `node_agent` n'en dépendaient (aucun import, aucune clé `llmstu-*`, aucune route ni base partagée). Les items de backlog exclusivement student (**COR-011**, **OPS-005**, **OPS-007**) sont annulés, ainsi que **EVA-006** et **EVA-023** côté [audit Claude archivé](docs/archive/claude-analyse-projet.md). Écarté : garder le composant en l'état (surface de maintenance, CI et audit de dépendances pour du code mort). | 2026-07-30 |
 
 Les décisions DEC-002 à DEC-008 restent `[!]` : elles ne bloquent pas le jalon
 M0 et seront tranchées à l'entrée des lots concernés.
@@ -1530,7 +1530,7 @@ niveau production doit être considérée comme prématurée tant que les opéra
 administratives ne respectent pas le pinning et que les chemins réels ne sont pas
 testés de bout en bout.
 
-### Relecture croisée de `claude-analyse-projet.md`
+### Relecture croisée de [l'audit Claude archivé](docs/archive/claude-analyse-projet.md)
 
 Le document Claude est de très bonne qualité. Il reprend les défauts reproduits,
 les transforme en items stables et ajoute des critères de validation beaucoup
@@ -2473,5 +2473,6 @@ Une entrée de backlog n'est terminée que si :
 |---|---|---|---|
 | 2026-07-30 | Codex | Création du plan consolidé, analyse du rapport externe et architecture du bootstrap | Audit local, 433 tests, sources officielles listées ci-dessus |
 | 2026-07-30 | Claude | Vague 4 : fermeture des 6 défauts du premier déploiement réel, plus COR-009 et OPS-010. En-tête de suivi §0.0 ajouté | 4 chantiers en worktrees isolés, **758 tests** (+80), rougeur de chaque correctif rejouée indépendamment avant fusion |
-| 2026-07-30 | Codex | Relecture de `claude-analyse-projet.md`; correction du statut de la supposée course pin, ajout de doctor, inspection GGUF, migrations et ordre de travail performance | Lecture intégrale du document Claude, vérification du segment asyncio et du paquet officiel `gguf` |
+| 2026-07-30 | Codex | Relecture de [l'audit Claude archivé](docs/archive/claude-analyse-projet.md); correction du statut de la supposée course pin, ajout de doctor, inspection GGUF, migrations et ordre de travail performance | Lecture intégrale du document Claude, vérification du segment asyncio et du paquet officiel `gguf` |
 | 2026-08-01 | Codex + 3 sous-agents | Revue et correction post-vague 6 : câblage réel d'AUT-017, activation live compensée, attestation runtime/GPU, types stricts et fermeture SSRF des deux flux d'artefacts | Commit code `5166cf0` ; **2089 tests** (2026 gateway sous Python 3.14 et 3.11, 63 node-agent sous les deux versions), `ruff` et `bash -n` propres. M2 non prononcé sans run GPU/nginx réel |
+| 2026-08-24 | Codex | Référentiel documentaire aligné sur `main` : audit Claude déplacé sous `docs/archive/`, `AGENTS.md` versionné et liens relatifs corrigés | Collecte : 2414 tests gateway et 67 node-agent ; 10 tests de flux ajoutés au dernier lot passent localement |

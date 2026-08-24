@@ -33,7 +33,7 @@ aussi l'exemple canonique de la documentation nginx, ce n'est donc pas un signal
 Reste non vérifié sans binaire nginx : la sémantique PCRE exacte des regex de
 `map` (les constructions employées sont communes à PCRE et à `re`).
 
-Règle CLAUDE.md appliquée : chaque test qui assère une ABSENCE porte un contrôle
+Règle AGENTS.md appliquée : chaque test qui assère une ABSENCE porte un contrôle
 positif. Ici ils sont de deux natures — un contrôle sur le format d'origine
 (`combined` fuit le canari, donc le détecteur voit quelque chose) et un contrôle
 sur la conf mutée (retirer la règle de rédaction fait rougir le test).
@@ -228,7 +228,7 @@ def _routes_de_lapplication() -> set[tuple[str, str]]:
     `(méthode, chemin)` de TOUTES les routes exposées, routeurs inclus compris.
 
     Parcours récursif obligatoire : depuis FastAPI 0.141, `app.routes` ne contient
-    qu'un `_IncludedRouter` pour `/admin/*` (voir CLAUDE.md § Testing).
+    qu'un `_IncludedRouter` pour `/admin/*` (voir AGENTS.md § Testing).
     """
     import main  # noqa: PLC0415 - import tardif : conftest prépare l'environnement
     from tests.test_smoke_test_script import _iter_app_routes  # noqa: PLC0415
