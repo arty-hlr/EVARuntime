@@ -296,7 +296,7 @@ class UrllibTransport:
     """
     Transport de production : bibliothèque standard seule, aucune dépendance ajoutée.
 
-    `CLAUDE.md` interdit d'ajouter une dépendance sans gain opérationnel réel, et
+    `AGENTS.md` interdit d'ajouter une dépendance sans gain opérationnel réel, et
     la vague 5 a écarté le paquet `gguf` officiel pour cette raison exacte. Un
     téléchargement borné avec contrôle d'empreinte en aval ne justifie pas
     `httpx` : `http.client` suffit, et l'appel bloquant part dans un thread pour

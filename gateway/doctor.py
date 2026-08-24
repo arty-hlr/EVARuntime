@@ -1793,7 +1793,7 @@ def _inspect_certificate(
 
     `ssl._ssl._test_decode_cert` est le seul décodeur X.509 de la bibliothèque
     standard. Il est utilisé ici plutôt qu'`openssl` en sous-processus ou qu'un
-    ajout de `cryptography` (cf. CLAUDE.md : éviter les nouvelles dépendances).
+    ajout de `cryptography` (cf. AGENTS.md : éviter les nouvelles dépendances).
     Toute défaillance dégrade en avertissement, jamais en traceback.
     """
     try:

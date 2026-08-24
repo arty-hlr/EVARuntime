@@ -6,7 +6,7 @@ nginx n'étant pas installé sur les runners, on ne peut pas s'appuyer sur
 sur un hôte réel, produiraient un warning au reload (OPS-009) ou un 504 côté
 client (COR-009).
 
-Règle CLAUDE.md appliquée partout ici : tout test qui assère une ABSENCE porte un
+Règle AGENTS.md appliquée partout ici : tout test qui assère une ABSENCE porte un
 contrôle positif prouvant qu'il voit encore quelque chose — sinon il devient
 inerte le jour où le parsing casse, sans jamais échouer.
 """
