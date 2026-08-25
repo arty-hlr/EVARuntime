@@ -11,6 +11,12 @@
 #
 # Il rafraîchit en revanche les artefacts d'exploitation versionnés : service
 # launchd principal. La rotation des logs est gérée par macOS (logrotate natif).
+#
+# Validation de la version déployée (COR-006) :
+#   Une version n'est conservée que si elle SERT réellement, pas seulement si elle
+#   répond. Trois contrôles se succèdent :
+#     1. `/ready` après le redémarrage (readiness structurelle stricte).
+#     2. `deploy/smoke_test.sh` : recette du premier token de bout en bout.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -156,7 +162,25 @@ else
     warn "  sudo launchctl load /Library/LaunchDaemons/com.evaruntime.gateway.plist"
 fi
 
-# ── 5. Nginx (optionnel) ─────────────────────────────────────────────────────
+# ── 5. Recette du premier token (smoke test) ──────────────────────────────────
+
+section "Recette du premier token…"
+
+SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
+
+if [[ -f "$SMOKE_TEST_SCRIPT" ]]; then
+    info "Exécution de la recette du premier token…"
+    if bash "$SMOKE_TEST_SCRIPT" --env-file "$CONFIG_FILE"; then
+        info "Recette du premier token réussie."
+    else
+        warn "La recette du premier token a échoué."
+        warn "→ La version déployée répond mais ne sert pas. Consultez les logs."
+    fi
+else
+    warn "smoke_test.sh introuvable — la recette est ignorée."
+fi
+
+# ── 6. Nginx (optionnel) ─────────────────────────────────────────────────────
 
 if [[ "$UPDATE_NGINX" == true ]] && command -v nginx &>/dev/null; then
     section "Mise à jour de la configuration nginx…"
@@ -180,7 +204,7 @@ if [[ "$UPDATE_NGINX" == true ]] && command -v nginx &>/dev/null; then
     fi
 fi
 
-# ── 6. Nettoyage des anciennes sauvegardes ────────────────────────────────────
+# ── 7. Nettoyage des anciennes sauvegardes ────────────────────────────────────
 
 section "Nettoyage…"
 
