@@ -221,7 +221,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
     # Vérifier les clés essentielles
     for key in MODELS_CONFIG_PATH LLAMA_SERVER_BIN DB_PATH; do
         if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-            PASS "Clé $* présente dans la configuration"
+            PASS "Clé $key présente dans la configuration"
         else
             FAIL "Clé $key absente de la configuration"
         fi
