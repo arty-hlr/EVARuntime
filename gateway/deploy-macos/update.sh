@@ -118,7 +118,7 @@ if launchctl list com.evaruntime.gateway &>/dev/null; then
     info "Arrêt du service…"
     if ! sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null; then
         warn "Échec de l'arrêt du service via launchctl bootout."
-        if ! sudo launchctl unload "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
+        if ! sudo launchctl unload "/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
             error "Impossible d'arrêter le service. Vérifiez les permissions.";
         fi
     fi
@@ -127,9 +127,9 @@ if launchctl list com.evaruntime.gateway &>/dev/null; then
     sleep 2
     
     info "Démarrage du service…"
-    if ! sudo launchctl bootstrap system "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
+    if ! sudo launchctl bootstrap system "/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
         warn "Échec de launchctl bootstrap. Tentative avec launchctl load…"
-        if ! sudo launchctl load "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
+        if ! sudo launchctl load "/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
             error "Impossible de démarrer le service. Vérifiez les permissions.";
         fi
     fi

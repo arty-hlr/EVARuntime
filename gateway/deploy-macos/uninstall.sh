@@ -44,7 +44,7 @@ DATA_DIR="${EVARUNE_DATA_DIR:-$HOME/Library/Application Support/evaruntime/data}
 LOG_DIR="${EVARUNE_LOG_DIR:-$HOME/Library/Application Support/evaruntime/logs}"
 CONFIG_FILE="$HOME/.config/evaruntime/env"
 MODELS_DIR="${EVARUNE_MODELS_DIR:-$HOME/Library/Application Support/evaruntime/models}"
-PLIST_PATH="$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist"
+PLIST_PATH="/Library/LaunchDaemons/com.evaruntime.gateway.plist"
 
 # ── Arrêt du service ──────────────────────────────────────────────────────────
 
