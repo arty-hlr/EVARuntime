@@ -112,7 +112,7 @@ Options :
   --admin-url URL          Plan de contrôle et /ready, en direct sur la gateway
                            (défaut : identique au défaut de --base-url)
   --env-file PATH          EnvironmentFile lu pour ADMIN_SECRET, le port et le
-                           modèle par défaut (défaut : /etc/llm-gateway/env)
+                           modèle par défaut (défaut : ~/.config/evaruntime/env)
   --admin-secret-file PATH Lit ADMIN_SECRET dans un fichier root-only plutôt que
                            dans l'EnvironmentFile
   --model ID               Modèle à exercer. Défaut dérivé de la configuration :
@@ -145,7 +145,7 @@ EOF
 
 BASE_URL=""
 ADMIN_URL=""
-ENV_FILE="${LLM_GATEWAY_CONFIG_DIR:-/etc/llm-gateway}/env"
+ENV_FILE="${LLM_GATEWAY_CONFIG_DIR:-$HOME/.config/evaruntime}/env"
 ADMIN_SECRET_FILE=""
 MODEL_ID="${SMOKE_TEST_MODEL:-}"
 PROMPT="Answer with a single word: OK"
