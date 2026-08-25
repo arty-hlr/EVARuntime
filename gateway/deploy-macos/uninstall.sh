@@ -62,7 +62,7 @@ fi
 # ── Suppression du plist launchd ──────────────────────────────────────────────
 
 if [[ -f "$PLIST_PATH" ]]; then
-    rm -f "$PLIST_PATH"
+    sudo rm -f "$PLIST_PATH"
     info "Plist launchd supprimé."
 else
     info "Plist launchd introuvable (déjà supprimé)."
