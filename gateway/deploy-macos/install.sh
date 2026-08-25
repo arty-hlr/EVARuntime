@@ -316,6 +316,6 @@ echo ""
 if [[ "$EFFECTIVE_MODE" == "local" ]]; then
     echo "  4. Charger un modèle (après avoir placé les GGUF dans $MODELS_DIR) :"
     echo "     curl -X POST http://127.0.0.1:8000/admin/models/{id}/load \\"
-echo "       -H 'Authorization: Bearer $(deploy_env_value "$CONFIG_FILE" ADMIN_SECRET)'"
+    echo "       -H 'Authorization: Bearer <VOTRE_CLE>'  # depuis $CONFIG_FILE"
 fi
 echo ""
