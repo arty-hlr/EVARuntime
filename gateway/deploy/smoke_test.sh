@@ -7,8 +7,8 @@
 # token sort. Ce script exerce le vrai chemin public :
 #
 #   client → nginx si configuré → authentification → quota/rate limit
-#          → résolution du modèle → llama-server → chunk SSE AVEC du contenu
-#          → log d'usage
+#          → résolution du modèle → llama-server → chunk SSE généré
+#          (content, reasoning_content ou tool_calls) → log d'usage
 #
 # Usage manuel (incident, validation avant ouverture du trafic) :
 #   sudo bash gateway/deploy/smoke_test.sh
@@ -387,6 +387,9 @@ def cmd_sse():
     saw_done = False
     content_chunks = 0
     content_chars = 0
+    reasoning_chunks = 0
+    reasoning_chars = 0
+    tool_chunks = 0
     bad_envelope = 0
     upstream_error = None
     models = set()
@@ -437,14 +440,30 @@ def cmd_sse():
             delta = choice.get("delta") or {}
             if not isinstance(delta, dict):
                 continue
+            # Un delta est « utile » selon la MÊME définition que la gateway
+            # elle-même (proxy._record_ttft) : content, reasoning_content ou
+            # tool_calls non vides. Les modèles thinking (DeepSeek/Qwen/MiniMax)
+            # épuisent un max_tokens court en tokens de réflexion routés dans
+            # `reasoning_content` : les ignorer ferait échouer un service qui
+            # génère réellement — faux négatif constaté sur macOS (PR #23).
+            generated = False
             content = delta.get("content")
             # `!= ""` et non `.strip()` : un token compose d'espaces EST du
             # contenu genere. Seul un delta vide ou absent ne prouve rien.
             if isinstance(content, str) and content != "":
                 content_chunks += 1
                 content_chars += len(content)
-                if t_first_content is None:
-                    t_first_content = now
+                generated = True
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning != "":
+                reasoning_chunks += 1
+                reasoning_chars += len(reasoning)
+                generated = True
+            if delta.get("tool_calls"):
+                tool_chunks += 1
+                generated = True
+            if generated and t_first_content is None:
+                t_first_content = now
 
     expected_model = sys.argv[2] if len(sys.argv) > 2 else ""
     http_code = stats.get("http_code", "000")
@@ -469,7 +488,7 @@ def cmd_sse():
         reason = "upstream_error"
     elif not saw_data:
         reason = "no_sse_data"
-    elif content_chunks == 0:
+    elif content_chunks == 0 and reasoning_chunks == 0 and tool_chunks == 0:
         # Coeur de COR-006 : le stream s'est ouvert, il a meme pu se terminer
         # proprement — mais aucun token utile n'est sorti. « Le service repond »
         # n'est pas « le service sert ».
@@ -494,6 +513,9 @@ def cmd_sse():
         ("total_ms", total_ms),
         ("content_chunks", content_chunks),
         ("content_chars", content_chars),
+        ("reasoning_chunks", reasoning_chunks),
+        ("reasoning_chars", reasoning_chars),
+        ("tool_chunks", tool_chunks),
         ("prompt_tokens", prompt_tokens),
         ("completion_tokens", completion_tokens),
         ("stream_model", sorted(models)[0] if models else ""),
@@ -597,6 +619,7 @@ def cmd_user_body():
 
 _NUMERIC = {
     "headers_ms", "ttft_ms", "total_ms", "content_chunks", "content_chars",
+    "reasoning_chunks", "reasoning_chars", "tool_chunks",
     "prompt_tokens", "completion_tokens", "usage_entries", "exit_code",
     "ttft_threshold_ms", "max_tokens",
 }
@@ -650,6 +673,7 @@ _REPORT_ROWS = (
     ("total_ms", "Durée totale du stream", " ms", "-"),
     ("content_chunks", "Chunks de contenu", "", "-"),
     ("content_chars", "Caractères générés", "", "-"),
+    ("reasoning_chunks", "Chunks de raisonnement", "", "-"),
     ("prompt_tokens", "Tokens de prompt", "", "-"),
     ("completion_tokens", "Tokens de complétion", "", "-"),
     ("usage_entries", "Entrées de log d'usage", "", "-"),
@@ -942,7 +966,7 @@ while IFS= read -r line; do
         gen_result) GEN_RESULT="$value" ;;
         gen_reason) GEN_REASON="$value" ;;
         ttft_ms)    TTFT_MS="$value"; put ttft_ms "$value" ;;
-        http_code|headers_ms|total_ms|content_chunks|content_chars|prompt_tokens|completion_tokens|saw_done)
+        http_code|headers_ms|total_ms|content_chunks|content_chars|reasoning_chunks|tool_chunks|prompt_tokens|completion_tokens|saw_done)
             put "$key" "$value" ;;
         stream_model) [[ -z "$value" ]] || put stream_model "$value" ;;
     esac
@@ -958,7 +982,7 @@ if [[ "$GEN_RESULT" != "ok" || "$PARSE_RC" -ne 0 ]]; then
     put reason "generation:$GEN_REASON"
     fail "Génération NON prouvée — cause : $GEN_REASON"
     case "$GEN_REASON" in
-        no_content)     fail "Le stream s'est ouvert mais n'a produit aucun delta avec du contenu : la version répond sans servir." ;;
+        no_content)     fail "Le stream s'est ouvert mais n'a produit aucun delta généré (content, reasoning_content ou tool_calls) : la version répond sans servir." ;;
         no_done)        fail "Le stream s'est interrompu avant [DONE]." ;;
         no_sse_data)    fail "Aucun événement SSE reçu." ;;
         upstream_error) fail "Le backend d'inférence a renvoyé une erreur pendant le stream." ;;

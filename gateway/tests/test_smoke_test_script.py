@@ -77,7 +77,8 @@ class Scenario:
             return any(m == method and p.startswith(prefix) for m, p in self.calls)
 
 
-def _chunk(content: str | None, *, usage: bool = False, model: str = MODEL_ID) -> bytes:
+def _chunk(content: str | None, *, usage: bool = False, model: str = MODEL_ID,
+           reasoning: str | None = None, tools: bool = False) -> bytes:
     payload: dict = {
         "id": "chatcmpl-smoke",
         "object": "chat.completion.chunk",
@@ -87,6 +88,13 @@ def _chunk(content: str | None, *, usage: bool = False, model: str = MODEL_ID) -
     }
     if content is not None:
         payload["choices"][0]["delta"]["content"] = content
+    if reasoning is not None:
+        payload["choices"][0]["delta"]["reasoning_content"] = reasoning
+    if tools:
+        payload["choices"][0]["delta"]["tool_calls"] = [
+            {"index": 0, "id": "call-smoke", "type": "function",
+             "function": {"name": "get_weather", "arguments": "{}"}},
+        ]
     if usage:
         payload["usage"] = {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}
     return ("data: " + json.dumps(payload) + "\n\n").encode()
@@ -222,6 +230,32 @@ def _make_handler(scenario: Scenario):
                 # Le stream s'ouvre, se termine proprement… et n'a rien généré.
                 self._write(_chunk(""))
                 self._write(_chunk("", usage=True))
+                self._write(b"data: [DONE]\n\n")
+                return
+            if mode == "empty_generated_fields":
+                # Régression : les champs génératifs présents mais VIDES ne
+                # prouvent rien — même combinaison que « no_content », étendue
+                # à reasoning_content.
+                self._write(_chunk("", reasoning=""))
+                self._write(_chunk("", reasoning="", usage=True))
+                self._write(b"data: [DONE]\n\n")
+                return
+            if mode == "reasoning_only":
+                # Modèle thinking avec max_tokens court : toute la génération
+                # part dans reasoning_content (routage llama.cpp/DeepSeek).
+                for _ in range(3):
+                    self._write(_chunk(None, reasoning="réflexion…"))
+                self._write(_chunk(None, reasoning="…", usage=True))
+                self._write(b"data: [DONE]\n\n")
+                return
+            if mode == "reasoning_then_content":
+                self._write(_chunk(None, reasoning="réflexion…"))
+                self._write(_chunk("OK", usage=True))
+                self._write(b"data: [DONE]\n\n")
+                return
+            if mode == "tool_calls_only":
+                self._write(_chunk(None, tools=True))
+                self._write(_chunk(None, usage=True))
                 self._write(b"data: [DONE]\n\n")
                 return
             if mode == "upstream_error":
@@ -376,6 +410,54 @@ def test_stream_ouvert_sans_aucun_contenu_est_un_echec(gateway, env_file):
     assert proc.returncode == EXIT_GENERATION, combined(proc)
     assert "no_content" in combined(proc)
     assert_identity_cleaned(gateway)
+
+
+def test_champs_generatifs_vides_ne_prouvent_toujours_rien(gateway, env_file):
+    """Contrôle inverse : content/reasoning_content présents mais vides échouent."""
+    gateway.chat = "empty_generated_fields"
+    proc = run_smoke(gateway, env_file)
+    assert proc.returncode == EXIT_GENERATION, combined(proc)
+    assert "no_content" in combined(proc)
+    assert_identity_cleaned(gateway)
+
+
+# ── Deltas génératifs au sens de proxy._record_ttft ───────────────────────────
+
+def test_stream_de_pure_reflexion_est_un_succes(gateway, env_file):
+    """Modèle thinking + max_tokens court : reasoning_content prouve la génération.
+
+    Faux négatif constaté en revue de PR #23 : un modèle qui raisonne épuise les
+    16 tokens par défaut dans des deltas `reasoning_content`, routés tels quels
+    par la gateway (proxy.py préserve ce champ). Le parseur ne comptait que
+    `delta.content` et déclarait « no_content » sur un service qui génère.
+    """
+    gateway.chat = "reasoning_only"
+    proc = run_smoke(gateway, env_file, "--json")
+    assert proc.returncode == EXIT_OK, combined(proc)
+    report = json.loads(proc.stdout)
+    assert report["reason"] == "ok"
+    assert report["content_chunks"] == 0
+    assert report["reasoning_chunks"] > 0
+    # Le TTFT est bien ancré sur le premier delta de réflexion, pas sur [DONE].
+    assert report["ttft_ms"] >= report["headers_ms"]
+
+
+def test_raisonnement_puis_contenu_sont_tous_deux_comptes(gateway, env_file):
+    gateway.chat = "reasoning_then_content"
+    proc = run_smoke(gateway, env_file, "--json")
+    assert proc.returncode == EXIT_OK, combined(proc)
+    report = json.loads(proc.stdout)
+    assert report["reason"] == "ok"
+    assert report["content_chunks"] == 1
+    assert report["reasoning_chunks"] >= 1
+
+
+def test_tool_calls_seuls_prouvent_la_generation(gateway, env_file):
+    """Même définition côté outils : un stream d'appels d'outils est servi."""
+    gateway.chat = "tool_calls_only"
+    proc = run_smoke(gateway, env_file, "--json")
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert json.loads(proc.stdout)["tool_chunks"] > 0
 
 
 def test_erreur_upstream_pendant_le_stream_est_un_echec(gateway, env_file):

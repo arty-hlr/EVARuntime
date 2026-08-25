@@ -1552,8 +1552,8 @@ public** :
 
 ```text
 client → nginx si configuré → authentification → quota/rate limit
-       → résolution du modèle → llama-server → chunk SSE AVEC du contenu
-       → log d'usage
+       → résolution du modèle → llama-server → chunk SSE généré
+       (content, reasoning_content ou tool_calls) → log d'usage
 ```
 
 Séquence exécutée :
@@ -1572,6 +1572,16 @@ Séquence exécutée :
 10. vérification de l'écriture du log d'usage (`GET /admin/usage`) ;
 11. révocation de la clé et **anonymisation** de l'utilisateur éphémère ;
 12. rapport, sans aucune clé ni contenu généré.
+
+> **Modèles de raisonnement (thinking).** Un delta est considéré comme généré
+> selon la même définition que la gateway elle-même
+> (`proxy._record_ttft`) : `delta.content`, `delta.reasoning_content` **ou**
+> `delta.tool_calls` non vides. Les modèles thinking (DeepSeek-R1, Qwen,
+> MiniMax…) épuisent un `--max-tokens` court en tokens de réflexion que
+> `llama-server` route dans `reasoning_content` : le smoke test les accepte
+> comme preuve de génération et les comptabilise séparément dans le rapport
+> (`Chunks de raisonnement`). Un delta dont tous ces champs sont **vides** ne
+> prouve toujours rien (`no_content`).
 
 ##### Usage manuel
 
