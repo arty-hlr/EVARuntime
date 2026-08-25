@@ -65,7 +65,7 @@ _DEPLOY_OPERATIONAL_FILES=(
 
 # deploy_sync_gateway_operational_files <source_root> <target_install_dir>
 # Copie les fichiers opérationnels depuis gateway/deploy-macos vers l'installation.
-# source_root est le répertoire gateway (ex: /Users/florian/EVARuntime/gateway).
+# source_root est le répertoire gateway (ex: /Users/<USER>/EVARuntime/gateway).
 deploy_sync_gateway_operational_files() {
     local source_root="$1" target_root="$2" file
 

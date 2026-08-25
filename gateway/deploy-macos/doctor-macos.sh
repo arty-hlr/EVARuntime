@@ -39,7 +39,7 @@ DATA_DIR="${EVARUNE_DATA_DIR:-$HOME/Library/Application Support/evaruntime/data}
 LOG_DIR="${EVARUNE_LOG_DIR:-$HOME/Library/Application Support/evaruntime/logs}"
 CONFIG_FILE="$HOME/.config/evaruntime/env"
 MODELS_DIR="${EVARUNE_MODELS_DIR:-$HOME/Library/Application Support/evaruntime/models}"
-PLIST_PATH="$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist"
+PLIST_PATH="/Library/LaunchDaemons/com.evaruntime.gateway.plist"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -146,11 +146,11 @@ echo "---------"
 if [[ -f "$PLIST_PATH" ]]; then
     PASS "Plist launchd présent : $PLIST_PATH"
     
-    if launchctl list com.evaruntime.gateway &>/dev/null; then
+    if sudo launchctl list com.evaruntime.gateway &>/dev/null; then
         PASS "Service chargé dans launchd"
         
         # Vérifier si le service est en cours d'exécution
-        SERVICE_PID=$(launchctl list com.evaruntime.gateway 2>/dev/null | awk '{print $1}' || echo "")
+        SERVICE_PID=$(sudo launchctl list com.evaruntime.gateway | grep PID | grep -oE '\d+' || echo "")
         if [[ -n "$SERVICE_PID" && "$SERVICE_PID" != "0" ]]; then
             PASS "Service en cours d'exécution (PID: $SERVICE_PID)"
             
@@ -262,8 +262,8 @@ if [[ -n "$MODELS_CONFIG_PATH" && -f "$MODELS_CONFIG_PATH" ]]; then
     PASS "Registre des modèles présent : $MODELS_CONFIG_PATH"
     
     # Compter les modèles activés
-    ENABLED_COUNT=$(grep -c "^  enabled: true" "$MODELS_CONFIG_PATH" 2>/dev/null || echo "0")
-    TOTAL_COUNT=$(grep -c "^  id:" "$MODELS_CONFIG_PATH" 2>/dev/null || echo "0")
+    ENABLED_COUNT=$(grep -Ec "^\s*enabled: true" "$MODELS_CONFIG_PATH" 2>/dev/null || echo "0")
+    TOTAL_COUNT=$(grep -Ec "^\s*- id:" "$MODELS_CONFIG_PATH" 2>/dev/null || echo "0")
     PASS "Modèles dans le registre : $TOTAL_COUNT total, $ENABLED_COUNT activés"
     
     # Vérifier les chemins GGUF

@@ -49,10 +49,12 @@ PLIST_PATH="$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist"
 # ── Arrêt du service ──────────────────────────────────────────────────────────
 
 info "Arrêt du service…"
-if launchctl list com.evaruntime.gateway &>/dev/null; then
-    sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null || \
-        sudo launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    info "Service arrêté."
+if sudo launchctl list com.evaruntime.gateway &>/dev/null; then
+    if sudo launchctl bootout system/com.evaruntime.gateway 2>&1 | grep -q failed && sudo launchctl unload "$PLIST_PATH" 2>&1 | grep -q "failed"; then
+        error "Échec de l'arrêt du service launchd. Vérifiez les permissions et les logs."
+    else
+        info "Service arrêté."
+    fi
 else
     info "Service déjà arrêté (ou jamais installé)."
 fi

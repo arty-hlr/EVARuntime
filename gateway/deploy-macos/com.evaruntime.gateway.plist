@@ -22,12 +22,6 @@
         <string>--access-log</string>
     </array>
 
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>EVARUNE_ENV_FILE</key>
-        <string>@CONFIG_FILE@</string>
-    </dict>
-
     <key>WorkingDirectory</key>
     <string>@INSTALL_DIR@</string>
 
@@ -42,6 +36,11 @@
 
     <key>RunAtLoad</key>
     <true/>
+
+    <key>UserName</key>
+    <string>@USER_NAME@</string>
+    <key>GroupName</key>
+    <string>@GROUP_NAME@</string>
 
     <key>SoftResourceLimits</key>
     <dict>

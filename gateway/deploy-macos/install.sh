@@ -89,6 +89,8 @@ PYTHON="${PYTHON:-python3}"
 CONFIG_FILE="$CONFIG_DIR/env"
 CURRENT_MODE="$(deploy_env_value "$CONFIG_FILE" CLUSTER_MODE)"
 EFFECTIVE_MODE="$REQUESTED_MODE"
+USER_NAME="$(whoami)"
+GROUP_NAME="$(id -gn)"
 
 if [[ -n "$CURRENT_MODE" ]] && ! deploy_validate_mode "$CURRENT_MODE"; then
     error "Valeur CLUSTER_MODE invalide dans $CONFIG_FILE : '$CURRENT_MODE'"
@@ -169,7 +171,7 @@ info "Répertoires créés."
 
 # ── 2. Copie du code source ───────────────────────────────────────────────────
 
-info "Copie du code source vers $INSTALL_DIR…"
+info "Copie du code source vers ${INSTALL_DIR}…"
 deploy_sync_gateway_code "$SCRIPT_DIR" "$INSTALL_DIR"
 
 # Fichiers statiques (dashboard admin servi par /admin/dashboard)
@@ -217,6 +219,15 @@ else
     info "Configuration existante conservée : $CONFIG_FILE"
 fi
 
+# ── 4b. Symlink .env vers INSTALL_DIR pour pydantic-settings ──────────────────
+# pydantic-settings cherche un fichier .env dans le working directory.
+# Sur macOS, l'env file est dans ~/.config/evaruntime/env, pas dans INSTALL_DIR.
+# On crée un symlink pour que la configuration soit trouvée au démarrage.
+if [[ ! -L "$INSTALL_DIR/.env" ]]; then
+    info "Création du symlink .env vers la configuration..."
+    ln -sf "$CONFIG_FILE" "$INSTALL_DIR/.env"
+fi
+
 # ── 5. Registre des modèles (models.yaml) ─────────────────────────────────────
 
 CONFIGURED_MODELS_FILE="$(deploy_env_value "$CONFIG_FILE" MODELS_CONFIG_PATH)"
@@ -235,19 +246,20 @@ fi
 # ── 6. Service launchd ────────────────────────────────────────────────────────
 
 info "Installation du service launchd…"
-PLIST_DIR="$HOME/Library/LaunchDaemons"
-mkdir -p "$PLIST_DIR"
+PLIST_DIR="/Library/LaunchDaemons"
 
 # Copier le template plist et substituer les variables
 info "Génération du plist launchd…"
 sed -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
     -e "s|@CONFIG_FILE@|$CONFIG_FILE|g" \
     -e "s|@LOG_DIR@|$LOG_DIR|g" \
+    -e "s|@USER_NAME@|$USER_NAME|g" \
+    -e "s|@GROUP_NAME@|$GROUP_NAME|g" \
     "$SCRIPT_DIR/deploy-macos/com.evaruntime.gateway.plist" \
-    > "$PLIST_DIR/com.evaruntime.gateway.plist"
+    | sudo tee "$PLIST_DIR/com.evaruntime.gateway.plist" >/dev/null
 
 # Charger le service dans launchd (nécessite sudo pour LaunchDaemons)
-if ! sudo launchctl load "$PLIST_DIR/com.evaruntime.gateway.plist" 2>/dev/null; then
+if sudo launchctl load "$PLIST_DIR/com.evaruntime.gateway.plist" 2>&1 | grep -q "failed"; then
     error "Échec du chargement du service launchd. Vérifiez les permissions et les logs.";
 fi
 info "Service launchd installé et chargé."
