@@ -70,7 +70,8 @@ Each model backend is managed as a gateway-owned subprocess instead of a permane
 gateway/                 Main OpenAI-compatible gateway
 gateway/bootstrap/       Unprivileged bootstrap planner and approved-model catalog
 gateway/cluster/         Multi-node scheduling and remote node client
-gateway/deploy/          systemd, nginx and install scripts
+gateway/deploy/          systemd, nginx and install scripts (Linux)
+gateway/deploy-macos/    macOS deployment scripts (launchd, Homebrew)
 gateway/static/          Admin dashboard
 gateway/tests/           Gateway test suite
 node_agent/              Lightweight remote GPU node agent
@@ -81,8 +82,8 @@ docs/                    Architecture, API, admin and deployment guides
 
 Prerequisites:
 
-- Local mode: a Linux server with NVIDIA GPU, CUDA `llama.cpp` and local GGUFs.
-- Cluster mode: a Linux orchestrator (GPU optional) plus separately installed
+- **Local mode**: a Linux server with NVIDIA GPU, CUDA `llama.cpp` and local GGUFs, OR macOS 26+ on Apple Silicon (M2/M3/M4) with Homebrew and Metal-enabled `llama.cpp`.
+- **Cluster mode**: a Linux orchestrator (GPU optional) plus separately installed
   GPU node-agents with CUDA `llama.cpp` and identical model paths.
 - Python 3.11+.
 
@@ -92,9 +93,10 @@ the safe default; the multi-node control plane is an optional second product:
 | Path | Gateway host | GPU execution | Command |
 | --- | --- | --- | --- |
 | Local (default) | Gateway + `llama-server` | On the gateway host | `install.sh --mode local` |
+| macOS Local | Gateway + `llama-server` (Metal) | Apple Silicon (M2/M3/M4) | `gateway/deploy-macos/install.sh --mode local` |
 | Cluster (opt-in) | Orchestrator only | On separately installed node-agents | `install.sh --mode cluster` |
 
-Install the local single-node gateway:
+### Linux: Install the local single-node gateway
 
 ```bash
 git clone https://github.com/Tutanka01/EVARuntime.git
@@ -122,6 +124,21 @@ walks you from creating a user and an API key (`llmgw-…`) to the first
 `/v1/chat/completions` on `http://127.0.0.1:8000` — and explains why the gateway
 rejects `ADMIN_SECRET` on `/v1/*` routes.
 
+### macOS: Install the local single-node gateway (Apple Silicon)
+
+```bash
+git clone https://github.com/Tutanka01/EVARuntime.git
+cd EVARuntime
+cd gateway/deploy-macos
+bash install.sh --mode local
+```
+
+macOS uses launchd instead of systemd and Homebrew for dependencies. The installer
+creates a Metal-enabled `llama-server` configuration and sets up the service with
+user-space paths (`~/Library/Application Support/evaruntime/`).
+
+> **Note**: Cluster mode is NOT supported on macOS. Only local (single-node) mode works.
+
 Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
 multi-node orchestrator, inspect the plan first, then install explicitly:
 
@@ -136,8 +153,12 @@ secret. A local↔cluster migration requires both an explicit target mode and
 omitted:
 
 ```bash
+# Linux
 sudo bash gateway/deploy/update.sh                 # auto-detect and preserve
 sudo bash gateway/deploy/update.sh --mode cluster  # explicit cluster update
+
+# macOS (local only)
+bash gateway/deploy-macos/update.sh                # auto-detect and preserve
 ```
 
 Cluster agents are installed and updated on each GPU node; the orchestrator

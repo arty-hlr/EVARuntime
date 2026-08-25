@@ -1,23 +1,20 @@
-# EVARuntime — Déploiement sur macOS (Mac Studio)
+# EVARuntime — Déploiement sur macOS (Apple Silicon)
 
 > **IMPORTANT** : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local (mono-nœud) est fonctionnel.
 
-Ce répertoire contient les scripts de déploiement d'EVARuntime pour macOS, spécifiquement conçus pour Mac Studio avec puces Apple Silicon (M2/M3/M4).
+Ce répertoire contient les scripts de déploiement d'EVARuntime pour macOS avec Apple Silicon (M2/M3/M4). L'installation utilise launchd et Homebrew au lieu de systemd.
 
 ## Prérequis
 
 Avant d'installer EVARuntime, vous devez avoir :
 
-1. **macOS 14+ (Sonoma)** sur un Mac Studio
+1. **macOS 14+ (Sonoma)** sur un Mac avec puce Apple Silicon (M2/M3/M4)
 2. **Homebrew** installé ([https://brew.sh](https://brew.sh))
    ```bash
    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
    ```
-3. **Python 3.11+** via Homebrew
-   ```bash
-   brew install python@3.12
-   ```
-4. **llama.cpp compilé** via Homebrew
+3. **Python 3.11+** via Homebrew (automatiquement installé avec `llama.cpp`)
+4. **llama.cpp** via Homebrew (inclut `llama-server` avec support Metal)
    ```bash
    brew install llama.cpp
    ```
@@ -34,20 +31,24 @@ Avant d'installer EVARuntime, vous devez avoir :
 | Logs | `/var/log/llm-gateway` | `~/Library/Application Support/evaruntime/logs` |
 | Configuration | `/etc/llm-gateway/env` | `~/.config/evaruntime/env` |
 | Modèles | `/models` | `~/Library/Application Support/evaruntime/models` |
-| GPU | CUDA (NVIDIA) | Metal (Apple Silicon) |
+| GPU | CUDA (NVIDIA) | Metal (Apple Silicon natif) |
 | Reverse-proxy | nginx (systemd) | nginx (Homebrew, optionnel) |
+| Service utilisateur | root (systemd) | Utilisateur courant (launchd) |
+| Permissions | sudo requis | Aucun sudo nécessaire |
 
 ## Installation rapide
 
 ```bash
-# 1. Vérifier le plan d'installation (dry-run)
-bash gateway/deploy-macos/install.sh --dry-run
+cd gateway/deploy-macos
 
-# 2. Lancer l'installation (SEUL mode supporté)
-bash gateway/deploy-macos/install.sh --mode local
+# 1. Vérifier le plan d'installation (dry-run)
+bash install.sh --dry-run
+
+# 2. Lancer l'installation (SEUL mode supporté sur macOS)
+bash install.sh --mode local
 
 # 3. Vérifier l'état de l'installation
-bash gateway/deploy-macos/doctor-macos.sh
+bash doctor-macos.sh
 ```
 
 ## Commandes disponibles
@@ -87,6 +88,7 @@ bash gateway/deploy-macos/update.sh [--nginx]
 4. Redémarre le service launchd
 5. Vérifie le ready state après redémarrage
 6. Nettoie les anciennes sauvegardes (> 3 conservées)
+7. Exécute un smoke test pour valider la fonctionnalité
 
 **Option `--nginx` :** Met aussi à jour la configuration nginx si installée.
 
@@ -109,7 +111,7 @@ bash gateway/deploy-macos/doctor-macos.sh [--json]
 
 Vérifie l'état complet de l'installation et signale les problèmes potentiels :
 - Système (macOS, Homebrew, Python)
-- GPU / Accélération Metal
+- GPU / Accélération Metal (Apple Silicon détecté)
 - Service launchd (chargé, en cours d'exécution, répondant)
 - Installation (code, venv, dépendances)
 - Configuration (clés essentielles, secrets)
@@ -119,18 +121,16 @@ Vérifie l'état complet de l'installation et signale les problèmes potentiels 
 
 ## Gestion du service
 
+Le service est géré automatiquement par `install.sh` et `update.sh`. Les commandes manuelles sont réservées au dépannage.
+
 ### Démarrer / Arrêter / Redémarrer
 
 ```bash
-# Charger le service (démarrage automatique au login)
-launchctl load ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
-
 # Arrêter le service
-launchctl bootout system/com.evaruntime.gateway
+sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null || true
 
 # Redémarrer
-launchctl bootout system/com.evaruntime.gateway 2>/dev/null || true
-launchctl bootstrap system ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
+sudo launchctl bootstrap system ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
 
 # Vérifier l'état
 launchctl list com.evaruntime.gateway
@@ -140,18 +140,18 @@ launchctl list com.evaruntime.gateway
 
 ```bash
 # Logs en temps réel
-tail -f ~/Library/Application\ Support/evaruntime/logs/gateway.log
+tail -f "~/Library/Application Support/evaruntime/logs/gateway.log"
 
 # Erreurs uniquement
-tail -f ~/Library/Application\ Support/evaruntime/logs/gateway-error.log
+tail -f "~/Library/Application Support/evaruntime/logs/gateway-error.log"
 
 # Dernières lignes
-tail -n 50 ~/Library/Application\ Support/evaruntime/logs/gateway.log
+tail -n 50 "~/Library/Application Support/evaruntime/logs/gateway.log"
 ```
 
 ## Configuration
 
-Le fichier de configuration se trouve dans `~/.config/evaruntime/env`. Il est généré automatiquement lors de l'installation avec des valeurs adaptées à votre Mac Studio :
+Le fichier de configuration se trouve dans `~/.config/evaruntime/env`. Il est généré automatiquement lors de l'installation avec des valeurs adaptées à votre Mac :
 
 - **RAM unifiée** : détectée automatiquement via `sysctl hw.memsize`
 - **llama-server** : chemin par défaut `/opt/homebrew/bin/llama-server`
@@ -168,8 +168,10 @@ export EVARUNE_LOG_DIR=/custom/path/to/logs
 export EVARUNE_MODELS_DIR=/custom/path/to/models
 export LLAMA_BIN=/custom/path/to/llama-server
 
-bash gateway/deploy-macos/install.sh
+bash install.sh --mode local
 ```
+
+
 
 ## Nginx (optionnel)
 
@@ -190,7 +192,8 @@ brew services start nginx
 
 ```bash
 # Copier la configuration macOS dans le répertoire servers de Homebrew nginx
-sudo cp gateway/deploy-macos/nginx.conf.macOS /opt/homebrew/etc/nginx/servers/llm-gateway
+cd gateway/deploy-macos
+sudo cp nginx.conf.macOS /opt/homebrew/etc/nginx/servers/llm-gateway
 
 # Tester la configuration
 nginx -t
@@ -234,7 +237,7 @@ open http://127.0.0.1:8000/admin/dashboard
 
 ### Charger un modèle
 
-Après avoir placé vos fichiers `.gguf` dans le répertoire de modèles :
+Après avoir placé vos fichiers `.gguf` dans le répertoire de modèles (`~/Library/Application Support/evaruntime/models/`) :
 
 ```bash
 # Récupérer le secret admin depuis la configuration
@@ -276,7 +279,7 @@ for chunk in response:
 launchctl list com.evaruntime.gateway
 
 # Consulter les logs d'erreur
-cat ~/Library/Application\ Support/evaruntime/logs/gateway-error.log
+cat "~/Library/Application Support/evaruntime/logs/gateway-error.log"
 
 # Vérifier que le port 8000 n'est pas déjà utilisé
 lsof -i :8000
@@ -300,7 +303,7 @@ nano ~/.config/evaruntime/env
 
 ### Problèmes de mémoire (OOM)
 
-Sur Mac Studio, la mémoire unifiée est partagée entre CPU et GPU. Si vous chargez des modèles trop gros :
+Sur Mac avec Apple Silicon, la mémoire unifiée est partagée entre CPU et GPU. Si vous chargez des modèles trop gros :
 
 1. Vérifiez la RAM disponible : `vm_stat | head -n 20`
 2. Réduisez `MAX_LOADED_MODELS` dans `~/.config/evaruntime/env`
@@ -311,11 +314,11 @@ Sur Mac Studio, la mémoire unifiée est partagée entre CPU et GPU. Si vous cha
 
 ```bash
 # Vérifier les permissions du répertoire logs
-ls -la ~/Library/Application\ Support/evaruntime/logs/
+ls -la "~/Library/Application Support/evaruntime/logs/"
 
 # Relancer le service avec les bons droits
-launchctl bootout system/com.evaruntime.gateway 2>/dev/null || true
-launchctl bootstrap system ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
+sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null || true
+sudo launchctl bootstrap system ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
 ```
 
 ### Reset complet
@@ -324,10 +327,10 @@ Si vous devez repartir de zéro :
 
 ```bash
 # Désinstaller en conservant les données (modèles GGUF)
-bash gateway/deploy-macos/uninstall.sh --keep-data
+bash uninstall.sh --keep-data
 
 # Réinstaller proprement
-bash gateway/deploy-macos/install.sh
+bash install.sh --mode local
 ```
 
 ## Comparaison avec le déploiement Linux
@@ -342,12 +345,12 @@ Les scripts macOS sont une adaptation des scripts Linux (`gateway/deploy/`). Les
 | **Mémoire** | VRAM dédiée (NVIDIA) | RAM unifiée (CPU+GPU) |
 | **Reverse-proxy** | nginx system-wide | nginx Homebrew (optionnel) |
 | **Logs** | journald + fichiers | Fichiers uniquement |
-| **Backup DB** | timer systemd quotidien | Non implémenté (à venir) |
+| **Backup DB** | timer systemd quotidien | `llm-gateway-backup.sh` (à configurer manuellement) |
 
 ## Prochaines étapes
 
-1. **Configurer les modèles** : Modifiez `models.yaml` dans le répertoire de données pour ajouter vos GGUF
-2. **Sécuriser l'accès** : Changez les secrets par défaut dans la configuration
+1. **Configurer les modèles** : Modifiez `models.yaml` dans `~/Library/Application Support/evaruntime/data/` pour ajouter vos GGUF
+2. **Sécuriser l'accès** : Changez les secrets par défaut dans `~/.config/evaruntime/env`
 3. **Activer HTTPS** : Installez nginx avec un certificat TLS si vous exposez la gateway au réseau
 4. **Monitorer** : Consultez le dashboard admin à `http://127.0.0.1:8000/admin/dashboard`
 
@@ -357,3 +360,57 @@ Pour les problèmes spécifiques à macOS, consultez :
 - [Documentation EVARuntime](../../docs/deployment.md) (générale)
 - [Architecture technique](../../docs/architecture.md)
 - Les scripts dans `gateway/` pour comprendre le comportement de la gateway elle-même (identique sur Linux et macOS)
+
+## Sauvegarde de la base de données
+
+La gateway utilise SQLite avec WAL pour la persistance. Une sauvegarde régulière est recommandée.
+
+### Script de sauvegarde inclus
+
+Le script `llm-gateway-backup.sh` est fourni dans le répertoire d'installation. Il peut être lancé manuellement ou via launchd.
+
+```bash
+# Lancer la sauvegarde manuellement
+bash "~/Library/Application Support/evaruntime/gateway/deploy/llm-gateway-backup.sh"
+```
+
+### Configuration automatique avec launchd (optionnel)
+
+Créez un fichier `~/Library/LaunchAgents/com.evaruntime.backup.plist` :
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" 
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.evaruntime.backup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/$(whoami)/Library/Application Support/evaruntime/gateway/deploy/llm-gateway-backup.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+</dict>
+</plist>
+```
+
+Chargez le service :
+```bash
+launchctl load ~/Library/LaunchAgents/com.evaruntime.backup.plist
+```
+
+## Support
+
+Pour les problèmes spécifiques à macOS, consultez :
+- [Documentation EVARuntime](../../docs/deployment.md) (générale)
+- [Architecture technique](../../docs/architecture.md)
+- Les scripts dans `gateway/` pour comprendre le comportement de la gateway elle-même (identique sur Linux et macOS)
+```bash
