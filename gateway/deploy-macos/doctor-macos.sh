@@ -296,7 +296,7 @@ if [[ -d "$LOG_DIR" ]]; then
         PASS "gateway.log présent (${LOG_SIZE})"
         
         # Vérifier les dernières erreurs
-        ERROR_COUNT=$(grep -c "\[ERROR\]" "$LOG_DIR/gateway.log" 2>/dev/null || echo "0")
+        ERROR_COUNT=$(grep -c "\[ERROR\]" "$LOG_DIR/gateway-error.log" 2>/dev/null || echo "0")
         if [[ "$ERROR_COUNT" -gt 0 ]]; then
             WARN "$ERROR_COUNT erreur(s) trouvée(s) dans les logs récents"
         fi
