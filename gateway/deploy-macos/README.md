@@ -130,7 +130,7 @@ Le service est géré automatiquement par `install.sh` et `update.sh`. Les comma
 sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null || true
 
 # Redémarrer
-sudo launchctl bootstrap system ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.evaruntime.gateway.plist
 
 # Vérifier l'état
 launchctl list com.evaruntime.gateway
@@ -318,7 +318,7 @@ ls -la "~/Library/Application Support/evaruntime/logs/"
 
 # Relancer le service avec les bons droits
 sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null || true
-sudo launchctl bootstrap system ~/Library/LaunchDaemons/com.evaruntime.gateway.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.evaruntime.gateway.plist
 ```
 
 ### Reset complet
