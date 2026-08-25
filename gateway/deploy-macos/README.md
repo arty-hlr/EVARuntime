@@ -33,8 +33,8 @@ Avant d'installer EVARuntime, vous devez avoir :
 | Modèles | `/models` | `~/Library/Application Support/evaruntime/models` |
 | GPU | CUDA (NVIDIA) | Metal (Apple Silicon natif) |
 | Reverse-proxy | nginx (systemd) | nginx (Homebrew, optionnel) |
-| Service utilisateur | root (systemd) | Utilisateur courant (launchd) |
-| Permissions | sudo requis | Aucun sudo nécessaire |
+| Service utilisateur | root (systemd) | Utilisateur courant au boot (launchd) |
+| Permissions | sudo requis | sudo requis |
 
 ## Installation rapide
 
@@ -340,7 +340,7 @@ Les scripts macOS sont une adaptation des scripts Linux (`gateway/deploy/`). Les
 | Aspect | Linux | macOS |
 |--------|-------|-------|
 | **Service** | systemd (root) | launchd (utilisateur courant) |
-| **Privilèges** | `sudo` requis | Aucun sudo nécessaire |
+| **Privilèges** | `sudo` requis | `sudo requis` |
 | **GPU** | CUDA + nvidia-smi | Metal (natif Apple Silicon) |
 | **Mémoire** | VRAM dédiée (NVIDIA) | RAM unifiée (CPU+GPU) |
 | **Reverse-proxy** | nginx system-wide | nginx Homebrew (optionnel) |
