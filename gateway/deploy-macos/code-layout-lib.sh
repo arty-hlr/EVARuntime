@@ -54,15 +54,18 @@ deploy_sync_gateway_code() {
 # Artefacts d'exploitation qui doivent exister sur une installation NEUVE
 # comme après une mise à jour. Les garder avec la règle de copie du code évite
 # qu'un runbook pointe vers un fichier uniquement livré par update.sh.
+#
+# Sur macOS, on ne copie que les scripts exécutables (backup et smoke test).
+# Les bibliothèques (deploy-mode-lib.sh, etc.) sont source directement depuis
+# deploy-macos/ par les scripts d'installation, pas depuis l'installation elle-même.
 _DEPLOY_OPERATIONAL_FILES=(
     llm-gateway-backup.sh
     smoke_test.sh
-    deploy-mode-lib.sh
-    nginx-lib.sh
-    runtime-variants.yaml.example
 )
 
-
+# deploy_sync_gateway_operational_files <source_root> <target_install_dir>
+# Copie les fichiers opérationnels depuis gateway/deploy-macos vers l'installation.
+# source_root est le répertoire gateway (ex: /Users/florian/EVARuntime/gateway).
 deploy_sync_gateway_operational_files() {
     local source_root="$1" target_root="$2" file
 
@@ -70,15 +73,15 @@ deploy_sync_gateway_operational_files() {
         "Synchronisation des artefacts d'exploitation" || return 1
 
     for file in "${_DEPLOY_OPERATIONAL_FILES[@]}"; do
-        [[ -f "$source_root/deploy/$file" ]] || {
-            echo "Source gateway incomplète : deploy/$file introuvable" >&2
+        [[ -f "$source_root/deploy-macos/$file" ]] || {
+            echo "Source gateway incomplète : deploy-macos/$file introuvable" >&2
             return 1
         }
     done
 
     mkdir -p "$target_root/deploy"
     for file in "${_DEPLOY_OPERATIONAL_FILES[@]}"; do
-        cp "$source_root/deploy/$file" "$target_root/deploy/"
+        cp "$source_root/deploy-macos/$file" "$target_root/deploy/"
     done
 }
 
@@ -96,7 +99,7 @@ deploy_sync_static_files() {
 }
 
 
-# deploy_set_file_permissions <install_dir> <service_user>
+# deploy_set_file_permissions <install_dir>
 # macOS : pas de service user dédié, les fichiers appartiennent à l'utilisateur courant.
 deploy_set_file_permissions() {
     local install_dir="$1"

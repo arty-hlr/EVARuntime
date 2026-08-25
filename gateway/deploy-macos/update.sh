@@ -29,8 +29,6 @@ section() { echo -e "\n${CYAN}▶ $*${NC}"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# shellcheck source=deploy-macos/deploy-mode-lib.sh
-source "$SCRIPT_DIR/deploy-macos/deploy-mode-lib.sh"
 # shellcheck source=deploy-macos/code-layout-lib.sh
 source "$SCRIPT_DIR/deploy-macos/code-layout-lib.sh"
 
@@ -91,6 +89,11 @@ if [[ -d "$SCRIPT_DIR/static" ]]; then
     mkdir -p "$INSTALL_DIR/static"
     cp -r "$SCRIPT_DIR/static/." "$INSTALL_DIR/static/"
 fi
+
+# Fichiers opérationnels (backup, smoke test, etc.)
+info "Copie des fichiers opérationnels…"
+deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"
+
 deploy_set_file_permissions "$INSTALL_DIR"
 info "Code synchronisé."
 
@@ -113,15 +116,23 @@ section "Redémarrage du service…"
 
 if launchctl list com.evaruntime.gateway &>/dev/null; then
     info "Arrêt du service…"
-    launchctl bootout system/com.evaruntime.gateway 2>/dev/null || \
-        launchctl unload "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null || true
+    if ! sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null; then
+        warn "Échec de l'arrêt du service via launchctl bootout."
+        if ! sudo launchctl unload "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
+            error "Impossible d'arrêter le service. Vérifiez les permissions.";
+        fi
+    fi
     
     # Petit délai pour libérer le port
     sleep 2
     
     info "Démarrage du service…"
-    launchctl bootstrap system "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null || \
-        launchctl load "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null || true
+    if ! sudo launchctl bootstrap system "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
+        warn "Échec de launchctl bootstrap. Tentative avec launchctl load…"
+        if ! sudo launchctl load "$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist" 2>/dev/null; then
+            error "Impossible de démarrer le service. Vérifiez les permissions.";
+        fi
+    fi
     
     # Attendre que le service soit prêt
     info "Attente du ready state…"

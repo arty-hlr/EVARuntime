@@ -5,6 +5,9 @@
 #   bash doctor-macos.sh [--json]
 #
 # Vérifie l'état complet de l'installation et signale les problèmes potentiels.
+#
+# IMPORTANT : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local
+#             (mono-nœud) est fonctionnel.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -37,6 +40,11 @@ LOG_DIR="${EVARUNE_LOG_DIR:-$HOME/Library/Application Support/evaruntime/logs}"
 CONFIG_FILE="$HOME/.config/evaruntime/env"
 MODELS_DIR="${EVARUNE_MODELS_DIR:-$HOME/Library/Application Support/evaruntime/models}"
 PLIST_PATH="$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# shellcheck source=deploy-mode-lib.sh
+source "$SCRIPT_DIR/deploy-macos/deploy-mode-lib.sh"
 
 # ── Prérequis système ────────────────────────────────────────────────────────
 

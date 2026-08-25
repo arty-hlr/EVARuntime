@@ -8,10 +8,13 @@
 #   - llama.cpp compilé et installé via Homebrew (brew install llama.cpp)
 #
 # Usage :
-#   bash install.sh --mode local    # mono-nœud (défaut)
+#   bash install.sh --mode local    # mono-nœud (SEUL mode supporté sur macOS)
 #   bash install.sh --dry-run       # affiche le plan sans modifier le système
 #
 # Ce script est idempotent : le relancer ne casse pas une installation existante.
+#
+# IMPORTANT : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local
+# (mono-nœud) est fonctionnel. Toute tentative d'installer en mode cluster échouera.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -29,11 +32,10 @@ source "$SCRIPT_DIR/deploy-macos/code-layout-lib.sh"
 
 usage() {
     cat <<EOF
-Usage: $0 [--mode local|cluster] [--dry-run] [-h|--help]
+Usage: $0 [--mode local] [--dry-run] [-h|--help]
 
-  --mode local       Gateway mono-nœud (défaut sur une installation neuve).
-  --mode cluster     Orchestrateur multi-nœuds (déconseillé sur Mac Studio).
-  --dry-run          Affiche le mode et le plan sans modifier l'hôte.
+  --mode local       Gateway mono-nœud (SEUL mode supporté sur macOS).
+  --dry-run          Affiche le plan sans modifier l'hôte.
 
 Sur macOS, EVARuntime s'installe dans ~/Library/Application Support/evaruntime/
 et utilise launchd pour la gestion du service. Homebrew est requis pour nginx
@@ -41,6 +43,9 @@ et utilise launchd pour la gestion du service. Homebrew est requis pour nginx
 
 Le binaire llama-server doit être installé via Homebrew avant de lancer ce script :
   brew install llama.cpp
+
+IMPORTANT : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local
+            (mono-nœud) est fonctionnel.
 EOF
 }
 
@@ -50,7 +55,7 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode)
-            [[ $# -ge 2 ]] || { echo "--mode requiert local ou cluster" >&2; usage; exit 2; }
+            [[ $# -ge 2 ]] || { echo "--mode requiert local" >&2; usage; exit 2; }
             deploy_validate_mode "$2" || { echo "Mode invalide : $2" >&2; usage; exit 2; }
             REQUESTED_MODE="$2"; MODE_WAS_EXPLICIT=true; shift 2 ;;
         --mode=*)
@@ -173,6 +178,10 @@ if [[ -d "$SCRIPT_DIR/static" ]]; then
     cp -r "$SCRIPT_DIR/static/." "$INSTALL_DIR/static/"
 fi
 
+# Fichiers opérationnels (backup, smoke test, etc.)
+info "Copie des fichiers opérationnels…"
+deploy_sync_gateway_operational_files "$SCRIPT_DIR" "$INSTALL_DIR"
+
 deploy_set_file_permissions "$INSTALL_DIR"
 
 # ── 3. Environnement virtuel Python ──────────────────────────────────────────
@@ -229,10 +238,6 @@ info "Installation du service launchd…"
 PLIST_DIR="$HOME/Library/LaunchDaemons"
 mkdir -p "$PLIST_DIR"
 
-if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
-    warn "Mode cluster : le service sera installé mais sans préflight GPU."
-fi
-
 # Copier le template plist et substituer les variables
 info "Génération du plist launchd…"
 sed -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
@@ -241,8 +246,10 @@ sed -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
     "$SCRIPT_DIR/deploy-macos/com.evaruntime.gateway.plist" \
     > "$PLIST_DIR/com.evaruntime.gateway.plist"
 
-# Charger le service dans launchd
-launchctl load "$PLIST_DIR/com.evaruntime.gateway.plist" 2>/dev/null || true
+# Charger le service dans launchd (nécessite sudo pour LaunchDaemons)
+if ! sudo launchctl load "$PLIST_DIR/com.evaruntime.gateway.plist" 2>/dev/null; then
+    error "Échec du chargement du service launchd. Vérifiez les permissions et les logs.";
+fi
 info "Service launchd installé et chargé."
 
 # ── 7. Nginx (optionnel) ─────────────────────────────────────────────────────

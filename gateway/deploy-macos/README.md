@@ -1,5 +1,7 @@
 # EVARuntime — Déploiement sur macOS (Mac Studio)
 
+> **IMPORTANT** : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local (mono-nœud) est fonctionnel.
+
 Ce répertoire contient les scripts de déploiement d'EVARuntime pour macOS, spécifiquement conçus pour Mac Studio avec puces Apple Silicon (M2/M3/M4).
 
 ## Prérequis
@@ -41,7 +43,7 @@ Avant d'installer EVARuntime, vous devez avoir :
 # 1. Vérifier le plan d'installation (dry-run)
 bash gateway/deploy-macos/install.sh --dry-run
 
-# 2. Lancer l'installation
+# 2. Lancer l'installation (SEUL mode supporté)
 bash gateway/deploy-macos/install.sh --mode local
 
 # 3. Vérifier l'état de l'installation
@@ -53,13 +55,14 @@ bash gateway/deploy-macos/doctor-macos.sh
 ### install.sh — Installation complète
 
 ```bash
-bash gateway/deploy-macos/install.sh [--mode local|cluster] [--dry-run]
+bash gateway/deploy-macos/install.sh --mode local [--dry-run]
 ```
 
 **Options :**
-- `--mode local` : Gateway mono-nœud (défaut, recommandé pour Mac Studio)
-- `--mode cluster` : Orchestrateur multi-nœuds (déconseillé sur Mac Studio)
+- `--mode local` : Gateway mono-nœud (SEUL mode supporté sur macOS)
 - `--dry-run` : Affiche le plan sans modifier le système
+
+> **Note** : Le mode cluster n'est PAS supporté sur macOS. Toute tentative d'installer en mode cluster échouera.
 
 **Ce que fait install.sh :**
 1. Vérifie les prérequis (Homebrew, Python 3.11+, llama-server)

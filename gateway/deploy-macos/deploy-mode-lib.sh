@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # deploy-mode-lib.sh — Validation du mode de déploiement (macOS)
 #
-# Le concept de mode (local vs cluster) est identique sur macOS et Linux.
+# IMPORTANT : Le mode cluster n'est PAS supporté sur macOS.
 # Cette bibliothèque fournit uniquement la fonction de validation.
 
 deploy_validate_mode() {
     case "$1" in
-        local|cluster) return 0 ;;
-        *) echo "Mode invalide : $1 (attendu: local ou cluster)" >&2; return 1 ;;
+        local) return 0 ;;
+        cluster)
+            echo "Mode cluster non supporté sur macOS. Utilisez 'local'." >&2
+            return 1
+            ;;
+        *) echo "Mode invalide : $1 (attendu: local)" >&2; return 1 ;;
     esac
 }
 

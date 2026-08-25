@@ -8,6 +8,9 @@
 #   --keep-data     Conserve les modèles GGUF et la base de données
 #   --keep-config   Conserve le fichier de configuration (secrets inclus)
 #   --force         Supprime tout sans confirmation interactive
+#
+# IMPORTANT : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local
+#             (mono-nœud) est fonctionnel.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -47,8 +50,8 @@ PLIST_PATH="$HOME/Library/LaunchDaemons/com.evaruntime.gateway.plist"
 
 info "Arrêt du service…"
 if launchctl list com.evaruntime.gateway &>/dev/null; then
-    launchctl bootout system/com.evaruntime.gateway 2>/dev/null || \
-        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null || \
+        sudo launchctl unload "$PLIST_PATH" 2>/dev/null || true
     info "Service arrêté."
 else
     info "Service déjà arrêté (ou jamais installé)."
