@@ -153,7 +153,7 @@ if launchctl list com.evaruntime.gateway &>/dev/null; then
     fi
 else
     warn "Service non chargé — lancez manuellement :"
-    warn "  launchctl load ~/Library/LaunchDaemons/com.evaruntime.gateway.plist"
+    warn "  sudo launchctl load /Library/LaunchDaemons/com.evaruntime.gateway.plist"
 fi
 
 # ── 5. Nginx (optionnel) ─────────────────────────────────────────────────────
