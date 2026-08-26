@@ -252,10 +252,38 @@ SMOKE_USER="evaruntime-smoke-$(date +%Y%m%d-%H%M%S)-$$"
 IDENTITY_ARMED=false
 IDENTITY_CLEANED=false
 CLEANUP_FAILED=false
+UNLOAD_FAILED=false
+MODEL_LOADED=false
 KEY_PREFIX=""
 
 # Idempotent : appelable par `finish` (pour que le rapport reflète le nettoyage)
 # ET par le trap (pour couvrir une interruption ou une sortie imprévue).
+unload_model() {
+    [[ "$MODEL_LOADED" == true ]] || return 0
+    MODEL_LOADED=false
+
+    local restore_errexit=false code
+    if [[ -o errexit ]]; then restore_errexit=true; fi
+    set +e
+
+    # POST /admin/models/{id}/unload répond 404 si le modèle est déjà déchargé.
+    code="$(admin_call POST "/admin/models/$MODEL_ID/unload" "$TMP_DIR/cleanup-unload.json" "$ADMIN_TIMEOUT")"
+    case "$code" in
+        200|404) ;;
+        *) UNLOAD_FAILED=true; fail "Déchargement du modèle : HTTP ${code:-<aucune réponse>}" ;;
+    esac
+
+    if [[ "$UNLOAD_FAILED" == true ]]; then
+        fail "DÉCHARGEMENT RÉSIDUEL — retirez-le à la main :"
+        fail "  curl -X POST -H 'Authorization: Bearer <ADMIN_SECRET>' $ADMIN_URL/admin/models/$MODEL_ID/unload"
+    else
+        info "Modèle déchargé avec succès."
+    fi
+
+    if [[ "$restore_errexit" == true ]]; then set -e; fi
+    return 0
+}
+
 cleanup_identity() {
     [[ "$IDENTITY_ARMED" == true ]] || return 0
     [[ "$IDENTITY_CLEANED" != true ]] || return 0
@@ -299,6 +327,7 @@ on_exit() {
     trap - EXIT INT TERM HUP
     set +e
     cleanup_identity
+    unload_model
     # Une identité résiduelle ne doit jamais passer pour un succès.
     if [[ "$CLEANUP_FAILED" == true && $rc -eq 0 ]]; then
         rc=$EXIT_IDENTITY
@@ -798,6 +827,11 @@ finish() {
         code="$EXIT_IDENTITY"
         put reason "identity_cleanup_failed"
     fi
+    unload_model $MODEL_ID
+    if [[ "$UNLOAD_FAILED" == true && "$code" -eq 0 ]]; then
+        code="$EXIT_UNLOAD"
+        put reason "model_unload_failed"
+    fi
     emit_report "$code"
     exit "$code"
 }
@@ -929,6 +963,7 @@ if [[ "$CODE" != "200" ]]; then
     [[ "$CODE" != "504" ]] || fail "504 : l'appel de contrôle a probablement traversé un proxy dont le timeout est trop court. Visez --admin-url en direct."
     finish "$EXIT_GENERATION"
 fi
+MODEL_LOADED=true
 info "Modèle chargé et prêt."
 
 # ── 6. Génération streamée sur le chemin public ───────────────────────────────
