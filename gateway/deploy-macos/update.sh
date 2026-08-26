@@ -81,7 +81,11 @@ fi
 # Sauvegarder les fichiers de configuration (sauf secrets)
 if [[ -f "$CONFIG_FILE" ]]; then
     info "Sauvegarde de la configuration…"
+    # Le fichier d'env contient ADMIN_SECRET et INTERNAL_API_KEY : la source
+    # est en 600, la sauvegarde doit l'être aussi (sinon umask → 644 lisible
+    # par tous les comptes locaux).
     cp "$CONFIG_FILE" "$BACKUP_DIR/$BACKUP_NAME/env.bak"
+    chmod 600 "$BACKUP_DIR/$BACKUP_NAME/env.bak"
 fi
 
 info "Sauvegarde terminée : $BACKUP_DIR/$BACKUP_NAME/"
