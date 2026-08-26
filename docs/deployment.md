@@ -13,12 +13,12 @@ EVARuntime peut être déployé sur Mac avec puce Apple Silicon (M2/M3/M4). L'in
 
 ### Prérequis
 
-- **macOS 26+** sur un Mac avec puce Apple Silicon
+- **macOS 14+ (Sonoma)** minimum sur un Mac avec puce Apple Silicon — c'est le plancher affirmé par l'en-tête de `gateway/deploy-macos/install.sh` ; le déploiement de référence validé tourne sous **macOS 26** sur Mac Studio M2 Ultra
 - **Homebrew** installé ([https://brew.sh](https://brew.sh))
-- **llama.cpp** via Homebrew (inclut `llama-server` avec support Metal) :
-  ```bash
-  brew install llama.cpp
-  ```
+- **llama.cpp** avec support Metal. Deux voies, détaillées dans le
+  [guide de compilation macOS](build-llama-cpp-macos.md) :
+  - voie rapide : `brew install llama.cpp` (versions potentiellement décalées, backend Metal parfois absent du bottle) ;
+  - voie recommandée en production : compilation depuis les sources, publication versionnée derrière un lien `current`.
 
 Le binaire `llama-server` doit être accessible dans votre `$PATH`. Homebrew l'installe généralement dans `/opt/homebrew/bin/llama-server`.
 
@@ -48,6 +48,80 @@ bash install.sh --mode local
 
 # 3. Vérifier l'état de l'installation
 bash doctor-macos.sh
+```
+
+### Obtenir un premier modèle
+
+L'installateur crée le répertoire des modèles mais ne télécharge aucun GGUF.
+Posez un premier modèle léger dans `~/Library/Application Support/evaruntime/models/`.
+Exemple avec Qwen2.5 0.5B (~400 Mo, même recette que le parcours Linux) :
+
+```bash
+# CLI Hugging Face. La commande historique `huggingface-cli` a été retirée de
+# huggingface_hub v1.0 : la commande actuelle est `hf`.
+python3 -m pip install --upgrade huggingface-hub
+
+hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF \
+  --include '*q4_k_m*' \
+  --local-dir "$HOME/Library/Application Support/evaruntime/models/qwen2.5-0.5b"
+
+find "$HOME/Library/Application Support/evaruntime/models/qwen2.5-0.5b" -name '*.gguf' -print
+```
+
+Le fichier attendu est
+`qwen2.5-0.5b-instruct-q4_k_m.gguf`. Notez le chemin complet affiché par
+`find` : c'est celui du registre à l'étape suivante.
+
+### Activer un modèle sur Mac — le double geste obligatoire
+
+Sur macOS, rendre un modèle disponible exige **deux modifications cohérentes**,
+sinon la gateway **refuse de démarrer** (validation fail-closed documentée au
+[§5](#les-trois-durcissements-posés-par-linstallateur)) :
+
+1. **Le registre** — `~/Library/Application Support/evaruntime/data/models.yaml`
+   est livré avec les chemins Linux d'origine (`/models/…`), tous désactivés.
+   Éditez une entrée pour pointer vers votre GGUF et l'activer :
+
+   ```yaml
+     - id: "qwen2.5-0.5b-instruct-q4_k_m"
+       path: "/Users/<user>/Library/Application Support/evaruntime/models/qwen2.5-0.5b/qwen2.5-0.5b-instruct-q4_k_m.gguf"
+       vram_gb: 1.0
+       enabled: true
+       capabilities: [text_generation, streaming]
+       llama_params:
+         n_gpu_layers: 999    # tout offloader vers Metal (plafonné automatiquement)
+         ctx_size: 4096
+         parallel: 1
+         flash_attn: true
+   ```
+
+2. **L'allowlist** — chaque entrée du registre (activée ou non) doit résider
+   dans un répertoire listé par `ALLOWED_MODEL_DIRS` du fichier
+   `~/.config/evaruntime/env`. À l'installation, cette clé est dérivée
+   **automatiquement du registre livré** par le template macOS
+   (`gateway/deploy-macos/env-template-lib.sh`,
+   `deploy_model_dirs_from_registry`) : elle contient donc le répertoire des
+   modèles standard plus les parents des chemins `/models/…` du registre
+   d'origine.
+
+   Conséquence pratique :
+
+   - GGUF posé dans `~/Library/Application Support/evaruntime/models/` → rien à
+     faire, ce répertoire est déjà dans l'allowlist ;
+   - GGUF posé **ailleurs** (disque externe, dossier personnel…) → ajouter le
+     répertoire parent **à la main** dans `~/.config/evaruntime/env`, sinon le
+     démarrage échoue :
+
+     ```ini
+     ALLOWED_MODEL_DIRS=/Users/<user>/Library/Application Support/evaruntime/models,/Volumes/inference/gguf
+     ```
+
+Après ces deux gestes, validez avant de redémarrer :
+
+```bash
+bash gateway/deploy-macos/doctor-macos.sh
+sudo launchctl kickstart -k system/com.evaruntime.gateway
+curl -fsS http://127.0.0.1:8000/health && curl -i http://127.0.0.1:8000/ready
 ```
 
 ### Commandes disponibles
@@ -94,6 +168,29 @@ bash gateway/deploy-macos/doctor-macos.sh [--json]
 
 Vérifie l'état complet de l'installation et signale les problèmes potentiels.
 
+#### Variables d'override des chemins
+
+Les scripts macOS lisent des variables d'environnement optionnelles pour
+déplacer les répertoires standards. Exportez-les **avant** d'invoquer le script
+(`EVARUNE_DATA_DIR=/… bash install.sh --mode local`) ; les changer entre deux
+exécutions produit des installations divergentes.
+
+| Variable | Défaut | Lue par |
+|---|---|---|
+| `EVARUNE_INSTALL_DIR` | `~/Library/Application Support/evaruntime/gateway` | `install.sh`, `update.sh`, `uninstall.sh`, `doctor-macos.sh` |
+| `EVARUNE_DATA_DIR` | `~/Library/Application Support/evaruntime/data` | `install.sh`, `update.sh`, `uninstall.sh`, `doctor-macos.sh` |
+| `EVARUNE_LOG_DIR` | `~/Library/Application Support/evaruntime/logs` | `install.sh`, `update.sh`, `uninstall.sh`, `doctor-macos.sh` |
+| `EVARUNE_CONFIG_DIR` | `~/.config/evaruntime` | `install.sh` |
+| `EVARUNE_MODELS_DIR` | `~/Library/Application Support/evaruntime/models` | `install.sh`, `uninstall.sh`, `doctor-macos.sh` |
+
+Une variable liée au runtime lui-même : `LLAMA_BIN` désigne le chemin de
+`llama-server` écrit dans le fichier env **au moment où `install.sh` génère la
+configuration initiale** (défaut `/opt/homebrew/bin/llama-server`). Après
+installation, c'est la clé `LLAMA_SERVER_BIN` du fichier
+`~/.config/evaruntime/env` qui fait foi ; pour pointer vers un build compilé
+depuis les sources, voir le [guide de compilation
+macOS](build-llama-cpp-macos.md).
+
 ### Gestion du service
 
 Le service est géré automatiquement par `install.sh` et `update.sh`. Les commandes manuelles sont réservées au dépannage.
@@ -113,10 +210,100 @@ launchctl list com.evaruntime.gateway
 
 ```bash
 # Logs en temps réel
-tail -f "~/Library/Application Support/evaruntime/logs/gateway.log"
+tail -f "$HOME/Library/Application Support/evaruntime/logs/gateway.log"
 
 # Erreurs uniquement
-tail -f "~/Library/Application Support/evaruntime/logs/gateway-error.log"
+tail -f "$HOME/Library/Application Support/evaruntime/logs/gateway-error.log"
+```
+
+> **Attention** : ne mettez pas le tilde entre guillemets simples
+> (`tail -f "~/Library/…"`) — dans ce cas `~` n'est pas étendu par le shell et
+> `tail` cherche un fichier littéralement nommé `~/Library/…`. Les guillemets
+> doubles autour de `$HOME` fonctionnent, ou sans guillemets si vous acceptez
+> d'échapper l'espace.
+
+### Dépannage macOS
+
+#### Metal est-il réellement utilisé ?
+
+Un modèle peut tourner sur CPU sans aucune erreur — seul le débit s'effondre
+(bottle Homebrew sans backend Metal, shader non compilé, couches non offlées).
+Au chargement du modèle, les logs de `llama-server` doivent contenir :
+
+```text
+load_tensors: offloaded N/N layers to GPU     ← toutes les couches sur GPU
+ggml_metal_init: picking default device: Apple M2 Ultra
+ggml_metal_init: recommendedMaxWorkingSetSize = XXXXX MB
+```
+
+Si la ligne `offloaded` montre `0/N` ou si aucune ligne `ggml_metal_*`
+(`ggml_metal_device_init`/`ggml_metal_library_init` selon la version) apparaît,
+Metal n'est pas actif. Diagnostic complet, comparaison CPU/GPU et correction :
+[guide de compilation macOS](build-llama-cpp-macos.md), section
+« Vérifier que Metal est réellement utilisé ».
+
+#### OOM mémoire unifiée (limite wired)
+
+Sur Apple Silicon, macOS plafonne la mémoire que le GPU peut verrouiller
+(« wired ») à environ 65–75 % de la RAM unifiée selon la machine. Symptôme
+typique : allocation refusée ou crash de `llama-server` alors que le Moniteur
+d'activité montre de la RAM libre ; le log annonce un
+`recommendedMaxWorkingSetSize` nettement inférieur à la RAM installée.
+
+```bash
+# Valeur courante (0 = défaut système ≈ 65–75 % de la RAM)
+sysctl iogpu.wired_limit_mb
+
+# Exemple : relever le plafond à 112 Go sur une machine 128 Go
+sudo sysctl iogpu.wired_limit_mb=114688
+
+# Retour au défaut système
+sudo sysctl iogpu.wired_limit_mb=0
+```
+
+Le réglage est immédiat mais **non persistant au redémarrage**, il ne crée pas
+de mémoire et ne doit pas être poussé à 100 % de la RAM : macOS a besoin d'un
+résident garanti (8–16 Go selon la configuration). Surveillez la pression
+mémoire après changement.
+
+Deuxième cause fréquente côté gateway : le budget d'admission
+(`TOTAL_VRAM_GB`, `VRAM_OVERHEAD_GB`, `VRAM_SAFETY_MARGIN` dans
+`~/.config/evaruntime/env`) dépasse ce que le plafond wired autorise. Le
+template macOS pose `TOTAL_VRAM_GB` à la RAM totale détectée : tant que ce
+budget n'est pas recalibré sur le plafond réel, alignez-le manuellement sur la
+valeur utilisable (`recommendedMaxWorkingSetSize` des logs). Réduire
+`ctx_size`/`parallel` dans `models.yaml` reste le premier levier.
+
+#### Port 8000 occupé
+
+macOS n'embarque pas `ss` : utilisez `lsof`.
+
+```bash
+lsof -i :8000 -n -P
+# COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+# Python  12345 user   12u  IPv4  …      TCP 127.0.0.1:8000 (LISTEN)
+
+kill <PID>          # processus parasite, puis relancer le service
+```
+
+#### Service launchd en boucle de redémarrage
+
+Le plist pose `KeepAlive=true` : dès que le processus meurt, launchd le
+relance. Un défaut au démarrage (allowlist, registre invalide, secret manquant)
+donne donc une boucle silencieuse. Lire l'erreur exacte dans le fichier pointé
+par `StandardErrorPath` :
+
+```bash
+tail -50 "$HOME/Library/Application Support/evaruntime/logs/gateway-error.log"
+
+launchctl list com.evaruntime.gateway   # PID "-" = le processus ne tient pas
+```
+
+Corrigez la cause affichée (voir aussi
+[doctor-macos.sh](#doctormacossh--diagnostic-complet)), puis relancez :
+
+```bash
+sudo launchctl kickstart -k system/com.evaruntime.gateway
 ```
 
 ## Déploiement local — premier token (Linux)
