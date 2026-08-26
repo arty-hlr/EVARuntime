@@ -57,7 +57,7 @@ CONFIG_FILE="$HOME/.config/evaruntime/env"
 
 section "Vérification du service en cours…"
 
-if ! launchctl list com.evaruntime.gateway &>/dev/null; then
+if ! sudo launchctl list com.evaruntime.gateway &>/dev/null; then
     warn "Service com.evaruntime.gateway non chargé dans launchd."
     warn "→ L'update continuera mais le service ne sera pas redémarré automatiquement."
 fi
@@ -124,7 +124,7 @@ fi
 
 section "Redémarrage du service…"
 
-if launchctl list com.evaruntime.gateway &>/dev/null; then
+if sudo launchctl list com.evaruntime.gateway &>/dev/null; then
     info "Arrêt du service…"
     if ! sudo launchctl bootout system/com.evaruntime.gateway 2>/dev/null; then
         warn "Échec de l'arrêt du service via launchctl bootout."
