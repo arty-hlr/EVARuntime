@@ -2138,6 +2138,11 @@ function renderModelsTable(models) {
 
     const caps = (m.capabilities || []).join(', ') || '—';
 
+    // Sous-ligne runtime de la cellule état : uptime + durée du dernier chargement.
+    const runtimeSub = [];
+    if (isReady && m.uptime_seconds != null) runtimeSub.push('up ' + fmtDuration(m.uptime_seconds));
+    if (isReady && m.last_load_seconds != null) runtimeSub.push('load ' + fmtDuration(m.last_load_seconds));
+
     return `<tr>
       <td>
         <div class="model-id">${esc(m.id)}</div>
@@ -2149,7 +2154,7 @@ function renderModelsTable(models) {
         <span class="state-badge ${state}">
           <span class="${dotCls}"></span>${state}
         </span>
-        ${isReady && m.uptime_seconds != null ? '<div style="font-size:10px;color:var(--text3);margin-top:2px">up ' + fmtDuration(m.uptime_seconds) + '</div>' : ''}
+        ${runtimeSub.length ? '<div style="font-size:10px;color:var(--text3);margin-top:2px">' + esc(runtimeSub.join(' · ')) + '</div>' : ''}
       </td>
       <td>
         <label class="toggle" title="${m.enabled ? 'Click to disable' : 'Click to enable'}">
@@ -2221,6 +2226,7 @@ function openModelInfo(id) {
   html += miRow('Port', m.port != null ? String(m.port) : '—');
   html += miRow('Uptime', m.uptime_seconds != null ? fmtDuration(m.uptime_seconds) : '—');
   html += miRow('Idle', m.idle_seconds != null ? fmtDuration(m.idle_seconds) : '—');
+  html += miRow('Last load', m.last_load_seconds != null ? fmtDuration(m.last_load_seconds) : '—');
 
   html += `<div class="mi-section-label">File</div>`;
   html += `<div class="status-row"><span class="status-key">Path</span><span class="status-val mono" style="word-break:break-all;text-align:right">${esc(m.path || '—')}</span></div>`;

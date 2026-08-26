@@ -919,6 +919,7 @@ class LocalModelManager:
                     "port": None,
                     "uptime_seconds": None,
                     "idle_seconds": None,
+                    "last_load_seconds": None,
                     "llama_params": None,
                 }
             models_status.append(entry)

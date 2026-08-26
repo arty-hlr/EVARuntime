@@ -82,6 +82,11 @@ class ServerManager:
         self._state: ModelState = ModelState.UNLOADED
         self._last_request_time: float = 0.0
         self._load_start_time: float = 0.0
+        # Durée du dernier chargement réussi (transition READY), en secondes.
+        # None tant qu'aucun chargement n'a abouti sur cette instance ; l'instance
+        # étant détruite à chaque déchargement, la valeur est bien « dernier
+        # chargement du modèle actuellement en mémoire ».
+        self._last_load_seconds: float | None = None
 
         self._state_lock = asyncio.Lock()
         self._ready_event: asyncio.Event | None = None
@@ -119,6 +124,11 @@ class ServerManager:
         if self._state == ModelState.READY and self._load_start_time:
             return time.monotonic() - self._load_start_time
         return None
+
+    @property
+    def last_load_seconds(self) -> float | None:
+        """Durée du dernier chargement réussi, ou None si jamais prêt."""
+        return self._last_load_seconds
 
     @property
     def idle_seconds(self) -> float:
@@ -259,14 +269,18 @@ class ServerManager:
                     await self._kill_process()  # idempotent, sécurité
                     return  # le finally s'exécute quand même (event.set + capacity)
                 self._state = ModelState.READY
-                self._load_start_time = time.monotonic()
-                self._last_request_time = time.monotonic()
+                now = time.monotonic()
+                self._last_load_seconds = max(0.0, now - started_at)
+                self._load_start_time = now
+                self._last_request_time = now
 
             log.info(
-                "llama-server prêt — modèle '%s' chargé sur port %d (PID %d)",
+                "llama-server prêt — modèle '%s' chargé sur port %d (PID %d) "
+                "en %.1f s",
                 self._model.id,
                 self._port,
                 self._process.pid if self._process else -1,
+                self._last_load_seconds,
             )
 
             self._idle_task = asyncio.create_task(self._idle_monitor())
@@ -583,6 +597,11 @@ class ServerManager:
             "port": self._port,
             "uptime_seconds": self.uptime_seconds,
             "idle_seconds": round(self.idle_seconds, 1) if self._last_request_time else None,
+            "last_load_seconds": (
+                round(self._last_load_seconds, 2)
+                if self._last_load_seconds is not None
+                else None
+            ),
             "active_requests": self._active_requests,
             "llama_params": {
                 "n_gpu_layers": self._model.llama_params.n_gpu_layers,

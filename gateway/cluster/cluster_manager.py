@@ -55,6 +55,10 @@ class _LoadedInfo:
     llama_url: str
     internal_api_key: str
     vram_gb: float
+    # Durée du chargement qui a mis ce handle en place, mesurée côté
+    # orchestrateur (RPC réseau inclus — même sémantique que MODEL_LOAD_SECONDS).
+    # None si inconnue : modèle déjà chargé sur le nœud au moment du placement.
+    last_load_seconds: float | None = None
     _last_request: float = field(default_factory=time.monotonic)
     _active_requests: int = 0
     # Empêche le fast-path de distribuer un nouveau handle pendant une
@@ -704,8 +708,9 @@ class ClusterManager:
                     )
                     continue
                 finally:
+                    load_seconds = max(0.0, time.monotonic() - load_started_at)
                     MODEL_LOAD_SECONDS.observe(
-                        max(0.0, time.monotonic() - load_started_at),
+                        load_seconds,
                         model=model.id,
                         node=chosen_state.node_id,
                         outcome=load_outcome,
@@ -716,6 +721,12 @@ class ClusterManager:
                     llama_url=resp.llama_url,
                     internal_api_key=resp.internal_api_key,
                     vram_gb=model.vram_gb,
+                    # already_loaded=True : le modèle tournait déjà sur le nœud,
+                    # la durée réelle du chargement d'origine est inconnue — on
+                    # n'invente pas une valeur à partir du seul aller-retour RPC.
+                    last_load_seconds=(
+                        None if resp.already_loaded else load_seconds
+                    ),
                 )
                 async with self._lock:
                     if self._unloading_all:
@@ -1233,6 +1244,11 @@ class ClusterManager:
                     "llama_url": info.llama_url,
                     "idle_seconds": round(info.idle_seconds, 1),
                     "active_requests": info.active_requests,
+                    "last_load_seconds": (
+                        round(info.last_load_seconds, 2)
+                        if info.last_load_seconds is not None
+                        else None
+                    ),
                     "pid": None,
                     "port": None,
                     "uptime_seconds": None,
@@ -1251,6 +1267,7 @@ class ClusterManager:
                     "llama_url": None,
                     "idle_seconds": None,
                     "active_requests": 0,
+                    "last_load_seconds": None,
                     "pid": None,
                     "port": None,
                     "uptime_seconds": None,

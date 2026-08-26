@@ -128,6 +128,10 @@ async def test_admin_status_cluster_reports_hosting_node(
     assert entry["state"] == "ready"
     assert entry["node"] == "node-a"
     assert entry["active_requests"] == 0
+    # Issue #31 : durée du chargement mesurée côté orchestrateur (RPC inclus),
+    # le modèle ayant été réellement chargé par ce placement.
+    assert entry["last_load_seconds"] is not None
+    assert entry["last_load_seconds"] >= 0.0
     # Détail d'infra interne : jamais exposé par /admin/status.
     assert "llama_url" not in entry
 
@@ -196,6 +200,20 @@ def test_admin_status_local_keeps_vram_drift_fields(
 
     assert budget["gpu_used_mb_measured"] == 20480.0
     assert budget["vram_drift_mb"] == 128.0
+
+
+def test_admin_status_local_exposes_last_load_seconds(client, admin_headers):
+    """
+    Issue #31 : `last_load_seconds` traverse le response model et reste présent
+    dans chaque entrée de `models`, même déchargée (None en mode local hors
+    chargement — aucun modèle n'est chargé par les tests).
+    """
+    body = client.get("/admin/status", headers=admin_headers).json()
+    assert body["models"], "le registre local doit contenir des modèles"
+
+    for entry in body["models"]:
+        assert "last_load_seconds" in entry
+        assert entry["last_load_seconds"] is None
 
 
 # ── Validation directe de VramBudgetResponse ──────────────────────────────────
