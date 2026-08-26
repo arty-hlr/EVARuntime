@@ -873,6 +873,13 @@ else
             warn "La version ${AFTER:0:8} est fonctionnelle et RESTE déployée."
             error "Identité de smoke test résiduelle : retirez-la immédiatement (voir le rapport ci-dessus)."
             ;;
+        6)
+            # Même logique que 5 : la version SERT, seul le déchargement du
+            # modèle de smoke test échoue. Le rollback serait disproportionné,
+            # mais le modèle résiduel doit rester bruyant et non nul.
+            warn "La version ${AFTER:0:8} est fonctionnelle et RESTE déployée."
+            error "Modèle de smoke test résiduel (déchargement en échec) : retirez-le à la main (voir le rapport ci-dessus)."
+            ;;
         *)
             rollback_deployed_release \
                 "Recette du premier token en ÉCHEC (code $SMOKE_RC) : la version ${AFTER:0:8} répond mais ne sert pas."

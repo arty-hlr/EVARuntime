@@ -88,6 +88,7 @@ EXIT_USAGE=2
 EXIT_PREFLIGHT=3
 EXIT_TTFT=4
 EXIT_IDENTITY=5
+EXIT_UNLOAD=6
 
 # Les traces vont sur stderr, le RAPPORT sur stdout : `--json` reste ainsi
 # directement exploitable par un pipeline.
@@ -137,7 +138,8 @@ Options :
   -h, --help               Cette aide
 
 Exit codes : 0 succès, 1 échec fonctionnel, 2 erreur d'usage, 3 préflight,
-4 seuil TTFT dépassé (avec --fail-on-ttft), 5 identité éphémère résiduelle.
+4 seuil TTFT dépassé (avec --fail-on-ttft), 5 identité éphémère résiduelle,
+6 modèle de recette non déchargé.
 EOF
 }
 
@@ -848,7 +850,7 @@ finish() {
         code="$EXIT_IDENTITY"
         put reason "identity_cleanup_failed"
     fi
-    unload_model $MODEL_ID
+    unload_model
     if [[ "$UNLOAD_FAILED" == true && "$code" -eq 0 ]]; then
         code="$EXIT_UNLOAD"
         put reason "model_unload_failed"
@@ -977,8 +979,13 @@ info "Identité éphémère créée (clé jamais imprimée ni passée en argumen
 # test qui demande le chargement, le temps de sa propre exécution.
 
 section "5/8  Chargement explicite du modèle (max ${LOAD_TIMEOUT}s)"
-MODEL_LOADED="$(helper is-loaded "$TMP_DIR/models.json" "$MODEL_ID" 2>/dev/null)"
-if [[ "$MODEL_LOADED" == true ]]; then
+# Un modèle déjà chargé doit rester chargé : le décharger en fin de recette
+# nuirait à un préchargement conservé volontairement (sujet #28). Le registre
+# n'est récupéré en section 3 qu'en auto-découverte : on le rafraîchit ici pour
+# que `is-loaded` réponde même avec un --model explicite. `admin_call` ne sort
+# jamais en erreur ; le `|| true` garde la substitution hors de portée du set -e.
+CODE="$(admin_call GET /admin/models "$TMP_DIR/models.json" "$ADMIN_TIMEOUT")"
+if [[ "$CODE" == "200" ]] && [[ "$(helper is-loaded "$TMP_DIR/models.json" "$MODEL_ID" 2>/dev/null || true)" == true ]]; then
     DONT_UNLOAD=true
     info "Modèle déjà chargé, ne sera pas déchargé."
 else

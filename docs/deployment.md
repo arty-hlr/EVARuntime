@@ -1675,7 +1675,9 @@ Séquence exécutée :
 1. liveness `GET /health` sur le chemin public ;
 2. readiness structurelle `GET /ready` sur le plan de contrôle ;
 3. création d'un **utilisateur et d'une clé éphémères** ;
-4. chargement **explicite** du modèle (`POST /admin/models/{id}/load`) ;
+4. chargement **explicite** du modèle (`POST /admin/models/{id}/load`), sauf
+   s'il est déjà chargé — dans ce cas la recette ne le **décharge** jamais en
+   fin de parcours (sujet #28) ;
 5. `POST /v1/chat/completions` avec `stream: true` ;
 6. mesure du temps jusqu'aux en-têtes ;
 7. mesure du **TTFT** = temps jusqu'au premier delta portant réellement du
@@ -1685,7 +1687,9 @@ Séquence exécutée :
    l'`usage` ;
 10. vérification de l'écriture du log d'usage (`GET /admin/usage`) ;
 11. révocation de la clé et **anonymisation** de l'utilisateur éphémère ;
-12. rapport, sans aucune clé ni contenu généré.
+12. déchargement du modèle si (et seulement si) la recette l'a chargé
+    elle-même ;
+13. rapport, sans aucune clé ni contenu généré.
 
 > **Modèles de raisonnement (thinking).** Un delta est considéré comme généré
 > selon la même définition que la gateway elle-même
@@ -1767,6 +1771,7 @@ et la comptabilisation.
 | 3 | Préflight : liveness ou readiness structurelle en échec | **Rollback** |
 | 4 | TTFT au-dessus du seuil **avec** `--fail-on-ttft` | **Rollback** (demandé explicitement) |
 | 5 | Identité éphémère non créée, ou non nettoyée | Version **conservée**, `update.sh` sort en erreur |
+| 6 | Modèle chargé par la recette mais **non déchargé** (échec de `unload`) | Version **conservée**, `update.sh` sort en erreur |
 
 ##### Ce que chaque URL de base couvre — et ne couvre pas
 
