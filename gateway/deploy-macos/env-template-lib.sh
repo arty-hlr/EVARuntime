@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # env-template-lib.sh — Rendu du fichier d'environnement initial sur macOS
 #
-# Génère /Users/<user>/.evaruntime/env avec les chemins et réglages adaptés à macOS.
+# Génère ~/.config/evaruntime/env avec les chemins et réglages adaptés à macOS.
 # Les valeurs par défaut sont adaptées pour Apple Silicon (Metal, unified memory).
 
 # ── Allowlist des répertoires de modèles ──────────────────────────────────────
