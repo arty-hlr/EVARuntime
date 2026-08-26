@@ -5,7 +5,121 @@ sûr et choisi par défaut, et l'**orchestrateur cluster**, explicitement opt-in
 Le premier lance `llama-server` sur l'hôte gateway; le second ne requiert aucun
 GPU local et pilote des node-agents installés séparément.
 
-## Déploiement local — premier token
+## Déploiement macOS (Apple Silicon)
+
+> **Note importante** : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local (mono-nœud) est fonctionnel.
+
+EVARuntime peut être déployé sur Mac avec puce Apple Silicon (M2/M3/M4). L'installation utilise `launchd` au lieu de `systemd` et `Homebrew` pour les dépendances.
+
+### Prérequis
+
+- **macOS 26+** sur un Mac avec puce Apple Silicon
+- **Homebrew** installé ([https://brew.sh](https://brew.sh))
+- **llama.cpp** via Homebrew (inclut `llama-server` avec support Metal) :
+  ```bash
+  brew install llama.cpp
+  ```
+
+Le binaire `llama-server` doit être accessible dans votre `$PATH`. Homebrew l'installe généralement dans `/opt/homebrew/bin/llama-server`.
+
+### Architecture macOS vs Linux
+
+| Composant | Linux (Ubuntu) | macOS |
+|-----------|---------------|-------|
+| Gestionnaire de service | systemd (`systemctl`) | launchd (`launchctl`) |
+| Répertoire d'installation | `/opt/llm-gateway` | `~/Library/Application Support/evaruntime/gateway` |
+| Données | `/var/lib/llm-gateway` | `~/Library/Application Support/evaruntime/data` |
+| Logs | `/var/log/llm-gateway` | `~/Library/Application Support/evaruntime/logs` |
+| Configuration | `/etc/llm-gateway/env` | `~/.config/evaruntime/env` |
+| Modèles | `/models` | `~/Library/Application Support/evaruntime/models` |
+| GPU | CUDA (NVIDIA) | Metal (Apple Silicon natif) |
+| Reverse-proxy | nginx (systemd) | nginx (Homebrew, optionnel) |
+
+### Installation rapide
+
+```bash
+cd gateway/deploy-macos
+
+# 1. Vérifier le plan d'installation (dry-run)
+bash install.sh --dry-run
+
+# 2. Lancer l'installation (SEUL mode supporté sur macOS)
+bash install.sh --mode local
+
+# 3. Vérifier l'état de l'installation
+bash doctor-macos.sh
+```
+
+### Commandes disponibles
+
+#### install.sh — Installation complète
+
+```bash
+bash gateway/deploy-macos/install.sh --mode local [--dry-run]
+```
+
+**Options :**
+- `--mode local` : Gateway mono-nœud (SEUL mode supporté sur macOS)
+- `--dry-run` : Affiche le plan sans modifier le système
+
+> **Note** : Le mode cluster n'est PAS supporté sur macOS. Toute tentative d'installer en mode cluster échouera.
+
+#### update.sh — Mise à jour transactionnelle
+
+```bash
+bash gateway/deploy-macos/update.sh [--nginx]
+```
+
+La mise à jour préserve :
+- `~/.config/evaruntime/env` (hors clés de mode explicitement demandées)
+- `~/Library/Application Support/evaruntime/data/gateway.db` (base de données)
+- `~/Library/Application Support/evaruntime/models/` (modèles GGUF)
+
+#### uninstall.sh — Désinstallation propre
+
+```bash
+bash gateway/deploy-macos/uninstall.sh [--keep-data] [--keep-config] [--force]
+```
+
+**Options :**
+- `--keep-data` : Conserve les modèles GGUF et la base de données
+- `--keep-config` : Conserve le fichier de configuration (secrets inclus)
+- `--force` : Supprime tout sans confirmation interactive
+
+#### doctor-macos.sh — Diagnostic complet
+
+```bash
+bash gateway/deploy-macos/doctor-macos.sh [--json]
+```
+
+Vérifie l'état complet de l'installation et signale les problèmes potentiels.
+
+### Gestion du service
+
+Le service est géré automatiquement par `install.sh` et `update.sh`. Les commandes manuelles sont réservées au dépannage.
+
+```bash
+# Arrêter le service
+sudo launchctl unload /Library/LaunchDaemons/com.evaruntime.gateway.plist
+
+# Redémarrer
+sudo launchctl load /Library/LaunchDaemons/com.evaruntime.gateway.plist
+
+# Vérifier l'état
+launchctl list com.evaruntime.gateway
+```
+
+### Consulter les logs
+
+```bash
+# Logs en temps réel
+tail -f "~/Library/Application Support/evaruntime/logs/gateway.log"
+
+# Erreurs uniquement
+tail -f "~/Library/Application Support/evaruntime/logs/gateway-error.log"
+```
+
+## Déploiement local — premier token (Linux)
 
 Ce parcours s'applique à une machine Linux équipée d'au moins un GPU NVIDIA :
 la gateway et `llama-server` tournent sur le même hôte. Il permet de vérifier

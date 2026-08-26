@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.evaruntime.gateway</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@INSTALL_DIR@/venv/bin/uvicorn</string>
+        <string>main:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8000</string>
+        <string>--workers</string>
+        <string>1</string>
+        <string>--loop</string>
+        <string>uvloop</string>
+        <string>--log-level</string>
+        <string>info</string>
+        <string>--access-log</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@INSTALL_DIR@</string>
+
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/gateway.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/gateway-error.log</string>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>UserName</key>
+    <string>@USER_NAME@</string>
+    <key>GroupName</key>
+    <string>@GROUP_NAME@</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>

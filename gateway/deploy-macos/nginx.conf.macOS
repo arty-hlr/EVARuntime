@@ -1,0 +1,109 @@
+# /opt/homebrew/etc/nginx/servers/llm-gateway
+#
+# Configuration nginx pour macOS — reverse-proxy optionnel devant la gateway EVARuntime.
+# Installez avec : brew install nginx
+# Placez ce fichier dans /opt/homebrew/etc/nginx/servers/llm-gateway
+# Rechargez avec : brew services restart nginx
+
+upstream llm_gateway {
+    server 127.0.0.1:8000;
+    keepalive 32;
+    keepalive_timeout 60s;
+}
+
+# Zone de rate-limiting (defense-in-depth, complément au rate limiting applicatif)
+limit_req_zone $binary_remote_addr zone=api_zone:10m rate=60r/m;
+# Zone de limitation des connexions concurrentes (borne les streams SSE par IP)
+limit_conn_zone $binary_remote_addr zone=api_conn:10m;
+
+server {
+    listen 80;
+    server_name localhost;
+
+    # Redirection HTTPS si certificat disponible
+    if (-f /opt/homebrew/etc/nginx/ssl/server.crt) {
+        return 301 https://$host$request_uri;
+    }
+
+    # Journal d'accès — anonymisation des noms dans les URI admin
+    # Note: log_format must be defined at http level in nginx.conf
+    # access_log /opt/homebrew/var/log/nginx/llm-gateway-access.log eva_rigged;
+    error_log  /opt/homebrew/var/log/nginx/llm-gateway-error.log warn;
+
+    # Anti-slowloris : timeouts courts sur header/body du client
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    keepalive_timeout 65s;
+    send_timeout 10s;
+    client_max_body_size 1m;
+
+    location / {
+        proxy_pass http://llm_gateway;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE (streaming) — désactive le buffer nginx côté réponse
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+        tcp_nopush on;
+        tcp_nodelay on;
+
+        # Timeout : doit couvrir MODEL_LOAD_TIMEOUT_SECONDS + marge
+        # Par défaut 180s + 10s = 190s ; on met 300s pour absorber les gros modèles
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+
+        # Rate limiting (complément au rate limiting applicatif)
+        limit_req zone=api_zone burst=5 nodelay;
+        limit_conn api_conn 10;
+    }
+
+    location /admin/ {
+        # Restreindre l'accès admin à localhost uniquement en mode local
+        allow 127.0.0.1;
+        deny all;
+
+        proxy_pass http://llm_gateway;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location /health {
+        proxy_pass http://llm_gateway;
+        access_log off;
+    }
+
+    location /ready {
+        proxy_pass http://llm_gateway;
+        access_log off;
+    }
+}
+
+# ── HTTPS (optionnel, nécessite un certificat) ────────────────────────────────
+# Pour activer HTTPS local avec un auto-signé :
+#   openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+#     -keyout /opt/homebrew/etc/nginx/ssl/server.key \
+#     -out /opt/homebrew/etc/nginx/ssl/server.crt \
+#     -subj "/CN=localhost"
+#
+# Décommenter le bloc ci-dessous après création du certificat :
+
+# server {
+#     listen 443 ssl http2;
+#     server_name localhost;
+#
+#     ssl_certificate /opt/homebrew/etc/nginx/ssl/server.crt;
+#     ssl_certificate_key /opt/homebrew/etc/nginx/ssl/server.key;
+#     ssl_protocols TLSv1.2 TLSv1.3;
+#     ssl_ciphers HIGH:!aNULL:!MD5;
+#     ssl_prefer_server_ciphers on;
+#
+#     # Mêmes directives que le bloc HTTP ci-dessus...
+# }
