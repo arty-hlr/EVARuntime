@@ -187,6 +187,13 @@ async def test_cancelled_load_leaves_last_load_seconds_none(monkeypatch):
     load_waiter = asyncio.create_task(mgr.ensure_loaded())
     while mgr.state != ModelState.LOADING:
         await asyncio.sleep(0)
+    # L'état LOADING est posé par ensure_loaded AVANT que la task de chargement
+    # ne s'exécute (les callbacks créés en cours d'itération ne tournent qu'à la
+    # suivante) : sans ce yield supplémentaire, unload() annulerait une task qui
+    # n'a pas démarré et la branche `except CancelledError` de _load_and_signal
+    # ne serait jamais atteinte — le test resterait vert sans rien contraindre.
+    await asyncio.sleep(0)
+    # La task est désormais suspendue dans _wait_for_health (health_event).
     await mgr.unload(reason="test race")
     health_event.set()
     try:
