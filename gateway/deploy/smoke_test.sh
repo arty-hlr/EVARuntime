@@ -254,12 +254,14 @@ IDENTITY_CLEANED=false
 CLEANUP_FAILED=false
 UNLOAD_FAILED=false
 MODEL_LOADED=false
+DONT_UNLOAD=false
 KEY_PREFIX=""
 
 # Idempotent : appelable par `finish` (pour que le rapport reflète le nettoyage)
 # ET par le trap (pour couvrir une interruption ou une sortie imprévue).
 unload_model() {
     [[ "$MODEL_LOADED" == true ]] || return 0
+    [[ "$DONT_UNLOAD" == true ]] && return 0
     MODEL_LOADED=false
 
     local restore_errexit=false code
@@ -371,6 +373,7 @@ Commandes, toutes sans etat et sans reseau :
                        jusqu'au premier delta UTILE et rend un verdict ;
   get FILE KEY         extrait un champ scalaire d'une reponse JSON ;
   pick-model FILE      choisit le plus petit modele active du registre ;
+  is-loaded FILE ID    indique si le modèle spécifié est chargé ; renvoie "true" ou "false".
   usage-count FILE M   compte les entrees du log d'usage pour le modele M ;
   request-body M P N   construit le corps JSON de la requete de generation ;
   report-json          convertit des lignes cle=valeur (stdin) en document JSON.
@@ -600,6 +603,23 @@ def cmd_pick_model():
     return 0
 
 
+def cmd_is_loaded():
+    """Indique si le modèle spécifié est chargé."""
+    try:
+        data = _load(sys.argv[2])
+    except (OSError, ValueError):
+        return 1
+    if not isinstance(data, list):
+        return 1
+    model_id = sys.argv[3] if len(sys.argv) > 3 else ""
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("id") == model_id and entry.get("state") == "ready":
+            sys.stdout.write("true\n")
+            return 0
+    sys.stdout.write("false\n")
+    return 0
+
+
 def cmd_usage_count():
     """Entrees du log d'usage imputees au modele exerce, avec des tokens."""
     count = 0
@@ -740,6 +760,7 @@ _COMMANDS = {
     "sse": cmd_sse,
     "get": cmd_get,
     "pick-model": cmd_pick_model,
+    "is-loaded": cmd_is_loaded,
     "usage-count": cmd_usage_count,
     "request-body": cmd_request_body,
     "user-body": cmd_user_body,
@@ -956,15 +977,21 @@ info "Identité éphémère créée (clé jamais imprimée ni passée en argumen
 # test qui demande le chargement, le temps de sa propre exécution.
 
 section "5/8  Chargement explicite du modèle (max ${LOAD_TIMEOUT}s)"
-CODE="$(admin_call POST "/admin/models/$MODEL_ID/load" "$TMP_DIR/load.json" "$LOAD_TIMEOUT")"
-if [[ "$CODE" != "200" ]]; then
-    put reason "model_load_failed:${CODE:-000}"
-    fail "POST /admin/models/$MODEL_ID/load a répondu ${CODE:-<aucune réponse>}."
-    [[ "$CODE" != "504" ]] || fail "504 : l'appel de contrôle a probablement traversé un proxy dont le timeout est trop court. Visez --admin-url en direct."
-    finish "$EXIT_GENERATION"
+MODEL_LOADED="$(helper is-loaded "$TMP_DIR/models.json" "$MODEL_ID" 2>/dev/null)"
+if [[ "$MODEL_LOADED" == true ]]; then
+    DONT_UNLOAD=true
+    info "Modèle déjà chargé, ne sera pas déchargé."
+else
+    CODE="$(admin_call POST "/admin/models/$MODEL_ID/load" "$TMP_DIR/load.json" "$LOAD_TIMEOUT")"
+    if [[ "$CODE" != "200" ]]; then
+        put reason "model_load_failed:${CODE:-000}"
+        fail "POST /admin/models/$MODEL_ID/load a répondu ${CODE:-<aucune réponse>}."
+        [[ "$CODE" != "504" ]] || fail "504 : l'appel de contrôle a probablement traversé un proxy dont le timeout est trop court. Visez --admin-url en direct."
+        finish "$EXIT_GENERATION"
+    fi
+    MODEL_LOADED=true
+    info "Modèle chargé et prêt."
 fi
-MODEL_LOADED=true
-info "Modèle chargé et prêt."
 
 # ── 6. Génération streamée sur le chemin public ───────────────────────────────
 
