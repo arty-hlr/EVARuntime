@@ -219,6 +219,9 @@ class TestPlacement:
         assert len(backend.load_calls) == 1
         assert backend.load_calls[0]["id"] == "m1"
         assert handle.telemetry_node == "a"
+        # Issue #31 : la durée mesurée pour le RPC de chargement est exposée
+        # dans le statut, comme l'observation MODEL_LOAD_SECONDS qui l'accompagne.
+        st_entry = next(e for e in mgr.status()["models"] if e["id"] == "m1")
         series = telemetry.MODEL_LOAD_SECONDS.snapshot().series
         assert len(series) == 1
         assert (series[0].model, series[0].node, series[0].outcome) == (
@@ -226,6 +229,42 @@ class TestPlacement:
             "a",
             "success",
         )
+        assert st_entry["state"] == "ready"
+        assert st_entry["last_load_seconds"] is not None
+        assert round(series[0].total, 2) == st_entry["last_load_seconds"]
+
+    @pytest.mark.anyio
+    async def test_last_load_seconds_none_when_already_loaded(self):
+        """
+        Issue #31 : already_loaded=True — le modèle tournait déjà sur le nœud,
+        la durée du chargement d'origine est inconnue. Le statut ne doit pas
+        inventer une valeur à partir du seul aller-retour RPC.
+        """
+        telemetry.reset_all()
+        backend = FakeNodeBackend("a", total_vram=48.0)
+
+        async def fake_load(model_dict: dict) -> LoadResponse:
+            return LoadResponse(
+                model_id=model_dict["id"],
+                llama_url=f"http://{backend._nid}:8081",
+                internal_api_key="internal-key",
+                port=8081,
+                already_loaded=True,
+            )
+
+        backend.load_model = fake_load
+        mgr = make_manager([backend], models=[FakeModelDef("m1", 10.0)])
+        await mgr.start_health_monitor()
+        try:
+            await mgr.ensure_model_loaded("m1")
+            st_entry = next(
+                e for e in mgr.status()["models"] if e["id"] == "m1"
+            )
+        finally:
+            await mgr.shutdown()
+
+        assert st_entry["state"] == "ready"
+        assert st_entry["last_load_seconds"] is None
 
     @pytest.mark.anyio
     async def test_best_fit_picks_tighter_node(self):

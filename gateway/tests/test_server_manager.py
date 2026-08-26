@@ -14,6 +14,8 @@ On garde le vrai machinisme d'état, de pin/unpin, de tasks et de callbacks.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,18 @@ import telemetry
 
 # ── Doubles de test ───────────────────────────────────────────────────────────
 
+class _FakeLlamaParams:
+    """Champs lus par ServerManager.status() pour llama_params."""
+
+    n_gpu_layers = 999
+    ctx_size = 2048
+    parallel = 1
+    flash_attn = False
+    cache_type_k = "f16"
+    cache_type_v = "f16"
+    cpu_moe = False
+
+
 class FakeModelDef:
     """Définition de modèle minimale suffisante pour ServerManager."""
 
@@ -35,7 +49,7 @@ class FakeModelDef:
         self.description = ""
         self.path = Path(f"/models/{mid}.gguf")
         self.capabilities = ["text_generation"]
-        self.llama_params = None
+        self.llama_params = _FakeLlamaParams()
         self.speculative = None
         self.load_timeout_seconds = 5
 
@@ -129,6 +143,59 @@ async def test_ensure_loaded_concurrent_starts_process_once(monkeypatch):
         1,
     )
     await mgr.unload()
+
+
+# ── Test 1b — durée du dernier chargement exposée (issue #31) ─────────────────
+
+@pytest.mark.anyio
+async def test_last_load_seconds_logged_and_exposed(monkeypatch, caplog):
+    """
+    Issue #31 : la durée de chargement doit apparaître dans la ligne de log
+    « llama-server prêt » ET dans le statut (last_load_seconds).
+    """
+    mgr = make_manager()
+    patch_process_and_health(mgr, monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="server_manager"):
+        await mgr.ensure_loaded()
+
+    assert mgr.state == ModelState.READY
+
+    # Le statut expose une durée plausible ; la propriété renvoie la même valeur.
+    duration = mgr.status()["last_load_seconds"]
+    assert duration is not None
+    assert duration >= 0.0
+    assert round(mgr.last_load_seconds, 2) == duration
+
+    # La ligne « llama-server prêt » porte désormais la durée en secondes.
+    ready_messages = [
+        r.getMessage() for r in caplog.records if "llama-server prêt" in r.getMessage()
+    ]
+    assert ready_messages, "la ligne 'llama-server prêt' doit être émise"
+    assert re.search(r"en \d+\.\d s$", ready_messages[-1]), ready_messages[-1]
+
+    await mgr.unload()
+
+
+@pytest.mark.anyio
+async def test_cancelled_load_leaves_last_load_seconds_none(monkeypatch):
+    """Un chargement abandonné (unload concurrent) ne produit pas de durée."""
+    mgr = make_manager()
+    health_event = asyncio.Event()
+    patch_process_and_health(mgr, monkeypatch, health_event=health_event)
+
+    load_waiter = asyncio.create_task(mgr.ensure_loaded())
+    while mgr.state != ModelState.LOADING:
+        await asyncio.sleep(0)
+    await mgr.unload(reason="test race")
+    health_event.set()
+    try:
+        await asyncio.wait_for(load_waiter, timeout=2.0)
+    except Exception:
+        pass
+
+    assert mgr.state != ModelState.READY
+    assert mgr.status()["last_load_seconds"] is None
 
 
 # ── Test 2 — is_pinned interdit l'éviction par inactivité ─────────────────────

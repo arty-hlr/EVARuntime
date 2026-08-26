@@ -233,6 +233,11 @@ class ModelStatusResponse(BaseModel):
     port: Optional[int]
     uptime_seconds: Optional[float]
     idle_seconds: Optional[float]
+    # Durée du dernier chargement réussi du modèle, en secondes. Mesurée côté
+    # gateway en local ; côté orchestrateur (RPC réseau inclus) en cluster.
+    # None si le modèle n'a jamais atteint « ready » — ou en cluster si le nœud
+    # l'avait déjà chargé au moment du placement (durée d'origine inconnue).
+    last_load_seconds: Optional[float] = None
     llama_params: Optional[dict]
     # Cluster uniquement : nœud d'hébergement et charge live. `llama_url` reste
     # volontairement hors de ce schéma (détail d'infra interne) — il n'est

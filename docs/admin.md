@@ -446,6 +446,7 @@ curl -s "$GW/admin/status" \
 #       "pid": 18432,
 #       "uptime_seconds": 3742.1,
 #       "idle_seconds": 42.3,
+#       "last_load_seconds": 87.4,
 #       "path": "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
 #     },
 #     {
@@ -457,6 +458,7 @@ curl -s "$GW/admin/status" \
 #       "pid": null,
 #       "uptime_seconds": null,
 #       "idle_seconds": null,
+#       "last_load_seconds": null,
 #       "path": "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 #     }
 #   ]
@@ -490,6 +492,25 @@ Les entrées de `models` portent en plus, en cluster, le nœud d'hébergement
 (`node`) et la charge live (`active_requests`) ; en local ces deux champs valent
 `null`. L'URL interne du `llama-server` n'est jamais exposée ici — elle n'est
 lisible que via `GET /admin/cluster`.
+
+#### Durée du dernier chargement (`last_load_seconds`)
+
+Chaque entrée de `models` expose aussi `last_load_seconds` : la durée du dernier
+chargement **réussi** du modèle, en secondes — c'est la contrepartie « dernier
+échantillon » de l'histogramme Prometheus `eva_model_load_seconds`. Elle vaut
+`null` tant que le modèle n'a jamais atteint l'état `ready`.
+
+Comparer cette durée entre deux chargements permet de distinguer un page cache
+froid d'un cache chaud (variance dominante observée lors de l'enquête #24), et
+sert de baseline pour mesurer un éventuel gain de checkpointing.
+
+La sémantique exacte dépend du mode :
+
+| Mode | Mesure |
+|---|---|
+| Local | Durée réelle du chargement, mesurée par la gateway du lancement du sous-processus à la santé OK — la même valeur figure désormais dans le log « llama-server prêt … en N.N s » |
+| Cluster | Durée de l'appel RPC `load_model` vers le node-agent (réseau inclus), côté orchestrateur — cohérente avec l'histogramme labellisé par nœud |
+| Cluster, modèle déjà chargé sur le nœud | `null` : le chargement d'origine n'a pas été observé par l'orchestrateur, aucune valeur n'est inventée |
 
 ### Surveiller la VRAM GPU
 
@@ -1265,8 +1286,8 @@ curl -s "$GW/admin/status" \
 #   },
 #   "capacity_queue": { "enabled": true, "waiters": 0, "max_waiters": 100, "timeout_seconds": 120 },
 #   "models": [
-#     { "id": "llama-3.3-70b-instruct", "state": "ready", "vram_gb": 42.0, ... },
-#     { "id": "llama-3.1-8b-instruct", "state": "unloaded", ... }
+#     { "id": "llama-3.3-70b-instruct", "state": "ready", "vram_gb": 42.0, "last_load_seconds": 87.4, ... },
+#     { "id": "llama-3.1-8b-instruct", "state": "unloaded", ..., "last_load_seconds": null }
 #   ]
 # }
 ```

@@ -1635,6 +1635,7 @@ Réponse après chargement du 70B :
       "pid": 18432,
       "uptime_seconds": 125.3,
       "idle_seconds": 12.1,
+      "last_load_seconds": 87.4,
       "path": "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
     }
   ]
