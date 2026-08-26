@@ -88,6 +88,7 @@ EXIT_USAGE=2
 EXIT_PREFLIGHT=3
 EXIT_TTFT=4
 EXIT_IDENTITY=5
+EXIT_UNLOAD=6
 
 # Les traces vont sur stderr, le RAPPORT sur stdout : `--json` reste ainsi
 # directement exploitable par un pipeline.
@@ -137,7 +138,8 @@ Options :
   -h, --help               Cette aide
 
 Exit codes : 0 succès, 1 échec fonctionnel, 2 erreur d'usage, 3 préflight,
-4 seuil TTFT dépassé (avec --fail-on-ttft), 5 identité éphémère résiduelle.
+4 seuil TTFT dépassé (avec --fail-on-ttft), 5 identité éphémère résiduelle,
+6 modèle de recette non déchargé.
 EOF
 }
 
@@ -252,10 +254,40 @@ SMOKE_USER="evaruntime-smoke-$(date +%Y%m%d-%H%M%S)-$$"
 IDENTITY_ARMED=false
 IDENTITY_CLEANED=false
 CLEANUP_FAILED=false
+UNLOAD_FAILED=false
+MODEL_LOADED=false
+DONT_UNLOAD=false
 KEY_PREFIX=""
 
 # Idempotent : appelable par `finish` (pour que le rapport reflète le nettoyage)
 # ET par le trap (pour couvrir une interruption ou une sortie imprévue).
+unload_model() {
+    [[ "$MODEL_LOADED" == true ]] || return 0
+    [[ "$DONT_UNLOAD" == true ]] && return 0
+    MODEL_LOADED=false
+
+    local restore_errexit=false code
+    if [[ -o errexit ]]; then restore_errexit=true; fi
+    set +e
+
+    # POST /admin/models/{id}/unload répond 404 si le modèle est déjà déchargé.
+    code="$(admin_call POST "/admin/models/$MODEL_ID/unload" "$TMP_DIR/cleanup-unload.json" "$ADMIN_TIMEOUT")"
+    case "$code" in
+        200|404) ;;
+        *) UNLOAD_FAILED=true; fail "Déchargement du modèle : HTTP ${code:-<aucune réponse>}" ;;
+    esac
+
+    if [[ "$UNLOAD_FAILED" == true ]]; then
+        fail "DÉCHARGEMENT RÉSIDUEL — retirez-le à la main :"
+        fail "  curl -X POST -H 'Authorization: Bearer <ADMIN_SECRET>' $ADMIN_URL/admin/models/$MODEL_ID/unload"
+    else
+        info "Modèle déchargé avec succès."
+    fi
+
+    if [[ "$restore_errexit" == true ]]; then set -e; fi
+    return 0
+}
+
 cleanup_identity() {
     [[ "$IDENTITY_ARMED" == true ]] || return 0
     [[ "$IDENTITY_CLEANED" != true ]] || return 0
@@ -299,6 +331,7 @@ on_exit() {
     trap - EXIT INT TERM HUP
     set +e
     cleanup_identity
+    unload_model
     # Une identité résiduelle ne doit jamais passer pour un succès.
     if [[ "$CLEANUP_FAILED" == true && $rc -eq 0 ]]; then
         rc=$EXIT_IDENTITY
@@ -342,6 +375,7 @@ Commandes, toutes sans etat et sans reseau :
                        jusqu'au premier delta UTILE et rend un verdict ;
   get FILE KEY         extrait un champ scalaire d'une reponse JSON ;
   pick-model FILE      choisit le plus petit modele active du registre ;
+  is-loaded FILE ID    indique si le modèle spécifié est chargé ; renvoie "true" ou "false".
   usage-count FILE M   compte les entrees du log d'usage pour le modele M ;
   request-body M P N   construit le corps JSON de la requete de generation ;
   report-json          convertit des lignes cle=valeur (stdin) en document JSON.
@@ -571,6 +605,23 @@ def cmd_pick_model():
     return 0
 
 
+def cmd_is_loaded():
+    """Indique si le modèle spécifié est chargé."""
+    try:
+        data = _load(sys.argv[2])
+    except (OSError, ValueError):
+        return 1
+    if not isinstance(data, list):
+        return 1
+    model_id = sys.argv[3] if len(sys.argv) > 3 else ""
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("id") == model_id and entry.get("state") == "ready":
+            sys.stdout.write("true\n")
+            return 0
+    sys.stdout.write("false\n")
+    return 0
+
+
 def cmd_usage_count():
     """Entrees du log d'usage imputees au modele exerce, avec des tokens."""
     count = 0
@@ -711,6 +762,7 @@ _COMMANDS = {
     "sse": cmd_sse,
     "get": cmd_get,
     "pick-model": cmd_pick_model,
+    "is-loaded": cmd_is_loaded,
     "usage-count": cmd_usage_count,
     "request-body": cmd_request_body,
     "user-body": cmd_user_body,
@@ -797,6 +849,11 @@ finish() {
     if [[ "$CLEANUP_FAILED" == true && "$code" -eq 0 ]]; then
         code="$EXIT_IDENTITY"
         put reason "identity_cleanup_failed"
+    fi
+    unload_model
+    if [[ "$UNLOAD_FAILED" == true && "$code" -eq 0 ]]; then
+        code="$EXIT_UNLOAD"
+        put reason "model_unload_failed"
     fi
     emit_report "$code"
     exit "$code"
@@ -922,14 +979,26 @@ info "Identité éphémère créée (clé jamais imprimée ni passée en argumen
 # test qui demande le chargement, le temps de sa propre exécution.
 
 section "5/8  Chargement explicite du modèle (max ${LOAD_TIMEOUT}s)"
-CODE="$(admin_call POST "/admin/models/$MODEL_ID/load" "$TMP_DIR/load.json" "$LOAD_TIMEOUT")"
-if [[ "$CODE" != "200" ]]; then
-    put reason "model_load_failed:${CODE:-000}"
-    fail "POST /admin/models/$MODEL_ID/load a répondu ${CODE:-<aucune réponse>}."
-    [[ "$CODE" != "504" ]] || fail "504 : l'appel de contrôle a probablement traversé un proxy dont le timeout est trop court. Visez --admin-url en direct."
-    finish "$EXIT_GENERATION"
+# Un modèle déjà chargé doit rester chargé : le décharger en fin de recette
+# nuirait à un préchargement conservé volontairement (sujet #28). Le registre
+# n'est récupéré en section 3 qu'en auto-découverte : on le rafraîchit ici pour
+# que `is-loaded` réponde même avec un --model explicite. `admin_call` ne sort
+# jamais en erreur ; le `|| true` garde la substitution hors de portée du set -e.
+CODE="$(admin_call GET /admin/models "$TMP_DIR/models.json" "$ADMIN_TIMEOUT")"
+if [[ "$CODE" == "200" ]] && [[ "$(helper is-loaded "$TMP_DIR/models.json" "$MODEL_ID" 2>/dev/null || true)" == true ]]; then
+    DONT_UNLOAD=true
+    info "Modèle déjà chargé, ne sera pas déchargé."
+else
+    CODE="$(admin_call POST "/admin/models/$MODEL_ID/load" "$TMP_DIR/load.json" "$LOAD_TIMEOUT")"
+    if [[ "$CODE" != "200" ]]; then
+        put reason "model_load_failed:${CODE:-000}"
+        fail "POST /admin/models/$MODEL_ID/load a répondu ${CODE:-<aucune réponse>}."
+        [[ "$CODE" != "504" ]] || fail "504 : l'appel de contrôle a probablement traversé un proxy dont le timeout est trop court. Visez --admin-url en direct."
+        finish "$EXIT_GENERATION"
+    fi
+    MODEL_LOADED=true
+    info "Modèle chargé et prêt."
 fi
-info "Modèle chargé et prêt."
 
 # ── 6. Génération streamée sur le chemin public ───────────────────────────────
 

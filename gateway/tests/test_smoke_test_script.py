@@ -46,6 +46,7 @@ EXIT_USAGE = 2
 EXIT_PREFLIGHT = 3
 EXIT_TTFT = 4
 EXIT_IDENTITY = 5
+EXIT_UNLOAD = 6
 
 
 # ── Faux serveur ──────────────────────────────────────────────────────────────
@@ -62,7 +63,9 @@ class Scenario:
         self.delete_key_status = 200
         self.delete_user_status = 200
         self.load_status = 200
+        self.unload_status = 200
         self.create_user_status = 201
+        self.model_state = "unloaded"
         self.calls: list[tuple[str, str]] = []
         self.auth: dict[str, str] = {}
         self.lock = threading.Lock()
@@ -155,9 +158,12 @@ def _make_handler(scenario: Scenario):
                                      "reason": "model_file_missing"})
             elif parsed.path == "/admin/models":
                 self._json(200, [
-                    {"id": "llama-3.3-70b-instruct", "enabled": True, "vram_gb": 42.0},
-                    {"id": MODEL_ID, "enabled": True, "vram_gb": 7.0},
-                    {"id": "tiny-disabled", "enabled": False, "vram_gb": 1.0},
+                    {"id": "llama-3.3-70b-instruct", "enabled": True, "vram_gb": 42.0,
+                     "state": "unloaded"},
+                    {"id": MODEL_ID, "enabled": True, "vram_gb": 7.0,
+                     "state": scenario.model_state},
+                    {"id": "tiny-disabled", "enabled": False, "vram_gb": 1.0,
+                     "state": "unloaded"},
                 ])
             elif parsed.path == "/admin/usage":
                 query = parse_qs(parsed.query)
@@ -190,6 +196,8 @@ def _make_handler(scenario: Scenario):
                                  "expires_at": None})
             elif re.fullmatch(r"/admin/models/[^/]+/load", parsed.path):
                 self._json(scenario.load_status, {"message": "chargé"})
+            elif re.fullmatch(r"/admin/models/[^/]+/unload", parsed.path):
+                self._json(scenario.unload_status, {"message": "déchargé"})
             elif parsed.path == "/v1/chat/completions":
                 self._chat()
             else:
@@ -525,6 +533,44 @@ def test_chargement_de_modele_impossible_est_un_echec(gateway, env_file):
     assert_identity_cleaned(gateway)
 
 
+# ── Cycle de vie du modèle : chargement / déchargement (sujet #28) ────────────
+
+def test_modele_charge_par_la_recette_est_decharge(gateway, env_file):
+    """Contrôle positif : ce que la recette charge, elle le décharge."""
+    proc = run_smoke(gateway, env_file)
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert gateway.seen("POST", f"/admin/models/{MODEL_ID}/load")
+    assert gateway.seen("POST", f"/admin/models/{MODEL_ID}/unload")
+
+
+def test_modele_deja_charge_n_est_pas_decharge(gateway, env_file):
+    """
+    Un modèle déjà chargé par l'opérateur ne doit ni être rechargé, ni être
+    déchargé en fin de recette : le décharger ferait tomber un service
+    volontairement prêt. Le contrôle d'absence porte sur `load`/`unload` ; la
+    lecture du registre et la génération en sont les contrôles positifs.
+    """
+    gateway.model_state = "ready"
+    proc = run_smoke(gateway, env_file)
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert gateway.seen("GET", "/admin/models")
+    assert gateway.seen("POST", "/v1/chat/completions")
+    assert not gateway.seen("POST", f"/admin/models/{MODEL_ID}/load")
+    assert not gateway.seen("POST", f"/admin/models/{MODEL_ID}/unload")
+
+
+def test_echec_dechargement_est_un_exit_code_dedie(gateway, env_file):
+    """Un modèle chargé par la recette mais jamais déchargé ne doit JAMAIS
+    passer pour un succès : code de sortie dédié et rapport explicite."""
+    gateway.unload_status = 500
+    proc = run_smoke(gateway, env_file, "--json")
+    assert proc.returncode == EXIT_UNLOAD, combined(proc)
+    report = json.loads(proc.stdout)
+    assert report["reason"] == "model_unload_failed"
+    assert "DÉCHARGEMENT RÉSIDUEL" in combined(proc)
+    assert_identity_cleaned(gateway)
+
+
 # ── Préflight ─────────────────────────────────────────────────────────────────
 
 def test_readiness_503_echoue_avant_toute_generation(gateway, env_file):
@@ -741,7 +787,7 @@ def test_aide_sort_en_zero():
     )
     assert proc.returncode == EXIT_OK
     for code in ("0 succès", "1 échec fonctionnel", "2 erreur d'usage",
-                 "3 préflight", "4 seuil TTFT", "5 identité"):
+                 "3 préflight", "4 seuil TTFT", "5 identité", "6 modèle de recette"):
         assert code in proc.stdout
 
 
@@ -910,6 +956,7 @@ def test_les_routes_exercees_existent_reellement():
         ("POST", "/admin/users"),
         ("POST", "/admin/users/{username}/keys"),
         ("POST", "/admin/models/{model_id}/load"),
+        ("POST", "/admin/models/{model_id}/unload"),
         ("GET", "/admin/usage"),
         ("DELETE", "/admin/keys/{key_prefix}"),
         ("DELETE", "/admin/users/{username}"),
